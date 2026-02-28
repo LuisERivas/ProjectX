@@ -1,0 +1,47 @@
+jetson-agent-platform/
+  README.md
+  docker-compose.yml               # optional if you containerize
+  client/
+    terminal_app/
+      main.py                      # CLI that hits the Jetson API
+      config.yaml
+  server/
+    gateway/
+      app.py                       # FastAPI gateway
+      auth.py
+      routes/
+        submit.py
+        status.py
+        result.py
+        rag.py
+        tools.py
+    orchestrator/
+      worker.py                    # queue consumer
+      planner.py                   # routing logic
+      policies.py                  # tool allowlists, limits
+      schemas.py                   # structured outputs
+    models/
+      orchestrator_llm/
+        server.py                  # wraps ollama/llama.cpp endpoint
+      coder_llm/
+        server.py
+      embedder/
+        server.py
+    rag/
+      ingest.py
+      chunker.py
+      store_sqlite.py
+      vector_faiss.py
+      retrieve.py
+    tools/
+      runtime.py                   # executes allowed tools
+      tool_defs.py                 # tool registry / schemas
+      sandboxes/
+        docker_tool.py
+        shell_tool.py
+  infra/
+    redis/
+    nginx/
+  data/
+    rag_store/
+    logs/

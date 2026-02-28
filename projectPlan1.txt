@@ -1,0 +1,19 @@
+Milestone 1 — Gateway + Queue + Worker
+
+Submit job
+
+Worker flips status: queued → running → done
+
+Result is stored and retrievable
+
+Milestone 2 — Tool Runtime
+
+Orchestrator job that calls fs.read or shell.exec
+
+Tool output captured in job result
+
+Milestone 3 — RAG
+
+/rag/ingest loads a text file
+
+/submit with mode="rag" returns top chunks
