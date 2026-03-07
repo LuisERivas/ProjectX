@@ -3,6 +3,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+REDIS_PACKAGE = os.getenv("REDIS_PACKAGE", "redis")
+REDIS_SYSTEMD_NAME = os.getenv("REDIS_SYSTEMD_NAME", "redis")
+REDIS_SYSTEMD_UNIT = f"{REDIS_SYSTEMD_NAME}.service"
+
 
 def run(cmd, *, check=True):
     print(f"+ {' '.join(cmd)}")
@@ -12,9 +16,9 @@ def run(cmd, *, check=True):
 def ensure_redis():
     print("\n=== Installing and enabling Redis (requires sudo) ===")
     run(["sudo", "apt", "update"])
-    run(["sudo", "apt", "install", "-y", "redis-server"])
-    run(["sudo", "systemctl", "enable", "redis-server"])
-    run(["sudo", "systemctl", "start", "redis-server"])
+    run(["sudo", "apt", "install", "-y", REDIS_PACKAGE])
+    run(["sudo", "systemctl", "enable", REDIS_SYSTEMD_NAME])
+    run(["sudo", "systemctl", "start", REDIS_SYSTEMD_NAME])
 
 
 def ensure_venv(project_root: Path):
@@ -52,7 +56,7 @@ def write_systemd_units(project_root: Path, venv_dir: Path):
 
     gateway_unit = f"""[Unit]
 Description=ProjectX Redis HTTP gateway
-After=network-online.target redis-server.service
+After=network-online.target {REDIS_SYSTEMD_UNIT}
 Wants=network-online.target
 
 [Service]
@@ -77,7 +81,7 @@ WantedBy=multi-user.target
 
     worker_unit = f"""[Unit]
 Description=ProjectX Redis echo worker
-After=network-online.target redis-server.service
+After=network-online.target {REDIS_SYSTEMD_UNIT}
 Wants=network-online.target
 
 [Service]

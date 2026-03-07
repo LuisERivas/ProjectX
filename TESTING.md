@@ -8,7 +8,38 @@ For now, testing is standardized on **systemd mode only**.
 
 Dev-mode test flow will be expanded in a future update and can be ignored for now.
 
-## 2) Test prerequisites
+## 2) Remote automated runner (no SSH)
+
+If you are testing from another machine, you can run the remote helper script that prompts for Jetson IP and executes the non-disruptive API flow from this document.
+
+From project root:
+
+```bash
+python scripts/run_testing_md_remote.py
+```
+
+Optional flags:
+
+```bash
+python scripts/run_testing_md_remote.py --host 192.168.1.50 --port 8000 --timeout-s 8 --poll-timeout-s 45
+```
+
+What it automates:
+- Health check (`GET /health`)
+- Submit + read terminal state (`POST /v1/jobs`, `GET /v1/jobs/{job_id}`)
+- Idempotency check (`Idempotency-Key` reused)
+- Cancel endpoint check (`POST /v1/jobs/{job_id}/cancel`)
+
+What remains manual without SSH:
+- `systemctl` status checks on Jetson
+- Redis ground-truth checks with `redis-cli`
+- Boundary static test (`python -m pytest tests/test_boundary_rules.py`)
+
+Exit codes:
+- `0`: all automated checks passed
+- `1`: one or more automated checks failed
+
+## 3) Test prerequisites
 
 - Redis running locally (`redis://127.0.0.1:6379/0` by default).
 - Gateway running as `redis-gateway.service`.
@@ -18,12 +49,12 @@ Dev-mode test flow will be expanded in a future update and can be ignored for no
 Ensure services are active:
 
 ```bash
-sudo systemctl status redis-server
+sudo systemctl status redis
 sudo systemctl status redis-gateway.service
 sudo systemctl status redis-echo-worker.service
 ```
 
-## 3) Health check
+## 4) Health check
 
 ```bash
 curl -sS http://127.0.0.1:8000/health
@@ -33,7 +64,7 @@ Expected:
 - `"ok": true`
 - `queue_stream` and `worker_group` fields present
 
-## 4) End-to-end job flow
+## 5) End-to-end job flow
 
 ### 4.1 Submit a job
 
@@ -75,7 +106,7 @@ Expected:
 - `status` is terminal (`done` for normal echo path)
 - `result` populated on success
 
-## 5) Idempotency behavior
+## 6) Idempotency behavior
 
 Run twice with the same idempotency key:
 
@@ -90,7 +121,7 @@ Expected on second call:
 - `"idempotent": true`
 - Same `job_id` as the first call
 
-## 6) Cancel behavior
+## 7) Cancel behavior
 
 Cancel the submitted job:
 
@@ -105,7 +136,7 @@ Expected:
 - If cancellation wins before completion, SSE terminal event is `canceled`.
 - If completion already happened, status remains existing terminal state.
 
-## 7) Redis ground-truth checks
+## 8) Redis ground-truth checks
 
 ```bash
 redis-cli -u redis://127.0.0.1:6379/0 HGETALL "job:${JOB_ID}"
@@ -118,7 +149,7 @@ Expected:
 - Events stream includes lifecycle transitions.
 - `XPENDING` trends to zero after job completion.
 
-## 8) Recovery behavior check (systemd mode only)
+## 9) Recovery behavior check (systemd mode only)
 
 1. Stop worker:
 
@@ -136,7 +167,7 @@ sudo systemctl start redis-echo-worker.service
 Expected:
 - Worker recovers and processes pending work.
 
-## 9) Boundary rule tests (static guardrails)
+## 10) Boundary rule tests (static guardrails)
 
 From project root, run:
 
@@ -150,7 +181,7 @@ Expected:
   - `gateway/main.py`
   - `worker/worker_main.py`
 
-## 10) Suggested regression checklist
+## 11) Suggested regression checklist
 
 Run this minimum suite after code changes:
 - Verify systemd services are active

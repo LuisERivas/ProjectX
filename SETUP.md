@@ -21,15 +21,15 @@ cd ProjectX
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip redis-server curl
+sudo apt install -y python3 python3-venv python3-pip redis curl
 ```
 
 Enable/start Redis:
 
 ```bash
-sudo systemctl enable redis-server
-sudo systemctl start redis-server
-sudo systemctl status redis-server
+sudo systemctl enable redis
+sudo systemctl start redis
+sudo systemctl status redis
 ```
 
 ## 4) Create virtual environment and Python dependencies
@@ -136,7 +136,7 @@ sudo systemctl status redis-echo-worker.service
 
 ## 8) Operational checks
 
-- Redis is healthy: `sudo systemctl status redis-server`
+- Redis is healthy: `sudo systemctl status redis`
 - Gateway is healthy: `curl -sS http://127.0.0.1:8000/health`
 - Worker is running: `sudo systemctl status redis-echo-worker.service`
 - Cancel API is reachable (replace with a real job id): `curl -sS -X POST http://127.0.0.1:8000/v1/jobs/<job_id>/cancel -H "Content-Type: application/json" -d "{\"reason\":{\"by\":\"ops\"}}"`
