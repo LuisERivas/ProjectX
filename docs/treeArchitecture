@@ -1,0 +1,48 @@
+Server Side Host (e.g. Jetson)
+│
+├── Process manager (e.g. systemd)
+│   ├── redis-server.service
+│   ├── redis-gateway.service
+│   └── redis-echo-worker.service
+│
+├── Redis (process + data store)
+│   ├── jobs:stream                    (queue stream; consumer group "workers")
+│   ├── job:{id}                       (hash per job: status, payload, result, error, ttl_s, timestamps)
+│   ├── job:{id}:events                (stream per job: type, ts, step, data)
+│   ├── jobs:dlq                       (dead-letter stream)
+│   └── idempotency:{key}              (optional key used by gateway)
+│
+├── Gateway (process: uvicorn + FastAPI)
+│   └── main.py (FastAPI app)
+│       ├── HTTP validation/response shaping
+│       ├── POST /v1/jobs              (delegates enqueue/state writes to contract layer)
+│       ├── POST /v1/jobs/{id}/cancel  (delegates cancellation to contract layer)
+│       ├── GET /v1/jobs/{id}          (delegates job reads to contract layer)
+│       ├── GET /v1/jobs/{id}/events   (SSE transport + formatting)
+│       └── GET /health                (contract-backed Redis health/backlog summary)
+│
+├── Worker (process: python -m worker.worker_main)
+│   ├── worker_main.py
+│   │   ├── Main loop                  (readgroup → spawn process_one)
+│   │   ├── Pending recovery loop     (autoclaim)
+│   │   └── process_one                (business logic: currently echo)
+│   └── ContractClient (contract.worker)
+│       ├── readgroup / autoclaim      (consume from jobs:stream)
+│       ├── mark_running               (job hash + running event + TTL)
+│       ├── emit_message               (message event + TTL)
+│       ├── finalize_done              (Lua: hash + done event + TTL + XACK)
+│       └── finalize_error             (DLQ + Lua: hash + error event + TTL + XACK)
+│
+└── Contract (spec + code on host; not a separate process)
+    ├── BOUNDARY_MATRIX.md             (responsibility boundaries)
+    ├── contract/shared/ (Python)
+    │   ├── config.py, redis_keys.py, types.py, errors.py
+    │   └── serde.py, schema.py, job_hash.py, group_ops.py
+    ├── contract/worker/ (Python)
+    │   ├── contract_client.py         (ContractClient)
+    │   ├── stream_ops.py, dlq.py, runtime.py
+    │   └── scripts/finalize_and_ack.lua, mark_running.lua  (loaded by Redis when worker calls it)
+    └── contract/gateway/service.py    (gateway-side Redis data-plane implementation:
+                                        ensure group, enqueue, job hash read/write,
+                                        cancel flow, event append/read, backlog metrics)
+        └── contract/gateway/scripts/create_job.lua, cancel_job.lua
