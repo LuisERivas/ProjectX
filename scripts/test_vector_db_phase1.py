@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import threading
@@ -95,6 +96,24 @@ def run_step(name: str, cmd: list[str], cwd: Path, estimate_s: int) -> None:
         raise RuntimeError(f"{name} failed with exit code {rc}")
 
 
+def clear_old_test_paths(vector_db_dir: Path) -> None:
+    stale_dirs = [
+        vector_db_dir / "smoke_data",
+        vector_db_dir / "benchmark_data",
+        vector_db_dir / "tc_check_data",
+    ]
+    print("\n== Cleanup old test paths ==")
+    for d in stale_dirs:
+        if d.exists():
+            print(f"- removing {d}")
+            if d.is_dir():
+                shutil.rmtree(d)
+            else:
+                d.unlink(missing_ok=True)
+        else:
+            print(f"- already clean {d}")
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     vector_db_dir = root / "vector_db"
@@ -117,6 +136,7 @@ def main() -> int:
     }
 
     try:
+        clear_old_test_paths(vector_db_dir)
         run_step(
             "Configure (CMake)",
             ["cmake", "-S", str(vector_db_dir), "-B", str(build_dir)],
