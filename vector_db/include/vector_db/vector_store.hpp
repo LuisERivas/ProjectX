@@ -46,6 +46,28 @@ struct WalStats {
     std::size_t wal_entries = 0;
 };
 
+struct ClusterStats {
+    bool available = false;
+    std::uint64_t version = 0;
+    std::uint64_t build_lsn = 0;
+    std::size_t vectors_indexed = 0;
+    std::size_t chosen_k = 0;
+    std::size_t k_min = 0;
+    std::size_t k_max = 0;
+    double objective = 0.0;
+    bool used_cuda = false;
+};
+
+struct ClusterHealth {
+    bool available = false;
+    bool passed = false;
+    double mean_nmi = 0.0;
+    double std_nmi = 0.0;
+    double mean_jaccard = 0.0;
+    double mean_centroid_drift = 0.0;
+    std::string status;
+};
+
 class VectorStore {
 public:
     explicit VectorStore(std::string data_dir);
@@ -55,6 +77,7 @@ public:
     Status open();
     Status flush();
     Status checkpoint();
+    Status build_initial_clusters(std::uint32_t seed = 1234);
     Status close();
 
     Status insert(std::uint64_t id, const std::vector<float>& vector_fp32_1024, const std::string& metadata_json, bool upsert = false);
@@ -63,6 +86,8 @@ public:
     std::optional<StoredRecord> get(std::uint64_t id) const;
     Stats stats() const;
     WalStats wal_stats() const;
+    ClusterStats cluster_stats() const;
+    ClusterHealth cluster_health() const;
 
 private:
     struct Impl;

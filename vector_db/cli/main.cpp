@@ -83,7 +83,10 @@ void print_usage() {
               << "  get --path <data_dir> --id <u64>\n"
               << "  stats --path <data_dir>\n"
               << "  checkpoint --path <data_dir>\n"
-              << "  wal-stats --path <data_dir>\n";
+              << "  wal-stats --path <data_dir>\n"
+              << "  build-initial-clusters --path <data_dir> [--seed <u32>]\n"
+              << "  cluster-stats --path <data_dir>\n"
+              << "  cluster-health --path <data_dir>\n";
 }
 
 }  // namespace
@@ -248,6 +251,56 @@ int main(int argc, char** argv) {
                   << "  \"checkpoint_lsn\": " << st.checkpoint_lsn << ",\n"
                   << "  \"last_lsn\": " << st.last_lsn << ",\n"
                   << "  \"wal_entries\": " << st.wal_entries << "\n"
+                  << "}\n";
+        return 0;
+    }
+
+    if (command == "build-initial-clusters") {
+        if (!open_or_fail()) {
+            return 1;
+        }
+        const std::string seed_str = get_arg(args, "--seed", "1234");
+        const auto s = store.build_initial_clusters(static_cast<std::uint32_t>(std::stoul(seed_str)));
+        if (!s.ok) {
+            std::cerr << "error: " << s.message << "\n";
+            return 1;
+        }
+        std::cout << "ok: initial clusters built\n";
+        return 0;
+    }
+
+    if (command == "cluster-stats") {
+        if (!open_or_fail()) {
+            return 1;
+        }
+        const auto st = store.cluster_stats();
+        std::cout << "{\n"
+                  << "  \"available\": " << (st.available ? "true" : "false") << ",\n"
+                  << "  \"version\": " << st.version << ",\n"
+                  << "  \"build_lsn\": " << st.build_lsn << ",\n"
+                  << "  \"vectors_indexed\": " << st.vectors_indexed << ",\n"
+                  << "  \"chosen_k\": " << st.chosen_k << ",\n"
+                  << "  \"k_min\": " << st.k_min << ",\n"
+                  << "  \"k_max\": " << st.k_max << ",\n"
+                  << "  \"objective\": " << st.objective << ",\n"
+                  << "  \"used_cuda\": " << (st.used_cuda ? "true" : "false") << "\n"
+                  << "}\n";
+        return 0;
+    }
+
+    if (command == "cluster-health") {
+        if (!open_or_fail()) {
+            return 1;
+        }
+        const auto h = store.cluster_health();
+        std::cout << "{\n"
+                  << "  \"available\": " << (h.available ? "true" : "false") << ",\n"
+                  << "  \"passed\": " << (h.passed ? "true" : "false") << ",\n"
+                  << "  \"mean_nmi\": " << h.mean_nmi << ",\n"
+                  << "  \"std_nmi\": " << h.std_nmi << ",\n"
+                  << "  \"mean_jaccard\": " << h.mean_jaccard << ",\n"
+                  << "  \"mean_centroid_drift\": " << h.mean_centroid_drift << ",\n"
+                  << "  \"status\": \"" << h.status << "\"\n"
                   << "}\n";
         return 0;
     }

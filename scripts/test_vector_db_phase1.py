@@ -22,10 +22,11 @@ def main() -> int:
     vector_db_dir = root / "vector_db"
     build_dir = vector_db_dir / "build"
 
-    print("Vector DB Phase 2 validation (WAL + Recovery + Startup Reload)")
+    print("Vector DB Phase 3 validation (Initial Clustering + CUDA path)")
     print("- Includes CRUD, tombstone, restart persistence checks")
     print("- Includes manifest.json + dirty_ranges.json reload checks")
     print("- Includes WAL append, replay, checkpoint, and malformed-tail tolerance checks")
+    print("- Includes ID estimation, binary elbow k selection, stability checks, and clustering artifacts")
 
     try:
         run_step(
@@ -48,6 +49,11 @@ def main() -> int:
             [sys.executable, "tests/smoke_cli.py"],
             cwd=vector_db_dir,
         )
+        run_step(
+            "Phase3 benchmark sanity",
+            [sys.executable, "tests/benchmark_phase3.py"],
+            cwd=vector_db_dir,
+        )
     except FileNotFoundError as e:
         print(f"[FAIL] Missing tool: {e}")
         print("Install required tools (cmake, ctest, C++ compiler) and retry.")
@@ -56,7 +62,7 @@ def main() -> int:
         print(f"[FAIL] {e}")
         return 1
 
-    print("\n[PASS] Vector DB Phase 2 checks completed.")
+    print("\n[PASS] Vector DB Phase 3 checks completed.")
     return 0
 
 

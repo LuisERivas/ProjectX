@@ -7,8 +7,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(vectordb
     src/vector_store.cpp
+    src/clustering/id_estimator.cpp
+    src/clustering/elbow_search.cpp
+    src/clustering/stability.cpp
 )
 target_include_directories(vectordb PUBLIC include)
+
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    enable_language(CUDA)
+    target_sources(vectordb PRIVATE src/clustering/spherical_kmeans_cuda.cu)
+    target_link_libraries(vectordb PRIVATE CUDA::cudart)
+    target_compile_definitions(vectordb PRIVATE VECTOR_DB_USE_CUDA=1)
+endif()
 
 add_executable(vectordb_cli
     cli/main.cpp

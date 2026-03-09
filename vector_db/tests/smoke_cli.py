@@ -16,8 +16,12 @@ def run(cmd: list[str]) -> str:
     return proc.stdout.strip()
 
 
-def make_vec() -> str:
-    return ",".join(f"{(i * 0.01):.6f}" for i in range(1024))
+def make_vec(seed: int) -> str:
+    vals = [0.0] * 1024
+    base = seed % 32
+    vals[base] = 0.8
+    vals[(base + 1) % 1024] = 0.6
+    return ",".join(f"{v:.6f}" for v in vals)
 
 
 def main() -> int:
@@ -31,9 +35,23 @@ def main() -> int:
     if data_dir.exists():
         shutil.rmtree(data_dir)
 
-    vec = make_vec()
+    vec = make_vec(0)
     run([str(cli), "init", "--path", str(data_dir)])
-    run([str(cli), "insert", "--path", str(data_dir), "--id", "100", "--vec", vec, "--meta", '{"kind":"a"}'])
+    for i in range(12):
+        run(
+            [
+                str(cli),
+                "insert",
+                "--path",
+                str(data_dir),
+                "--id",
+                str(100 + i),
+                "--vec",
+                make_vec(i),
+                "--meta",
+                '{"kind":"a"}',
+            ]
+        )
     run([str(cli), "get", "--path", str(data_dir), "--id", "100"])
     run([str(cli), "update-meta", "--path", str(data_dir), "--id", "100", "--meta", '{"kind":"b","x":1}'])
     run([str(cli), "delete", "--path", str(data_dir), "--id", "100"])
@@ -41,7 +59,7 @@ def main() -> int:
     assert wal_before_checkpoint["wal_entries"] >= 3
     stats_out = run([str(cli), "stats", "--path", str(data_dir)])
     parsed = json.loads(stats_out)
-    assert parsed["total_rows"] == 1
+    assert parsed["total_rows"] == 12
     assert parsed["tombstone_rows"] == 1
     assert (data_dir / "manifest.json").exists()
     assert (data_dir / "dirty_ranges.json").exists()
@@ -52,13 +70,24 @@ def main() -> int:
     assert wal_after_checkpoint["wal_entries"] == 0
     assert wal_after_checkpoint["checkpoint_lsn"] >= wal_before_checkpoint["last_lsn"]
 
+    run([str(cli), "build-initial-clusters", "--path", str(data_dir), "--seed", "9001"])
+    cluster_stats = json.loads(run([str(cli), "cluster-stats", "--path", str(data_dir)]))
+    cluster_health = json.loads(run([str(cli), "cluster-health", "--path", str(data_dir)]))
+    assert cluster_stats["available"] is True
+    assert cluster_stats["chosen_k"] >= cluster_stats["k_min"]
+    assert cluster_stats["chosen_k"] <= cluster_stats["k_max"]
+    assert cluster_health["available"] is True
+    assert (data_dir / "clusters" / "initial" / "cluster_manifest.json").exists()
+
     # Restart behavior: invoke fresh process again and verify get still works.
     get_after_restart = run([str(cli), "get", "--path", str(data_dir), "--id", "100"])
     assert '"deleted": true' in get_after_restart
     stats_after_restart = json.loads(run([str(cli), "stats", "--path", str(data_dir)]))
-    assert stats_after_restart["total_rows"] == 1
+    assert stats_after_restart["total_rows"] == 12
     assert stats_after_restart["tombstone_rows"] == 1
     assert stats_after_restart["dirty_ranges"] >= 3
+    cluster_stats_after = json.loads(run([str(cli), "cluster-stats", "--path", str(data_dir)]))
+    assert cluster_stats_after["version"] == cluster_stats["version"]
 
     shutil.rmtree(data_dir)
     print("smoke_cli: PASS")

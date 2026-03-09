@@ -1,4 +1,5 @@
 #include "vector_db/vector_store.hpp"
+#include "vector_db/clustering.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -8,6 +9,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -172,6 +176,39 @@ std::optional<std::string> extract_string_field(const std::string& text, const s
     return text.substr(q1 + 1, q2 - q1 - 1);
 }
 
+std::optional<double> extract_double_field(const std::string& text, const std::string& key) {
+    const auto key_pos = text.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto n0 = text.find_first_of("-0123456789", key_pos);
+    if (n0 == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto n1 = text.find_first_not_of("0123456789+-.eE", n0);
+    try {
+        return std::stod(text.substr(n0, n1 - n0));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<bool> extract_bool_field(const std::string& text, const std::string& key) {
+    const auto key_pos = text.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto t = text.find("true", key_pos);
+    if (t != std::string::npos) {
+        return true;
+    }
+    const auto f = text.find("false", key_pos);
+    if (f != std::string::npos) {
+        return false;
+    }
+    return std::nullopt;
+}
+
 Status write_text_atomic(const fs::path& path, const std::string& content) {
     const fs::path tmp = path.string() + ".tmp";
     {
@@ -227,12 +264,16 @@ struct VectorStore::Impl {
 
     std::unordered_map<std::uint64_t, Entry> entries;
     std::vector<DirtyRange> dirty_ranges;
+    ClusterStats cluster_stats_cache;
+    ClusterHealth cluster_health_cache;
 
     fs::path root() const { return fs::path(data_dir); }
     fs::path segments_dir() const { return root() / "segments"; }
     fs::path manifest_path() const { return root() / "manifest.json"; }
     fs::path dirty_ranges_path() const { return root() / "dirty_ranges.json"; }
     fs::path wal_path() const { return root() / "wal.log"; }
+    fs::path clusters_root() const { return root() / "clusters" / "initial"; }
+    fs::path cluster_manifest_path() const { return clusters_root() / "cluster_manifest.json"; }
 
     fs::path seg_base(std::uint64_t seg_id) const {
         return segments_dir() / ("seg_" + std::to_string(seg_id));
@@ -252,6 +293,10 @@ struct VectorStore::Impl {
         fs::create_directories(segments_dir(), ec);
         if (ec) {
             return Status::Error("failed creating segments dir: " + segments_dir().string());
+        }
+        fs::create_directories(clusters_root(), ec);
+        if (ec) {
+            return Status::Error("failed creating clusters dir: " + clusters_root().string());
         }
         return Status::Ok();
     }
@@ -683,6 +728,212 @@ struct VectorStore::Impl {
         return Status::Ok();
     }
 
+    std::vector<std::pair<std::uint64_t, std::vector<float>>> collect_live_vectors() const {
+        std::vector<std::pair<std::uint64_t, std::vector<float>>> out;
+        out.reserve(entries.size());
+        for (const auto& kv : entries) {
+            if (kv.second.deleted) {
+                continue;
+            }
+            const auto vec = read_vector_at_row(kv.second.row);
+            if (!vec.has_value()) {
+                continue;
+            }
+            out.push_back({kv.first, *vec});
+        }
+        std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
+        return out;
+    }
+
+    std::uint64_t next_cluster_version() const {
+        return cluster_stats_cache.available ? (cluster_stats_cache.version + 1) : 1;
+    }
+
+    Status load_cluster_manifest() {
+        cluster_stats_cache = ClusterStats{};
+        cluster_health_cache = ClusterHealth{};
+        const fs::path p = cluster_manifest_path();
+        if (!fs::exists(p)) {
+            return Status::Ok();
+        }
+        std::ifstream in(p, std::ios::binary);
+        if (!in) {
+            return Status::Error("failed opening cluster manifest: " + p.string());
+        }
+        std::ostringstream os;
+        os << in.rdbuf();
+        const std::string text = os.str();
+        cluster_stats_cache.available = true;
+        cluster_health_cache.available = true;
+        if (const auto v = extract_u64_field(text, "version"); v.has_value()) {
+            cluster_stats_cache.version = *v;
+        }
+        if (const auto v = extract_u64_field(text, "build_lsn"); v.has_value()) {
+            cluster_stats_cache.build_lsn = *v;
+        }
+        if (const auto v = extract_u64_field(text, "vectors_indexed"); v.has_value()) {
+            cluster_stats_cache.vectors_indexed = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "chosen_k"); v.has_value()) {
+            cluster_stats_cache.chosen_k = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "k_min"); v.has_value()) {
+            cluster_stats_cache.k_min = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "k_max"); v.has_value()) {
+            cluster_stats_cache.k_max = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_double_field(text, "objective"); v.has_value()) {
+            cluster_stats_cache.objective = *v;
+        }
+        if (const auto v = extract_bool_field(text, "used_cuda"); v.has_value()) {
+            cluster_stats_cache.used_cuda = *v;
+        }
+        if (const auto v = extract_double_field(text, "mean_nmi"); v.has_value()) {
+            cluster_health_cache.mean_nmi = *v;
+        }
+        if (const auto v = extract_double_field(text, "std_nmi"); v.has_value()) {
+            cluster_health_cache.std_nmi = *v;
+        }
+        if (const auto v = extract_double_field(text, "mean_jaccard"); v.has_value()) {
+            cluster_health_cache.mean_jaccard = *v;
+        }
+        if (const auto v = extract_double_field(text, "mean_centroid_drift"); v.has_value()) {
+            cluster_health_cache.mean_centroid_drift = *v;
+        }
+        if (const auto v = extract_bool_field(text, "stability_passed"); v.has_value()) {
+            cluster_health_cache.passed = *v;
+        }
+        cluster_health_cache.status = cluster_health_cache.passed ? "ok" : "failed";
+        return Status::Ok();
+    }
+
+    Status write_cluster_manifest(
+        const ClusterStats& stats,
+        const ClusterHealth& health,
+        const IdEstimateRange& idr,
+        bool elbow_fallback) const {
+        std::ostringstream os;
+        os << "{\n";
+        os << "  \"version\": " << stats.version << ",\n";
+        os << "  \"build_lsn\": " << stats.build_lsn << ",\n";
+        os << "  \"vectors_indexed\": " << stats.vectors_indexed << ",\n";
+        os << "  \"chosen_k\": " << stats.chosen_k << ",\n";
+        os << "  \"k_min\": " << stats.k_min << ",\n";
+        os << "  \"k_max\": " << stats.k_max << ",\n";
+        os << "  \"objective\": " << std::setprecision(10) << stats.objective << ",\n";
+        os << "  \"used_cuda\": " << (stats.used_cuda ? "true" : "false") << ",\n";
+        os << "  \"id_sample_size\": " << idr.sample_size << ",\n";
+        os << "  \"id_m_low\": " << idr.m_low << ",\n";
+        os << "  \"id_m_high\": " << idr.m_high << ",\n";
+        os << "  \"elbow_fallback\": " << (elbow_fallback ? "true" : "false") << ",\n";
+        os << "  \"mean_nmi\": " << health.mean_nmi << ",\n";
+        os << "  \"std_nmi\": " << health.std_nmi << ",\n";
+        os << "  \"mean_jaccard\": " << health.mean_jaccard << ",\n";
+        os << "  \"mean_centroid_drift\": " << health.mean_centroid_drift << ",\n";
+        os << "  \"stability_passed\": " << (health.passed ? "true" : "false") << "\n";
+        os << "}\n";
+        return write_text_atomic(cluster_manifest_path(), os.str());
+    }
+
+    Status write_initial_cluster_artifacts(
+        std::uint64_t version,
+        const IdEstimateRange& idr,
+        const ElbowSelection& elbow,
+        const KMeansModel& model,
+        const StabilityMetrics& stability,
+        const std::vector<std::pair<std::uint64_t, std::vector<float>>>& vectors) const {
+        std::error_code ec;
+        const fs::path out_dir = clusters_root() / ("v" + std::to_string(version));
+        fs::create_directories(out_dir, ec);
+        if (ec) {
+            return Status::Error("failed creating clustering version directory: " + out_dir.string());
+        }
+
+        {
+            std::ostringstream os;
+            os << "{\n";
+            os << "  \"sample_size\": " << idr.sample_size << ",\n";
+            os << "  \"m_low\": " << idr.m_low << ",\n";
+            os << "  \"m_high\": " << idr.m_high << ",\n";
+            os << "  \"k_min\": " << idr.k_min << ",\n";
+            os << "  \"k_max\": " << idr.k_max << "\n";
+            os << "}\n";
+            if (const Status s = write_text_atomic(out_dir / "id_estimate.json", os.str()); !s.ok) {
+                return s;
+            }
+        }
+        {
+            std::ostringstream os;
+            os << "{\n";
+            os << "  \"chosen_k\": " << elbow.chosen_k << ",\n";
+            os << "  \"used_fallback\": " << (elbow.used_fallback ? "true" : "false") << ",\n";
+            os << "  \"trace\": [\n";
+            for (std::size_t i = 0; i < elbow.trace.size(); ++i) {
+                const auto& t = elbow.trace[i];
+                os << "    {\"k\": " << t.k << ", \"objective\": " << t.objective << ", \"gain_to_2k\": " << t.gain_to_2k << "}";
+                if (i + 1 < elbow.trace.size()) {
+                    os << ",";
+                }
+                os << "\n";
+            }
+            os << "  ]\n}\n";
+            if (const Status s = write_text_atomic(out_dir / "elbow_trace.json", os.str()); !s.ok) {
+                return s;
+            }
+        }
+        {
+            std::ostringstream os;
+            os << "{\n";
+            os << "  \"mean_nmi\": " << stability.mean_nmi << ",\n";
+            os << "  \"std_nmi\": " << stability.std_nmi << ",\n";
+            os << "  \"mean_jaccard\": " << stability.mean_jaccard << ",\n";
+            os << "  \"mean_centroid_drift\": " << stability.mean_centroid_drift << ",\n";
+            os << "  \"passed\": " << (stability.passed ? "true" : "false") << "\n";
+            os << "}\n";
+            if (const Status s = write_text_atomic(out_dir / "stability_report.json", os.str()); !s.ok) {
+                return s;
+            }
+        }
+        {
+            std::ofstream cent_out(out_dir / "centroids.bin", std::ios::binary | std::ios::trunc);
+            if (!cent_out) {
+                return Status::Error("failed opening centroids.bin for write");
+            }
+            cent_out.write(
+                reinterpret_cast<const char*>(model.centroids.data()),
+                static_cast<std::streamsize>(model.centroids.size() * sizeof(float)));
+            if (!cent_out.good()) {
+                return Status::Error("failed writing centroids.bin");
+            }
+        }
+        {
+            std::ostringstream os;
+            os << "{\n  \"assignments\": [\n";
+            for (std::size_t i = 0; i < vectors.size(); ++i) {
+                os << "    {\"id\": " << vectors[i].first << ", \"top\": [";
+                for (std::size_t j = 0; j < model.assignments[i].size(); ++j) {
+                    if (j > 0) {
+                        os << ", ";
+                    }
+                    os << model.assignments[i][j];
+                }
+                os << "]}";
+                if (i + 1 < vectors.size()) {
+                    os << ",";
+                }
+                os << "\n";
+            }
+            os << "  ]\n}\n";
+            if (const Status s = write_text_atomic(out_dir / "assignments.json", os.str()); !s.ok) {
+                return s;
+            }
+        }
+        return Status::Ok();
+    }
+
     Status apply_insert_internal(
         std::uint64_t id,
         const std::vector<float>& vector_fp32_1024,
@@ -922,6 +1173,9 @@ Status VectorStore::open() {
     if (const Status s = impl_->load_dirty_ranges(); !s.ok) {
         return s;
     }
+    if (const Status s = impl_->load_cluster_manifest(); !s.ok) {
+        return s;
+    }
     if (const Status s = impl_->replay_wal(); !s.ok) {
         return s;
     }
@@ -953,6 +1207,73 @@ Status VectorStore::checkpoint() {
         return s;
     }
     return write_text_atomic(impl_->wal_path(), "");
+}
+
+Status VectorStore::build_initial_clusters(std::uint32_t seed) {
+    if (!impl_->opened) {
+        if (const Status s = open(); !s.ok) {
+            return s;
+        }
+    }
+    const auto live = impl_->collect_live_vectors();
+    if (live.size() < 8) {
+        return Status::Error("need at least 8 live vectors to build initial clusters");
+    }
+    std::vector<std::vector<float>> vectors;
+    vectors.reserve(live.size());
+    for (const auto& kv : live) {
+        vectors.push_back(kv.second);
+    }
+
+    InitialClusteringConfig cfg;
+    cfg.seed = seed;
+    cfg.max_sample = std::max<std::size_t>(256, std::min<std::size_t>(4096, vectors.size()));
+
+    IdEstimateRange idr;
+    if (const Status s = estimate_intrinsic_dimensionality(vectors, cfg.seed, cfg.min_sample, cfg.max_sample, &idr); !s.ok) {
+        return s;
+    }
+    KMeansModel model;
+    ElbowSelection elbow;
+    if (const Status s = select_k_binary_elbow(vectors, idr, cfg, &model, &elbow); !s.ok) {
+        return s;
+    }
+    StabilityMetrics stability;
+    if (const Status s = evaluate_stability(vectors, model.k, cfg, &stability); !s.ok) {
+        return s;
+    }
+
+    const std::uint64_t version = impl_->next_cluster_version();
+    if (const Status s = impl_->write_initial_cluster_artifacts(version, idr, elbow, model, stability, live); !s.ok) {
+        return s;
+    }
+
+    ClusterStats st{};
+    st.available = true;
+    st.version = version;
+    st.build_lsn = impl_->last_lsn;
+    st.vectors_indexed = vectors.size();
+    st.chosen_k = model.k;
+    st.k_min = idr.k_min;
+    st.k_max = idr.k_max;
+    st.objective = model.objective;
+    st.used_cuda = model.used_cuda;
+
+    ClusterHealth health{};
+    health.available = true;
+    health.passed = stability.passed;
+    health.mean_nmi = stability.mean_nmi;
+    health.std_nmi = stability.std_nmi;
+    health.mean_jaccard = stability.mean_jaccard;
+    health.mean_centroid_drift = stability.mean_centroid_drift;
+    health.status = stability.passed ? "ok" : "failed";
+
+    if (const Status s = impl_->write_cluster_manifest(st, health, idr, elbow.used_fallback); !s.ok) {
+        return s;
+    }
+    impl_->cluster_stats_cache = st;
+    impl_->cluster_health_cache = health;
+    return Status::Ok();
 }
 
 Status VectorStore::close() {
@@ -1060,6 +1381,8 @@ std::optional<StoredRecord> VectorStore::get(std::uint64_t id) const {
 
 Stats VectorStore::stats() const { return impl_->current_stats(); }
 WalStats VectorStore::wal_stats() const { return impl_->current_wal_stats(); }
+ClusterStats VectorStore::cluster_stats() const { return impl_->cluster_stats_cache; }
+ClusterHealth VectorStore::cluster_health() const { return impl_->cluster_health_cache; }
 
 }  // namespace vector_db
 

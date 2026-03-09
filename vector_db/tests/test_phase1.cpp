@@ -1,5 +1,6 @@
 #include <filesystem>
 #include <fstream>
+#include <cmath>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -23,6 +24,21 @@ std::vector<float> make_vec(float base) {
     std::vector<float> v(vector_db::kVectorDim, 0.0f);
     for (std::size_t i = 0; i < v.size(); ++i) {
         v[i] = base + static_cast<float>(i) * 0.001f;
+    }
+    return v;
+}
+
+std::vector<float> make_unit_vec(std::size_t hot_idx, float strength) {
+    std::vector<float> v(vector_db::kVectorDim, 0.0f);
+    v[hot_idx % vector_db::kVectorDim] = strength;
+    v[(hot_idx + 1) % vector_db::kVectorDim] = 1.0f - strength;
+    float norm_sq = 0.0f;
+    for (float x : v) {
+        norm_sq += x * x;
+    }
+    const float norm = std::sqrt(norm_sq);
+    for (float& x : v) {
+        x /= norm;
     }
     return v;
 }
@@ -60,6 +76,20 @@ std::vector<std::uint64_t> parse_lsns(const fs::path& p) {
         out.push_back(static_cast<std::uint64_t>(std::stoull(line.substr(n0, n1 - n0))));
     }
     return out;
+}
+
+std::size_t count_substr(const std::string& text, const std::string& needle) {
+    std::size_t count = 0;
+    std::size_t pos = 0;
+    while (true) {
+        pos = text.find(needle, pos);
+        if (pos == std::string::npos) {
+            break;
+        }
+        ++count;
+        pos += needle.size();
+    }
+    return count;
 }
 
 }  // namespace
@@ -200,9 +230,72 @@ int main() {
         return 1;
     }
 
-    std::cout << "[PASS] vectordb phase2 wal/recovery tests\n";
+    // Phase 3: initial clustering build + reload.
+    const fs::path cluster_dir = fs::path("vector_db_test_data_phase3");
+    fs::remove_all(cluster_dir, ec);
+    vector_db::VectorStore cluster_store(cluster_dir.string());
+    if (!expect(cluster_store.init().ok, "phase3 init succeeds")) {
+        return 1;
+    }
+    if (!expect(cluster_store.open().ok, "phase3 open succeeds")) {
+        return 1;
+    }
+    for (std::uint64_t i = 0; i < 32; ++i) {
+        const auto vec = make_unit_vec(static_cast<std::size_t>(i % 2 == 0 ? 10 : 200), 0.95f);
+        if (!expect(cluster_store.insert(1000 + i, vec, "{\"kind\":\"cluster\"}").ok, "phase3 insert")) {
+            return 1;
+        }
+    }
+    if (!expect(cluster_store.build_initial_clusters(777).ok, "build initial clusters succeeds")) {
+        return 1;
+    }
+    const auto cstats = cluster_store.cluster_stats();
+    if (!expect(cstats.available, "cluster stats available")) {
+        return 1;
+    }
+    if (!expect(cstats.version >= 1, "cluster version set")) {
+        return 1;
+    }
+    if (!expect(cstats.chosen_k >= cstats.k_min && cstats.chosen_k <= cstats.k_max, "chosen_k in discovered range")) {
+        return 1;
+    }
+    if (!expect(fs::exists(cluster_dir / "clusters" / "initial" / "cluster_manifest.json"), "cluster manifest exists")) {
+        return 1;
+    }
+    if (!expect(fs::exists(cluster_dir / "clusters" / "initial" / ("v" + std::to_string(cstats.version)) / "id_estimate.json"), "id estimate artifact exists")) {
+        return 1;
+    }
+    if (!expect(fs::exists(cluster_dir / "clusters" / "initial" / ("v" + std::to_string(cstats.version)) / "elbow_trace.json"), "elbow trace artifact exists")) {
+        return 1;
+    }
+    if (!expect(fs::exists(cluster_dir / "clusters" / "initial" / ("v" + std::to_string(cstats.version)) / "stability_report.json"), "stability artifact exists")) {
+        return 1;
+    }
+    const auto elbow_trace = slurp(cluster_dir / "clusters" / "initial" / ("v" + std::to_string(cstats.version)) / "elbow_trace.json");
+    const std::size_t evaluated_k = count_substr(elbow_trace, "\"k\": ");
+    if (!expect(evaluated_k >= 2, "elbow trace has multiple k evaluations")) {
+        return 1;
+    }
+    if (!expect(evaluated_k <= 16, "elbow search remains bounded")) {
+        return 1;
+    }
+    if (!expect(cluster_store.close().ok, "phase3 close succeeds")) {
+        return 1;
+    }
+    vector_db::VectorStore cluster_reopen(cluster_dir.string());
+    if (!expect(cluster_reopen.open().ok, "phase3 reopen succeeds")) {
+        return 1;
+    }
+    const auto cstats_reopen = cluster_reopen.cluster_stats();
+    if (!expect(cstats_reopen.available && cstats_reopen.version == cstats.version, "cluster stats stable across reopen")) {
+        return 1;
+    }
+
+    std::cout << "[PASS] vectordb phase3 initial clustering tests\n";
     malformed_tail_reopen.close();
+    cluster_reopen.close();
     fs::remove_all(test_dir, ec);
+    fs::remove_all(cluster_dir, ec);
     return 0;
 }
 
