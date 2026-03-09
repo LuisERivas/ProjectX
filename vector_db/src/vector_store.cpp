@@ -792,6 +792,18 @@ struct VectorStore::Impl {
         if (const auto v = extract_bool_field(text, "used_cuda"); v.has_value()) {
             cluster_stats_cache.used_cuda = *v;
         }
+        if (const auto v = extract_bool_field(text, "tensor_core_enabled"); v.has_value()) {
+            cluster_stats_cache.tensor_core_enabled = *v;
+        }
+        if (const auto v = extract_string_field(text, "gpu_backend"); v.has_value()) {
+            cluster_stats_cache.gpu_backend = *v;
+        }
+        if (const auto v = extract_double_field(text, "scoring_ms_total"); v.has_value()) {
+            cluster_stats_cache.scoring_ms_total = *v;
+        }
+        if (const auto v = extract_u64_field(text, "scoring_calls"); v.has_value()) {
+            cluster_stats_cache.scoring_calls = static_cast<std::size_t>(*v);
+        }
         if (const auto v = extract_double_field(text, "mean_nmi"); v.has_value()) {
             cluster_health_cache.mean_nmi = *v;
         }
@@ -826,6 +838,10 @@ struct VectorStore::Impl {
         os << "  \"k_max\": " << stats.k_max << ",\n";
         os << "  \"objective\": " << std::setprecision(10) << stats.objective << ",\n";
         os << "  \"used_cuda\": " << (stats.used_cuda ? "true" : "false") << ",\n";
+        os << "  \"tensor_core_enabled\": " << (stats.tensor_core_enabled ? "true" : "false") << ",\n";
+        os << "  \"gpu_backend\": \"" << json_escape(stats.gpu_backend) << "\",\n";
+        os << "  \"scoring_ms_total\": " << stats.scoring_ms_total << ",\n";
+        os << "  \"scoring_calls\": " << stats.scoring_calls << ",\n";
         os << "  \"id_sample_size\": " << idr.sample_size << ",\n";
         os << "  \"id_m_low\": " << idr.m_low << ",\n";
         os << "  \"id_m_high\": " << idr.m_high << ",\n";
@@ -1264,6 +1280,10 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     st.k_max = idr.k_max;
     st.objective = model.objective;
     st.used_cuda = model.used_cuda;
+    st.tensor_core_enabled = model.tensor_core_enabled;
+    st.gpu_backend = model.gpu_backend;
+    st.scoring_ms_total = model.scoring_ms_total;
+    st.scoring_calls = model.scoring_calls;
 
     ClusterHealth health{};
     health.available = true;
@@ -1279,7 +1299,10 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     }
     impl_->cluster_stats_cache = st;
     impl_->cluster_health_cache = health;
-    std::cout << "progress: clustering done chosen_k=" << st.chosen_k << " stability=" << (health.passed ? "pass" : "fail") << "\n";
+    std::cout << "progress: clustering done chosen_k=" << st.chosen_k
+              << " backend=" << st.gpu_backend
+              << " tensor_core=" << (st.tensor_core_enabled ? "on" : "off")
+              << " stability=" << (health.passed ? "pass" : "fail") << "\n";
     return Status::Ok();
 }
 

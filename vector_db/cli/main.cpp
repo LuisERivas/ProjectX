@@ -426,7 +426,11 @@ int main(int argc, char** argv) {
                   << "  \"k_min\": " << st.k_min << ",\n"
                   << "  \"k_max\": " << st.k_max << ",\n"
                   << "  \"objective\": " << st.objective << ",\n"
-                  << "  \"used_cuda\": " << (st.used_cuda ? "true" : "false") << "\n"
+                  << "  \"used_cuda\": " << (st.used_cuda ? "true" : "false") << ",\n"
+                  << "  \"tensor_core_enabled\": " << (st.tensor_core_enabled ? "true" : "false") << ",\n"
+                  << "  \"gpu_backend\": \"" << st.gpu_backend << "\",\n"
+                  << "  \"scoring_ms_total\": " << st.scoring_ms_total << ",\n"
+                  << "  \"scoring_calls\": " << st.scoring_calls << "\n"
                   << "}\n";
         return 0;
     }

@@ -1,6 +1,7 @@
 #include "vector_db/clustering.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -66,10 +67,16 @@ Status compute_scores(
     const std::vector<float>& centroids,
     std::size_t k,
     std::vector<float>* out_scores,
-    bool* used_cuda) {
+    bool* used_cuda,
+    bool* tensor_core_enabled,
+    std::string* backend_name,
+    double* elapsed_ms) {
     const std::size_t n = vectors.size();
     out_scores->assign(n * k, 0.0f);
     *used_cuda = false;
+    *tensor_core_enabled = false;
+    *backend_name = "cpu";
+    *elapsed_ms = 0.0;
 
     std::vector<float> vectors_row_major;
     vectors_row_major.reserve(n * kDim);
@@ -78,12 +85,26 @@ Status compute_scores(
     }
 
     if (cuda_dot_products_available()) {
-        if (const Status s = cuda_compute_dot_products(vectors_row_major, centroids, n, k, kDim, out_scores); s.ok) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (const Status s = cuda_compute_dot_products(
+                vectors_row_major,
+                centroids,
+                n,
+                k,
+                kDim,
+                out_scores,
+                tensor_core_enabled,
+                backend_name);
+            s.ok) {
+            auto t1 = std::chrono::steady_clock::now();
+            *elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             *used_cuda = true;
             return Status::Ok();
         }
+        *backend_name = "cpu_fallback";
     }
 
+    auto t0 = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < n; ++i) {
         for (std::size_t c = 0; c < k; ++c) {
             const float* x = vectors[i].data();
@@ -91,6 +112,8 @@ Status compute_scores(
             (*out_scores)[i * k + c] = dot_raw(x, mu, kDim);
         }
     }
+    auto t1 = std::chrono::steady_clock::now();
+    *elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     return Status::Ok();
 }
 
@@ -133,55 +156,97 @@ Status run_kmeans_impl(
 
     std::vector<float> scores;
     bool used_cuda_once = false;
+    bool tensor_core_once = false;
+    std::string backend_used = "cpu";
+    double scoring_ms_total = 0.0;
+    std::size_t scoring_calls = 0;
     for (std::size_t iter = 0; iter < cfg.iters; ++iter) {
         bool used_cuda_iter = false;
-        if (const Status s = compute_scores(vectors, centroids, k, &scores, &used_cuda_iter); !s.ok) {
+        bool tensor_iter = false;
+        std::string backend_iter = "cpu";
+        double scoring_ms = 0.0;
+        if (const Status s = compute_scores(vectors, centroids, k, &scores, &used_cuda_iter, &tensor_iter, &backend_iter, &scoring_ms); !s.ok) {
             return s;
         }
         used_cuda_once = used_cuda_once || used_cuda_iter;
+        tensor_core_once = tensor_core_once || tensor_iter;
+        if (backend_used == "cpu" || backend_used == "cpu_fallback") {
+            backend_used = backend_iter;
+        }
+        scoring_ms_total += scoring_ms;
+        scoring_calls += 1;
 
-        std::vector<float> sums(k * kDim, 0.0f);
-        std::vector<std::size_t> counts(k, 0);
-        for (std::size_t i = 0; i < vectors.size(); ++i) {
-            std::size_t best = 0;
-            float best_score = -std::numeric_limits<float>::infinity();
-            for (std::size_t c = 0; c < k; ++c) {
-                const float s = scores[i * k + c];
-                if (s > best_score) {
-                    best_score = s;
-                    best = c;
+        bool updated_on_gpu = false;
+        if (used_cuda_iter && cuda_assignment_kernels_available()) {
+            std::vector<std::uint32_t> labels_gpu;
+            std::vector<float> best_scores;
+            if (const Status s = cuda_assign_top1_labels(scores, vectors.size(), k, &labels_gpu, &best_scores); s.ok) {
+                std::vector<float> vectors_row_major;
+                vectors_row_major.reserve(vectors.size() * kDim);
+                for (const auto& v : vectors) {
+                    vectors_row_major.insert(vectors_row_major.end(), v.begin(), v.end());
                 }
-            }
-            counts[best] += 1;
-            for (std::size_t d = 0; d < kDim; ++d) {
-                sums[best * kDim + d] += vectors[i][d];
+                std::vector<float> centroids_gpu;
+                if (const Status s2 = cuda_reduce_centroids_top1(vectors_row_major, labels_gpu, vectors.size(), k, kDim, &centroids_gpu); s2.ok) {
+                    centroids = std::move(centroids_gpu);
+                    updated_on_gpu = true;
+                }
             }
         }
 
-        for (std::size_t c = 0; c < k; ++c) {
-            if (counts[c] == 0) {
-                const auto& src = vectors[idx[(c + iter) % vectors.size()]];
-                std::copy(src.begin(), src.end(), centroids.begin() + static_cast<std::ptrdiff_t>(c * kDim));
-                continue;
+        if (!updated_on_gpu) {
+            std::vector<float> sums(k * kDim, 0.0f);
+            std::vector<std::size_t> counts(k, 0);
+            for (std::size_t i = 0; i < vectors.size(); ++i) {
+                std::size_t best = 0;
+                float best_score = -std::numeric_limits<float>::infinity();
+                for (std::size_t c = 0; c < k; ++c) {
+                    const float s = scores[i * k + c];
+                    if (s > best_score) {
+                        best_score = s;
+                        best = c;
+                    }
+                }
+                counts[best] += 1;
+                for (std::size_t d = 0; d < kDim; ++d) {
+                    sums[best * kDim + d] += vectors[i][d];
+                }
             }
-            float norm_sq = 0.0f;
-            for (std::size_t d = 0; d < kDim; ++d) {
-                const float v = sums[c * kDim + d] / static_cast<float>(counts[c]);
-                centroids[c * kDim + d] = v;
-                norm_sq += v * v;
-            }
-            const float norm = std::sqrt(std::max(1e-12f, norm_sq));
-            for (std::size_t d = 0; d < kDim; ++d) {
-                centroids[c * kDim + d] /= norm;
+
+            for (std::size_t c = 0; c < k; ++c) {
+                if (counts[c] == 0) {
+                    const auto& src = vectors[idx[(c + iter) % vectors.size()]];
+                    std::copy(src.begin(), src.end(), centroids.begin() + static_cast<std::ptrdiff_t>(c * kDim));
+                    continue;
+                }
+                float norm_sq = 0.0f;
+                for (std::size_t d = 0; d < kDim; ++d) {
+                    const float v = sums[c * kDim + d] / static_cast<float>(counts[c]);
+                    centroids[c * kDim + d] = v;
+                    norm_sq += v * v;
+                }
+                const float norm = std::sqrt(std::max(1e-12f, norm_sq));
+                for (std::size_t d = 0; d < kDim; ++d) {
+                    centroids[c * kDim + d] /= norm;
+                }
             }
         }
     }
 
     bool used_cuda_final = false;
-    if (const Status s = compute_scores(vectors, centroids, k, &scores, &used_cuda_final); !s.ok) {
+    bool tensor_final = false;
+    std::string backend_final = "cpu";
+    double scoring_ms_final = 0.0;
+    if (const Status s = compute_scores(vectors, centroids, k, &scores, &used_cuda_final, &tensor_final, &backend_final, &scoring_ms_final); !s.ok) {
         return s;
     }
     used_cuda_once = used_cuda_once || used_cuda_final;
+    tensor_core_once = tensor_core_once || tensor_final;
+    if (backend_used == "cpu" || backend_used == "cpu_fallback") {
+        backend_used = backend_final;
+    }
+    scoring_ms_total += scoring_ms_final;
+    scoring_calls += 1;
 
     std::vector<std::vector<std::uint32_t>> top_assign(vectors.size());
     std::vector<std::uint32_t> labels(vectors.size(), 0);
@@ -201,6 +266,10 @@ Status run_kmeans_impl(
     out_model->k = k;
     out_model->objective = objective;
     out_model->used_cuda = used_cuda_once;
+    out_model->tensor_core_enabled = tensor_core_once;
+    out_model->gpu_backend = backend_used;
+    out_model->scoring_ms_total = scoring_ms_total;
+    out_model->scoring_calls = scoring_calls;
     out_model->centroids = std::move(centroids);
     out_model->assignments = std::move(top_assign);
     out_model->labels = std::move(labels);
@@ -331,9 +400,35 @@ Status select_k_binary_elbow(
 
 #ifndef VECTOR_DB_USE_CUDA
 bool cuda_dot_products_available() { return false; }
+bool cuda_assignment_kernels_available() { return false; }
 Status cuda_compute_dot_products(
     const std::vector<float>&,
     const std::vector<float>&,
+    std::size_t,
+    std::size_t,
+    std::size_t,
+    std::vector<float>*,
+    bool* out_tensor_core_enabled,
+    std::string* out_backend_name) {
+    if (out_tensor_core_enabled != nullptr) {
+        *out_tensor_core_enabled = false;
+    }
+    if (out_backend_name != nullptr) {
+        *out_backend_name = "cpu";
+    }
+    return Status::Error("cuda support is not compiled");
+}
+Status cuda_assign_top1_labels(
+    const std::vector<float>&,
+    std::size_t,
+    std::size_t,
+    std::vector<std::uint32_t>*,
+    std::vector<float>*) {
+    return Status::Error("cuda support is not compiled");
+}
+Status cuda_reduce_centroids_top1(
+    const std::vector<float>&,
+    const std::vector<std::uint32_t>&,
     std::size_t,
     std::size_t,
     std::size_t,

@@ -71,6 +71,10 @@ def main() -> int:
     assert cluster_stats["available"] is True
     assert cluster_stats["chosen_k"] >= cluster_stats["k_min"]
     assert cluster_stats["chosen_k"] <= cluster_stats["k_max"]
+    assert "gpu_backend" in cluster_stats
+    assert "tensor_core_enabled" in cluster_stats
+    assert "scoring_ms_total" in cluster_stats
+    assert "scoring_calls" in cluster_stats
     assert cluster_health["available"] is True
     assert (data_dir / "clusters" / "initial" / "cluster_manifest.json").exists()
 

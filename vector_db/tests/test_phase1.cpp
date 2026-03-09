@@ -264,6 +264,12 @@ int main() {
     if (!expect(cstats.chosen_k >= cstats.k_min && cstats.chosen_k <= cstats.k_max, "chosen_k in discovered range")) {
         return 1;
     }
+    if (!expect(!cstats.gpu_backend.empty(), "cluster backend telemetry populated")) {
+        return 1;
+    }
+    if (!expect(cstats.scoring_calls > 0, "cluster scoring call telemetry populated")) {
+        return 1;
+    }
     if (!expect(fs::exists(cluster_dir / "clusters" / "initial" / "cluster_manifest.json"), "cluster manifest exists")) {
         return 1;
     }

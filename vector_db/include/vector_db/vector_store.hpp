@@ -56,6 +56,10 @@ struct ClusterStats {
     std::size_t k_max = 0;
     double objective = 0.0;
     bool used_cuda = false;
+    bool tensor_core_enabled = false;
+    std::string gpu_backend = "cpu";
+    double scoring_ms_total = 0.0;
+    std::size_t scoring_calls = 0;
 };
 
 struct ClusterHealth {
