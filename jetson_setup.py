@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 REDIS_PACKAGE = os.getenv("REDIS_PACKAGE", "redis")
 REDIS_SYSTEMD_NAME = os.getenv("REDIS_SYSTEMD_NAME", "redis")
 REDIS_SYSTEMD_UNIT = f"{REDIS_SYSTEMD_NAME}.service"
+CUDA_APT_PACKAGE = os.getenv("CUDA_APT_PACKAGE", "nvidia-jetpack")
 
 
 def run(cmd, *, check=True):
@@ -24,6 +26,17 @@ def ensure_redis():
 def ensure_cpp_toolchain():
     print("\n=== Installing C++ build toolchain (requires sudo) ===")
     run(["sudo", "apt", "install", "-y", "g++", "cmake"])
+
+
+def ensure_cuda_toolchain():
+    print("\n=== Installing CUDA toolkit / nvcc (requires sudo) ===")
+    if shutil.which("nvcc") is not None:
+        run(["nvcc", "--version"])
+        return
+    run(["sudo", "apt", "update"])
+    run(["sudo", "apt", "install", "-y", CUDA_APT_PACKAGE])
+    nvcc_path = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    run([nvcc_path, "--version"])
 
 
 def ensure_venv(project_root: Path):
@@ -144,6 +157,7 @@ def main():
 
     ensure_redis()
     ensure_cpp_toolchain()
+    ensure_cuda_toolchain()
     venv_dir = ensure_venv(project_root)
     write_systemd_units(project_root, venv_dir)
 

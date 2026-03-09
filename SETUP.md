@@ -24,6 +24,22 @@ sudo apt update
 sudo apt install -y python3 python3-venv python3-pip redis curl
 ```
 
+### 3.1) Install CUDA toolkit (`nvcc`) on Jetson
+
+Install the Jetson CUDA toolchain via JetPack packages:
+
+```bash
+sudo apt update
+sudo apt install -y nvidia-jetpack
+```
+
+Verify `nvcc` is available:
+
+```bash
+which nvcc || ls -l /usr/local/cuda/bin/nvcc
+nvcc --version
+```
+
 Enable/start Redis:
 
 ```bash

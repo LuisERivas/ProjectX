@@ -27,6 +27,7 @@ def main() -> int:
     print("- Includes manifest.json + dirty_ranges.json reload checks")
     print("- Includes WAL append, replay, checkpoint, and malformed-tail tolerance checks")
     print("- Includes ID estimation, binary elbow k selection, stability checks, and clustering artifacts")
+    print("- Generates synthetic 10k FP16 embeddings and reuses them in smoke flow")
 
     try:
         run_step(
@@ -42,6 +43,11 @@ def main() -> int:
         run_step(
             "CTest",
             ["ctest", "--test-dir", str(build_dir), "--output-on-failure"],
+            cwd=root,
+        )
+        run_step(
+            "Generate synthetic dataset",
+            [sys.executable, "scripts/generate_synthetic_embeddings.py"],
             cwd=root,
         )
         run_step(

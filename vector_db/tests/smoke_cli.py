@@ -16,12 +16,15 @@ def run(cmd: list[str]) -> str:
     return proc.stdout.strip()
 
 
-def make_vec(seed: int) -> str:
-    vals = [0.0] * 1024
-    base = seed % 32
-    vals[base] = 0.8
-    vals[(base + 1) % 1024] = 0.6
-    return ",".join(f"{v:.6f}" for v in vals)
+def load_insert_payloads(path: Path) -> list[dict]:
+    items: list[dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            items.append(json.loads(line))
+    return items
 
 
 def main() -> int:
@@ -35,9 +38,17 @@ def main() -> int:
     if data_dir.exists():
         shutil.rmtree(data_dir)
 
-    vec = make_vec(0)
     run([str(cli), "init", "--path", str(data_dir)])
-    for i in range(12):
+    payloads_path = Path("synthetic_dataset_10k_fp16/insert_payloads.jsonl")
+    if not payloads_path.exists():
+        raise RuntimeError(
+            f"missing synthetic payloads file: {payloads_path}. "
+            "Run scripts/generate_synthetic_embeddings.py first."
+        )
+    payloads = load_insert_payloads(payloads_path)
+    if len(payloads) < 12:
+        raise RuntimeError("synthetic payloads file has too few rows; expected at least 12")
+    for item in payloads:
         run(
             [
                 str(cli),
@@ -45,11 +56,11 @@ def main() -> int:
                 "--path",
                 str(data_dir),
                 "--id",
-                str(100 + i),
+                str(item["id"]),
                 "--vec",
-                make_vec(i),
+                item["vec_csv"],
                 "--meta",
-                '{"kind":"a"}',
+                item["meta_json"],
             ]
         )
     run([str(cli), "get", "--path", str(data_dir), "--id", "100"])
@@ -59,7 +70,7 @@ def main() -> int:
     assert wal_before_checkpoint["wal_entries"] >= 3
     stats_out = run([str(cli), "stats", "--path", str(data_dir)])
     parsed = json.loads(stats_out)
-    assert parsed["total_rows"] == 12
+    assert parsed["total_rows"] == len(payloads)
     assert parsed["tombstone_rows"] == 1
     assert (data_dir / "manifest.json").exists()
     assert (data_dir / "dirty_ranges.json").exists()
@@ -83,7 +94,7 @@ def main() -> int:
     get_after_restart = run([str(cli), "get", "--path", str(data_dir), "--id", "100"])
     assert '"deleted": true' in get_after_restart
     stats_after_restart = json.loads(run([str(cli), "stats", "--path", str(data_dir)]))
-    assert stats_after_restart["total_rows"] == 12
+    assert stats_after_restart["total_rows"] == len(payloads)
     assert stats_after_restart["tombstone_rows"] == 1
     assert stats_after_restart["dirty_ranges"] >= 3
     cluster_stats_after = json.loads(run([str(cli), "cluster-stats", "--path", str(data_dir)]))

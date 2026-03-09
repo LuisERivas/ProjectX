@@ -45,7 +45,7 @@ Exit codes:
 - Gateway running as `redis-gateway.service`.
 - Worker running as `redis-echo-worker.service`.
 - `curl` and `redis-cli` available.
-- C++ build toolchain available on Jetson (`g++`, `cmake`) for local vector DB build/test steps.
+- C++/CUDA build toolchain available on Jetson (`g++`, `cmake`, `nvcc`) for local vector DB build/test steps.
 
 Ensure services are active:
 
@@ -60,6 +60,7 @@ Verify build tools are installed:
 ```bash
 g++ --version
 cmake --version
+nvcc --version
 ```
 
 ## 4) Health check
