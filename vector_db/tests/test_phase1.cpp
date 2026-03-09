@@ -28,10 +28,15 @@ std::vector<float> make_vec(float base) {
     return v;
 }
 
-std::vector<float> make_unit_vec(std::size_t hot_idx, float strength) {
+std::vector<float> make_unit_vec(std::size_t hot_idx, float strength, std::size_t variant) {
     std::vector<float> v(vector_db::kVectorDim, 0.0f);
     v[hot_idx % vector_db::kVectorDim] = strength;
     v[(hot_idx + 1) % vector_db::kVectorDim] = 1.0f - strength;
+    // Add tiny deterministic variation so vectors are not exact duplicates.
+    const std::size_t j1 = (hot_idx + 7 + variant) % vector_db::kVectorDim;
+    const std::size_t j2 = (hot_idx + 31 + (variant * 3)) % vector_db::kVectorDim;
+    v[j1] += 0.0005f * static_cast<float>((variant % 11) + 1);
+    v[j2] += 0.0003f * static_cast<float>(((variant + 5) % 13) + 1);
     float norm_sq = 0.0f;
     for (float x : v) {
         norm_sq += x * x;
@@ -241,7 +246,7 @@ int main() {
         return 1;
     }
     for (std::uint64_t i = 0; i < 32; ++i) {
-        const auto vec = make_unit_vec(static_cast<std::size_t>(i % 2 == 0 ? 10 : 200), 0.95f);
+        const auto vec = make_unit_vec(static_cast<std::size_t>(i % 2 == 0 ? 10 : 200), 0.95f, static_cast<std::size_t>(i));
         if (!expect(cluster_store.insert(1000 + i, vec, "{\"kind\":\"cluster\"}").ok, "phase3 insert")) {
             return 1;
         }
