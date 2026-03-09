@@ -37,12 +37,20 @@ def main() -> int:
     run([str(cli), "get", "--path", str(data_dir), "--id", "100"])
     run([str(cli), "update-meta", "--path", str(data_dir), "--id", "100", "--meta", '{"kind":"b","x":1}'])
     run([str(cli), "delete", "--path", str(data_dir), "--id", "100"])
+    wal_before_checkpoint = json.loads(run([str(cli), "wal-stats", "--path", str(data_dir)]))
+    assert wal_before_checkpoint["wal_entries"] >= 3
     stats_out = run([str(cli), "stats", "--path", str(data_dir)])
     parsed = json.loads(stats_out)
     assert parsed["total_rows"] == 1
     assert parsed["tombstone_rows"] == 1
     assert (data_dir / "manifest.json").exists()
     assert (data_dir / "dirty_ranges.json").exists()
+    assert (data_dir / "wal.log").exists()
+
+    run([str(cli), "checkpoint", "--path", str(data_dir)])
+    wal_after_checkpoint = json.loads(run([str(cli), "wal-stats", "--path", str(data_dir)]))
+    assert wal_after_checkpoint["wal_entries"] == 0
+    assert wal_after_checkpoint["checkpoint_lsn"] >= wal_before_checkpoint["last_lsn"]
 
     # Restart behavior: invoke fresh process again and verify get still works.
     get_after_restart = run([str(cli), "get", "--path", str(data_dir), "--id", "100"])

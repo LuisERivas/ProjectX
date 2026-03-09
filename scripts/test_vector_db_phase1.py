@@ -22,9 +22,10 @@ def main() -> int:
     vector_db_dir = root / "vector_db"
     build_dir = vector_db_dir / "build"
 
-    print("Vector DB Phase 1 validation")
+    print("Vector DB Phase 2 validation (WAL + Recovery + Startup Reload)")
     print("- Includes CRUD, tombstone, restart persistence checks")
-    print("- Includes manifest.json and dirty_ranges.json reload checks")
+    print("- Includes manifest.json + dirty_ranges.json reload checks")
+    print("- Includes WAL append, replay, checkpoint, and malformed-tail tolerance checks")
 
     try:
         run_step(
@@ -55,7 +56,7 @@ def main() -> int:
         print(f"[FAIL] {e}")
         return 1
 
-    print("\n[PASS] Vector DB Phase 1 checks completed.")
+    print("\n[PASS] Vector DB Phase 2 checks completed.")
     return 0
 
 

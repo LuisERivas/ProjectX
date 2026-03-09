@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -106,6 +107,71 @@ std::string json_unescape(const std::string& s) {
     return out;
 }
 
+std::vector<std::string> split_csv_numbers(const std::string& csv) {
+    std::vector<std::string> out;
+    std::stringstream ss(csv);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        if (!token.empty()) {
+            out.push_back(trim_copy(token));
+        }
+    }
+    return out;
+}
+
+std::optional<std::uint64_t> extract_u64_field(const std::string& text, const std::string& key) {
+    const auto key_pos = text.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto n0 = text.find_first_of("0123456789", key_pos);
+    if (n0 == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto n1 = text.find_first_not_of("0123456789", n0);
+    try {
+        return static_cast<std::uint64_t>(std::stoull(text.substr(n0, n1 - n0)));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::string> extract_string_field(const std::string& text, const std::string& key) {
+    const auto key_pos = text.find("\"" + key + "\"");
+    if (key_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto colon = text.find(':', key_pos);
+    if (colon == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto q1 = text.find('"', colon);
+    if (q1 == std::string::npos) {
+        return std::nullopt;
+    }
+    std::size_t q2 = std::string::npos;
+    bool escaped = false;
+    for (std::size_t i = q1 + 1; i < text.size(); ++i) {
+        const char c = text[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '"') {
+            q2 = i;
+            break;
+        }
+    }
+    if (q2 == std::string::npos || q2 <= q1) {
+        return std::nullopt;
+    }
+    return text.substr(q1 + 1, q2 - q1 - 1);
+}
+
 Status write_text_atomic(const fs::path& path, const std::string& content) {
     const fs::path tmp = path.string() + ".tmp";
     {
@@ -143,9 +209,20 @@ struct VectorStore::Impl {
         std::string metadata_json = "{}";
     };
 
+    struct WalRecord {
+        std::uint64_t lsn = 0;
+        std::string op;
+        std::uint64_t id = 0;
+        std::string metadata_json;
+        std::vector<float> vector_fp32;
+    };
+
     std::string data_dir;
     bool opened = false;
+    bool replay_mode = false;
     std::uint64_t active_segment_id = 1;
+    std::uint64_t checkpoint_lsn = 0;
+    std::uint64_t last_lsn = 0;
     std::size_t total_rows = 0;
 
     std::unordered_map<std::uint64_t, Entry> entries;
@@ -155,6 +232,7 @@ struct VectorStore::Impl {
     fs::path segments_dir() const { return root() / "segments"; }
     fs::path manifest_path() const { return root() / "manifest.json"; }
     fs::path dirty_ranges_path() const { return root() / "dirty_ranges.json"; }
+    fs::path wal_path() const { return root() / "wal.log"; }
 
     fs::path seg_base(std::uint64_t seg_id) const {
         return segments_dir() / ("seg_" + std::to_string(seg_id));
@@ -185,6 +263,7 @@ struct VectorStore::Impl {
         os << "  \"schema_version\": 1,\n";
         os << "  \"dimension\": " << kVectorDim << ",\n";
         os << "  \"active_segment_id\": " << active_segment_id << ",\n";
+        os << "  \"checkpoint_lsn\": " << checkpoint_lsn << ",\n";
         os << "  \"segments\": [" << active_segment_id << "],\n";
         os << "  \"total_rows\": " << st.total_rows << ",\n";
         os << "  \"live_rows\": " << st.live_rows << ",\n";
@@ -234,6 +313,171 @@ struct VectorStore::Impl {
             row,
             reason,
         });
+    }
+
+    std::uint64_t next_lsn() {
+        if (last_lsn < checkpoint_lsn) {
+            last_lsn = checkpoint_lsn;
+        }
+        last_lsn += 1;
+        return last_lsn;
+    }
+
+    std::uint64_t now_ms() const {
+        const auto now = std::chrono::system_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+        return static_cast<std::uint64_t>(ms.count());
+    }
+
+    std::string encode_vector_csv(const std::vector<float>& vec) const {
+        std::ostringstream os;
+        for (std::size_t i = 0; i < vec.size(); ++i) {
+            if (i > 0) {
+                os << ",";
+            }
+            os << vec[i];
+        }
+        return os.str();
+    }
+
+    std::optional<std::vector<float>> decode_vector_csv(const std::string& csv) const {
+        const auto parts = split_csv_numbers(csv);
+        if (parts.size() != kVectorDim) {
+            return std::nullopt;
+        }
+        std::vector<float> vec(kVectorDim, 0.0f);
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            try {
+                vec[i] = std::stof(parts[i]);
+            } catch (...) {
+                return std::nullopt;
+            }
+        }
+        return vec;
+    }
+
+    Status append_wal_insert(std::uint64_t id, const std::vector<float>& vec, const std::string& metadata_json) {
+        const std::uint64_t lsn = next_lsn();
+        std::ofstream out(wal_path(), std::ios::binary | std::ios::app);
+        if (!out) {
+            return Status::Error("failed opening wal for insert");
+        }
+        out << "{\"lsn\":" << lsn
+            << ",\"op\":\"INSERT\""
+            << ",\"id\":" << id
+            << ",\"metadata\":\"" << json_escape(metadata_json) << "\""
+            << ",\"vector\":\"" << json_escape(encode_vector_csv(vec)) << "\""
+            << ",\"ts_ms\":" << now_ms()
+            << "}\n";
+        if (!out.good()) {
+            return Status::Error("failed appending wal insert");
+        }
+        return Status::Ok();
+    }
+
+    Status append_wal_delete(std::uint64_t id) {
+        const std::uint64_t lsn = next_lsn();
+        std::ofstream out(wal_path(), std::ios::binary | std::ios::app);
+        if (!out) {
+            return Status::Error("failed opening wal for delete");
+        }
+        out << "{\"lsn\":" << lsn
+            << ",\"op\":\"DELETE\""
+            << ",\"id\":" << id
+            << ",\"ts_ms\":" << now_ms()
+            << "}\n";
+        if (!out.good()) {
+            return Status::Error("failed appending wal delete");
+        }
+        return Status::Ok();
+    }
+
+    Status append_wal_update_meta(std::uint64_t id, const std::string& metadata_json) {
+        const std::uint64_t lsn = next_lsn();
+        std::ofstream out(wal_path(), std::ios::binary | std::ios::app);
+        if (!out) {
+            return Status::Error("failed opening wal for metadata update");
+        }
+        out << "{\"lsn\":" << lsn
+            << ",\"op\":\"UPDATE_META\""
+            << ",\"id\":" << id
+            << ",\"metadata\":\"" << json_escape(metadata_json) << "\""
+            << ",\"ts_ms\":" << now_ms()
+            << "}\n";
+        if (!out.good()) {
+            return Status::Error("failed appending wal metadata update");
+        }
+        return Status::Ok();
+    }
+
+    std::optional<WalRecord> parse_wal_line(const std::string& line) const {
+        if (trim_copy(line).empty()) {
+            return std::nullopt;
+        }
+        const auto lsn = extract_u64_field(line, "lsn");
+        const auto id = extract_u64_field(line, "id");
+        const auto op_opt = extract_string_field(line, "op");
+        if (!lsn.has_value() || !id.has_value() || !op_opt.has_value()) {
+            return std::nullopt;
+        }
+        WalRecord rec;
+        rec.lsn = *lsn;
+        rec.id = *id;
+        rec.op = *op_opt;
+        if (rec.op == "INSERT") {
+            const auto meta = extract_string_field(line, "metadata");
+            const auto vector_s = extract_string_field(line, "vector");
+            if (!meta.has_value() || !vector_s.has_value()) {
+                return std::nullopt;
+            }
+            rec.metadata_json = json_unescape(*meta);
+            const auto decoded = decode_vector_csv(json_unescape(*vector_s));
+            if (!decoded.has_value()) {
+                return std::nullopt;
+            }
+            rec.vector_fp32 = *decoded;
+        } else if (rec.op == "UPDATE_META") {
+            const auto meta = extract_string_field(line, "metadata");
+            if (!meta.has_value()) {
+                return std::nullopt;
+            }
+            rec.metadata_json = json_unescape(*meta);
+        } else if (rec.op != "DELETE") {
+            return std::nullopt;
+        }
+        return rec;
+    }
+
+    Status load_wal_records(std::vector<WalRecord>* out_records) {
+        out_records->clear();
+        const fs::path p = wal_path();
+        if (!fs::exists(p)) {
+            return Status::Ok();
+        }
+        std::ifstream in(p, std::ios::binary);
+        if (!in) {
+            return Status::Error("failed opening wal file: " + p.string());
+        }
+        std::string line;
+        std::size_t line_no = 0;
+        while (std::getline(in, line)) {
+            ++line_no;
+            if (trim_copy(line).empty()) {
+                continue;
+            }
+            auto parsed = parse_wal_line(line);
+            if (!parsed.has_value()) {
+                if (in.eof()) {
+                    break;
+                }
+                return Status::Error("failed parsing wal line " + std::to_string(line_no));
+            }
+            out_records->push_back(*parsed);
+            if (parsed->lsn > last_lsn) {
+                last_lsn = parsed->lsn;
+            }
+        }
+        return Status::Ok();
     }
 
     Status load_ids_and_vectors() {
@@ -368,6 +612,12 @@ struct VectorStore::Impl {
         } catch (...) {
             return Status::Error("invalid active_segment_id in manifest");
         }
+        if (const auto checkpoint = extract_u64_field(text, "checkpoint_lsn"); checkpoint.has_value()) {
+            checkpoint_lsn = *checkpoint;
+            if (last_lsn < checkpoint_lsn) {
+                last_lsn = checkpoint_lsn;
+            }
+        }
         return Status::Ok();
     }
 
@@ -433,6 +683,173 @@ struct VectorStore::Impl {
         return Status::Ok();
     }
 
+    Status apply_insert_internal(
+        std::uint64_t id,
+        const std::vector<float>& vector_fp32_1024,
+        const std::string& metadata_json,
+        bool upsert,
+        const std::string& reason) {
+        const auto it_existing = entries.find(id);
+        if (it_existing != entries.end() && !upsert) {
+            return Status::Error("duplicate id rejected");
+        }
+
+        if (it_existing != entries.end() && upsert) {
+            auto& e = entries[id];
+            const fs::path vec = seg_vec(active_segment_id);
+            std::fstream vec_io(vec, std::ios::binary | std::ios::in | std::ios::out);
+            if (!vec_io) {
+                return Status::Error("failed opening vector file for upsert: " + vec.string());
+            }
+            const std::uint64_t byte_off = static_cast<std::uint64_t>(e.row) * static_cast<std::uint64_t>(kVectorDim) * sizeof(float);
+            vec_io.seekp(static_cast<std::streamoff>(byte_off), std::ios::beg);
+            vec_io.write(reinterpret_cast<const char*>(vector_fp32_1024.data()), static_cast<std::streamsize>(kVectorDim * sizeof(float)));
+            if (!vec_io.good()) {
+                return Status::Error("failed writing vector during upsert");
+            }
+            e.deleted = false;
+            e.metadata_json = metadata_json;
+            record_dirty(e.row, reason);
+            std::ofstream meta_out(seg_meta(active_segment_id), std::ios::binary | std::ios::app);
+            if (!meta_out) {
+                return Status::Error("failed opening metadata file for upsert");
+            }
+            meta_out << "{\"id\":" << id << ",\"metadata\":\"" << json_escape(metadata_json) << "\"}\n";
+            if (!meta_out.good()) {
+                return Status::Error("failed appending metadata during upsert");
+            }
+            return Status::Ok();
+        }
+
+        {
+            std::ofstream vec_out(seg_vec(active_segment_id), std::ios::binary | std::ios::app);
+            if (!vec_out) {
+                return Status::Error("failed opening vector file for append");
+            }
+            vec_out.write(reinterpret_cast<const char*>(vector_fp32_1024.data()), static_cast<std::streamsize>(kVectorDim * sizeof(float)));
+            if (!vec_out.good()) {
+                return Status::Error("failed appending vector bytes");
+            }
+        }
+        {
+            std::ofstream id_out(seg_ids(active_segment_id), std::ios::binary | std::ios::app);
+            if (!id_out) {
+                return Status::Error("failed opening ids file for append");
+            }
+            id_out.write(reinterpret_cast<const char*>(&id), static_cast<std::streamsize>(sizeof(id)));
+            if (!id_out.good()) {
+                return Status::Error("failed appending id");
+            }
+        }
+        {
+            std::ofstream meta_out(seg_meta(active_segment_id), std::ios::binary | std::ios::app);
+            if (!meta_out) {
+                return Status::Error("failed opening metadata file for append");
+            }
+            meta_out << "{\"id\":" << id << ",\"metadata\":\"" << json_escape(metadata_json) << "\"}\n";
+            if (!meta_out.good()) {
+                return Status::Error("failed appending metadata");
+            }
+        }
+
+        const std::size_t row = total_rows;
+        entries[id] = Entry{id, row, false, metadata_json};
+        total_rows += 1;
+        record_dirty(row, reason);
+        return Status::Ok();
+    }
+
+    Status apply_remove_internal(std::uint64_t id, const std::string& reason) {
+        auto it = entries.find(id);
+        if (it == entries.end()) {
+            return Status::Error("id not found");
+        }
+        if (it->second.deleted) {
+            return Status::Ok();
+        }
+        std::ofstream tomb_out(seg_tomb(active_segment_id), std::ios::binary | std::ios::app);
+        if (!tomb_out) {
+            return Status::Error("failed opening tombstone file for append");
+        }
+        tomb_out.write(reinterpret_cast<const char*>(&id), static_cast<std::streamsize>(sizeof(id)));
+        if (!tomb_out.good()) {
+            return Status::Error("failed appending tombstone");
+        }
+        it->second.deleted = true;
+        record_dirty(it->second.row, reason);
+        return Status::Ok();
+    }
+
+    Status apply_update_metadata_internal(std::uint64_t id, const std::string& patch_json, const std::string& reason) {
+        auto it = entries.find(id);
+        if (it == entries.end()) {
+            return Status::Error("id not found");
+        }
+        it->second.metadata_json = patch_json;
+        std::ofstream meta_out(seg_meta(active_segment_id), std::ios::binary | std::ios::app);
+        if (!meta_out) {
+            return Status::Error("failed opening metadata file for update");
+        }
+        meta_out << "{\"id\":" << id << ",\"metadata\":\"" << json_escape(patch_json) << "\"}\n";
+        if (!meta_out.good()) {
+            return Status::Error("failed appending metadata update");
+        }
+        record_dirty(it->second.row, reason);
+        return Status::Ok();
+    }
+
+    Status replay_wal() {
+        std::vector<WalRecord> records;
+        if (const Status s = load_wal_records(&records); !s.ok) {
+            return s;
+        }
+        std::sort(records.begin(), records.end(), [](const WalRecord& a, const WalRecord& b) {
+            return a.lsn < b.lsn;
+        });
+        replay_mode = true;
+        for (const auto& rec : records) {
+            if (rec.lsn <= checkpoint_lsn) {
+                continue;
+            }
+            Status op = Status::Ok();
+            if (rec.op == "INSERT") {
+                op = apply_insert_internal(rec.id, rec.vector_fp32, rec.metadata_json, true, "replay_insert");
+            } else if (rec.op == "DELETE") {
+                op = apply_remove_internal(rec.id, "replay_delete");
+            } else if (rec.op == "UPDATE_META") {
+                op = apply_update_metadata_internal(rec.id, rec.metadata_json, "replay_update_metadata");
+            }
+            if (!op.ok) {
+                replay_mode = false;
+                return Status::Error("wal replay failed at lsn " + std::to_string(rec.lsn) + ": " + op.message);
+            }
+            if (rec.lsn > last_lsn) {
+                last_lsn = rec.lsn;
+            }
+        }
+        replay_mode = false;
+        return Status::Ok();
+    }
+
+    WalStats current_wal_stats() const {
+        WalStats st{};
+        st.checkpoint_lsn = checkpoint_lsn;
+        st.last_lsn = last_lsn;
+        const fs::path p = wal_path();
+        if (!fs::exists(p)) {
+            st.wal_entries = 0;
+            return st;
+        }
+        std::ifstream in(p, std::ios::binary);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!trim_copy(line).empty()) {
+                st.wal_entries += 1;
+            }
+        }
+        return st;
+    }
+
     std::optional<std::vector<float>> read_vector_at_row(std::size_t row) const {
         const fs::path vec = seg_vec(active_segment_id);
         std::ifstream in(vec, std::ios::binary);
@@ -474,6 +891,12 @@ Status VectorStore::init() {
             return s;
         }
     }
+    if (!fs::exists(impl_->wal_path())) {
+        std::ofstream wal_out(impl_->wal_path(), std::ios::binary | std::ios::app);
+        if (!wal_out) {
+            return Status::Error("failed creating wal file");
+        }
+    }
     return Status::Ok();
 }
 
@@ -499,6 +922,12 @@ Status VectorStore::open() {
     if (const Status s = impl_->load_dirty_ranges(); !s.ok) {
         return s;
     }
+    if (const Status s = impl_->replay_wal(); !s.ok) {
+        return s;
+    }
+    if (const Status s = flush(); !s.ok) {
+        return s;
+    }
     impl_->opened = true;
     return Status::Ok();
 }
@@ -511,6 +940,19 @@ Status VectorStore::flush() {
         return s;
     }
     return Status::Ok();
+}
+
+Status VectorStore::checkpoint() {
+    if (!impl_->opened) {
+        if (const Status s = open(); !s.ok) {
+            return s;
+        }
+    }
+    impl_->checkpoint_lsn = impl_->last_lsn;
+    if (const Status s = flush(); !s.ok) {
+        return s;
+    }
+    return write_text_atomic(impl_->wal_path(), "");
 }
 
 Status VectorStore::close() {
@@ -536,71 +978,24 @@ Status VectorStore::insert(std::uint64_t id, const std::vector<float>& vector_fp
     if (!looks_like_json(metadata_json)) {
         return Status::Error("metadata_json must be a JSON object/array string");
     }
-
-    const auto it_existing = impl_->entries.find(id);
-    if (it_existing != impl_->entries.end() && !upsert) {
+    const auto existing = impl_->entries.find(id);
+    if (existing != impl_->entries.end() && !upsert && !impl_->replay_mode) {
         return Status::Error("duplicate id rejected");
     }
-
-    if (it_existing != impl_->entries.end() && upsert) {
-        auto& e = it_existing->second;
-        const fs::path vec = impl_->seg_vec(impl_->active_segment_id);
-        std::fstream vec_io(vec, std::ios::binary | std::ios::in | std::ios::out);
-        if (!vec_io) {
-            return Status::Error("failed opening vector file for upsert: " + vec.string());
-        }
-        const std::uint64_t byte_off = static_cast<std::uint64_t>(e.row) * static_cast<std::uint64_t>(kVectorDim) * sizeof(float);
-        vec_io.seekp(static_cast<std::streamoff>(byte_off), std::ios::beg);
-        vec_io.write(reinterpret_cast<const char*>(vector_fp32_1024.data()), static_cast<std::streamsize>(kVectorDim * sizeof(float)));
-        if (!vec_io.good()) {
-            return Status::Error("failed writing vector during upsert");
-        }
-        e.deleted = false;
-        e.metadata_json = metadata_json;
-        impl_->record_dirty(e.row, "upsert");
-        std::ofstream meta_out(impl_->seg_meta(impl_->active_segment_id), std::ios::binary | std::ios::app);
-        if (!meta_out) {
-            return Status::Error("failed opening metadata file for upsert");
-        }
-        meta_out << "{\"id\":" << id << ",\"metadata\":\"" << json_escape(metadata_json) << "\"}\n";
-        return flush();
-    }
-
-    {
-        std::ofstream vec_out(impl_->seg_vec(impl_->active_segment_id), std::ios::binary | std::ios::app);
-        if (!vec_out) {
-            return Status::Error("failed opening vector file for append");
-        }
-        vec_out.write(reinterpret_cast<const char*>(vector_fp32_1024.data()), static_cast<std::streamsize>(kVectorDim * sizeof(float)));
-        if (!vec_out.good()) {
-            return Status::Error("failed appending vector bytes");
+    if (!impl_->replay_mode) {
+        if (const Status s = impl_->append_wal_insert(id, vector_fp32_1024, metadata_json); !s.ok) {
+            return s;
         }
     }
-    {
-        std::ofstream id_out(impl_->seg_ids(impl_->active_segment_id), std::ios::binary | std::ios::app);
-        if (!id_out) {
-            return Status::Error("failed opening ids file for append");
-        }
-        id_out.write(reinterpret_cast<const char*>(&id), static_cast<std::streamsize>(sizeof(id)));
-        if (!id_out.good()) {
-            return Status::Error("failed appending id");
-        }
+    const Status applied = impl_->apply_insert_internal(
+        id,
+        vector_fp32_1024,
+        metadata_json,
+        upsert || impl_->replay_mode,
+        impl_->replay_mode ? "replay_insert" : (upsert ? "upsert" : "insert"));
+    if (!applied.ok) {
+        return applied;
     }
-    {
-        std::ofstream meta_out(impl_->seg_meta(impl_->active_segment_id), std::ios::binary | std::ios::app);
-        if (!meta_out) {
-            return Status::Error("failed opening metadata file for append");
-        }
-        meta_out << "{\"id\":" << id << ",\"metadata\":\"" << json_escape(metadata_json) << "\"}\n";
-        if (!meta_out.good()) {
-            return Status::Error("failed appending metadata");
-        }
-    }
-
-    const std::size_t row = impl_->total_rows;
-    impl_->entries[id] = Impl::Entry{id, row, false, metadata_json};
-    impl_->total_rows += 1;
-    impl_->record_dirty(row, "insert");
     return flush();
 }
 
@@ -610,25 +1005,21 @@ Status VectorStore::remove(std::uint64_t id) {
             return s;
         }
     }
-    auto it = impl_->entries.find(id);
+    const auto it = impl_->entries.find(id);
     if (it == impl_->entries.end()) {
         return Status::Error("id not found");
     }
     if (it->second.deleted) {
         return Status::Ok();
     }
-    {
-        std::ofstream tomb_out(impl_->seg_tomb(impl_->active_segment_id), std::ios::binary | std::ios::app);
-        if (!tomb_out) {
-            return Status::Error("failed opening tombstone file for append");
-        }
-        tomb_out.write(reinterpret_cast<const char*>(&id), static_cast<std::streamsize>(sizeof(id)));
-        if (!tomb_out.good()) {
-            return Status::Error("failed appending tombstone");
+    if (!impl_->replay_mode) {
+        if (const Status s = impl_->append_wal_delete(id); !s.ok) {
+            return s;
         }
     }
-    it->second.deleted = true;
-    impl_->record_dirty(it->second.row, "delete");
+    if (const Status s = impl_->apply_remove_internal(id, impl_->replay_mode ? "replay_delete" : "delete"); !s.ok) {
+        return s;
+    }
     return flush();
 }
 
@@ -641,22 +1032,17 @@ Status VectorStore::update_metadata(std::uint64_t id, const std::string& patch_j
     if (!looks_like_json(patch_json)) {
         return Status::Error("patch_json must be a JSON object/array string");
     }
-    auto it = impl_->entries.find(id);
-    if (it == impl_->entries.end()) {
+    if (impl_->entries.find(id) == impl_->entries.end()) {
         return Status::Error("id not found");
     }
-    it->second.metadata_json = patch_json;
-    {
-        std::ofstream meta_out(impl_->seg_meta(impl_->active_segment_id), std::ios::binary | std::ios::app);
-        if (!meta_out) {
-            return Status::Error("failed opening metadata file for update");
-        }
-        meta_out << "{\"id\":" << id << ",\"metadata\":\"" << json_escape(patch_json) << "\"}\n";
-        if (!meta_out.good()) {
-            return Status::Error("failed appending metadata update");
+    if (!impl_->replay_mode) {
+        if (const Status s = impl_->append_wal_update_meta(id, patch_json); !s.ok) {
+            return s;
         }
     }
-    impl_->record_dirty(it->second.row, "update_metadata");
+    if (const Status s = impl_->apply_update_metadata_internal(id, patch_json, impl_->replay_mode ? "replay_update_metadata" : "update_metadata"); !s.ok) {
+        return s;
+    }
     return flush();
 }
 
@@ -673,6 +1059,7 @@ std::optional<StoredRecord> VectorStore::get(std::uint64_t id) const {
 }
 
 Stats VectorStore::stats() const { return impl_->current_stats(); }
+WalStats VectorStore::wal_stats() const { return impl_->current_wal_stats(); }
 
 }  // namespace vector_db
 

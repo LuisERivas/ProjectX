@@ -81,7 +81,9 @@ void print_usage() {
               << "  delete --path <data_dir> --id <u64>\n"
               << "  update-meta --path <data_dir> --id <u64> --meta <json_patch>\n"
               << "  get --path <data_dir> --id <u64>\n"
-              << "  stats --path <data_dir>\n";
+              << "  stats --path <data_dir>\n"
+              << "  checkpoint --path <data_dir>\n"
+              << "  wal-stats --path <data_dir>\n";
 }
 
 }  // namespace
@@ -220,6 +222,32 @@ int main(int argc, char** argv) {
                   << "  \"tombstone_rows\": " << st.tombstone_rows << ",\n"
                   << "  \"segments\": " << st.segments << ",\n"
                   << "  \"dirty_ranges\": " << st.dirty_ranges << "\n"
+                  << "}\n";
+        return 0;
+    }
+
+    if (command == "checkpoint") {
+        if (!open_or_fail()) {
+            return 1;
+        }
+        const auto s = store.checkpoint();
+        if (!s.ok) {
+            std::cerr << "error: " << s.message << "\n";
+            return 1;
+        }
+        std::cout << "ok: checkpoint complete\n";
+        return 0;
+    }
+
+    if (command == "wal-stats") {
+        if (!open_or_fail()) {
+            return 1;
+        }
+        const auto st = store.wal_stats();
+        std::cout << "{\n"
+                  << "  \"checkpoint_lsn\": " << st.checkpoint_lsn << ",\n"
+                  << "  \"last_lsn\": " << st.last_lsn << ",\n"
+                  << "  \"wal_entries\": " << st.wal_entries << "\n"
                   << "}\n";
         return 0;
     }

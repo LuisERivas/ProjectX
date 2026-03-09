@@ -40,6 +40,12 @@ struct Stats {
     std::size_t dirty_ranges = 0;
 };
 
+struct WalStats {
+    std::uint64_t checkpoint_lsn = 0;
+    std::uint64_t last_lsn = 0;
+    std::size_t wal_entries = 0;
+};
+
 class VectorStore {
 public:
     explicit VectorStore(std::string data_dir);
@@ -48,6 +54,7 @@ public:
     Status init();
     Status open();
     Status flush();
+    Status checkpoint();
     Status close();
 
     Status insert(std::uint64_t id, const std::vector<float>& vector_fp32_1024, const std::string& metadata_json, bool upsert = false);
@@ -55,6 +62,7 @@ public:
     Status update_metadata(std::uint64_t id, const std::string& patch_json);
     std::optional<StoredRecord> get(std::uint64_t id) const;
     Stats stats() const;
+    WalStats wal_stats() const;
 
 private:
     struct Impl;
