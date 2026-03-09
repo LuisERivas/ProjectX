@@ -8,13 +8,20 @@ from pathlib import Path
 def run_step(name: str, cmd: list[str], cwd: Path) -> None:
     print(f"\n== {name} ==")
     print(f"$ {' '.join(cmd)}")
-    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
-    if proc.stdout:
-        print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
-    if proc.stderr:
-        print(proc.stderr, end="" if proc.stderr.endswith("\n") else "\n")
-    if proc.returncode != 0:
-        raise RuntimeError(f"{name} failed with exit code {proc.returncode}")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="")
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"{name} failed with exit code {rc}")
 
 
 def main() -> int:

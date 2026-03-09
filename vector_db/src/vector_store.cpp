@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -1219,6 +1220,7 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     if (live.size() < 8) {
         return Status::Error("need at least 8 live vectors to build initial clusters");
     }
+    std::cout << "progress: clustering collected live vectors=" << live.size() << "\n";
     std::vector<std::vector<float>> vectors;
     vectors.reserve(live.size());
     for (const auto& kv : live) {
@@ -1230,20 +1232,24 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     cfg.max_sample = std::max<std::size_t>(256, std::min<std::size_t>(4096, vectors.size()));
 
     IdEstimateRange idr;
+    std::cout << "progress: clustering step 1/4 id estimation\n";
     if (const Status s = estimate_intrinsic_dimensionality(vectors, cfg.seed, cfg.min_sample, cfg.max_sample, &idr); !s.ok) {
         return s;
     }
     KMeansModel model;
     ElbowSelection elbow;
+    std::cout << "progress: clustering step 2/4 binary elbow k selection\n";
     if (const Status s = select_k_binary_elbow(vectors, idr, cfg, &model, &elbow); !s.ok) {
         return s;
     }
     StabilityMetrics stability;
+    std::cout << "progress: clustering step 3/4 stability evaluation\n";
     if (const Status s = evaluate_stability(vectors, model.k, cfg, &stability); !s.ok) {
         return s;
     }
 
     const std::uint64_t version = impl_->next_cluster_version();
+    std::cout << "progress: clustering step 4/4 writing artifacts version=" << version << "\n";
     if (const Status s = impl_->write_initial_cluster_artifacts(version, idr, elbow, model, stability, live); !s.ok) {
         return s;
     }
@@ -1273,6 +1279,7 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     }
     impl_->cluster_stats_cache = st;
     impl_->cluster_health_cache = health;
+    std::cout << "progress: clustering done chosen_k=" << st.chosen_k << " stability=" << (health.passed ? "pass" : "fail") << "\n";
     return Status::Ok();
 }
 

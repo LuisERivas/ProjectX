@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <cctype>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -73,6 +74,98 @@ std::optional<std::vector<float>> parse_vector_1024(const std::string& file_or_c
     return values;
 }
 
+std::string json_unescape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (c == '\\' && i + 1 < s.size()) {
+            const char n = s[i + 1];
+            switch (n) {
+                case '\\':
+                    out.push_back('\\');
+                    ++i;
+                    continue;
+                case '"':
+                    out.push_back('"');
+                    ++i;
+                    continue;
+                case 'n':
+                    out.push_back('\n');
+                    ++i;
+                    continue;
+                case 'r':
+                    out.push_back('\r');
+                    ++i;
+                    continue;
+                case 't':
+                    out.push_back('\t');
+                    ++i;
+                    continue;
+                default:
+                    break;
+            }
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+std::optional<std::string> extract_json_string_field(const std::string& line, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    const auto key_pos = line.find(needle);
+    if (key_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto colon = line.find(':', key_pos + needle.size());
+    if (colon == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto q1 = line.find('"', colon);
+    if (q1 == std::string::npos) {
+        return std::nullopt;
+    }
+    bool esc = false;
+    std::size_t q2 = std::string::npos;
+    for (std::size_t i = q1 + 1; i < line.size(); ++i) {
+        const char c = line[i];
+        if (esc) {
+            esc = false;
+            continue;
+        }
+        if (c == '\\') {
+            esc = true;
+            continue;
+        }
+        if (c == '"') {
+            q2 = i;
+            break;
+        }
+    }
+    if (q2 == std::string::npos || q2 <= q1) {
+        return std::nullopt;
+    }
+    return json_unescape(line.substr(q1 + 1, q2 - q1 - 1));
+}
+
+std::optional<std::uint64_t> extract_json_u64_field(const std::string& line, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    const auto key_pos = line.find(needle);
+    if (key_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto n0 = line.find_first_of("0123456789", key_pos + needle.size());
+    if (n0 == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto n1 = line.find_first_not_of("0123456789", n0);
+    try {
+        return static_cast<std::uint64_t>(std::stoull(line.substr(n0, n1 - n0)));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 void print_usage() {
     std::cout << "vectordb <command> [args]\n"
               << "Commands:\n"
@@ -84,6 +177,7 @@ void print_usage() {
               << "  stats --path <data_dir>\n"
               << "  checkpoint --path <data_dir>\n"
               << "  wal-stats --path <data_dir>\n"
+              << "  bulk-insert --path <data_dir> --input <insert_payloads.jsonl>\n"
               << "  build-initial-clusters --path <data_dir> [--seed <u32>]\n"
               << "  cluster-stats --path <data_dir>\n"
               << "  cluster-health --path <data_dir>\n";
@@ -143,6 +237,55 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cout << "ok: inserted id=" << id_str << "\n";
+        return 0;
+    }
+
+    if (command == "bulk-insert") {
+        const std::string input = get_arg(args, "--input");
+        if (input.empty()) {
+            print_usage();
+            return 2;
+        }
+        if (!open_or_fail()) {
+            return 1;
+        }
+        std::ifstream in(input, std::ios::binary);
+        if (!in) {
+            std::cerr << "error: failed opening input file: " << input << "\n";
+            return 1;
+        }
+        std::string line;
+        std::size_t line_no = 0;
+        std::size_t inserted = 0;
+        std::cout << "progress: bulk insert started\n";
+        while (std::getline(in, line)) {
+            ++line_no;
+            if (line.empty()) {
+                continue;
+            }
+            const auto id = extract_json_u64_field(line, "id");
+            const auto vec_csv = extract_json_string_field(line, "vec_csv");
+            const auto meta_json = extract_json_string_field(line, "meta_json");
+            if (!id.has_value() || !vec_csv.has_value() || !meta_json.has_value()) {
+                std::cerr << "error: invalid payload at line " << line_no << "\n";
+                return 1;
+            }
+            const auto vec = parse_vector_1024(*vec_csv);
+            if (!vec.has_value()) {
+                std::cerr << "error: invalid 1024-d vector at line " << line_no << "\n";
+                return 1;
+            }
+            const auto s = store.insert(*id, *vec, *meta_json);
+            if (!s.ok) {
+                std::cerr << "error: insert failed at line " << line_no << ": " << s.message << "\n";
+                return 1;
+            }
+            ++inserted;
+            if (inserted % 500 == 0) {
+                std::cout << "progress: inserted " << inserted << " rows\n";
+            }
+        }
+        std::cout << "ok: bulk inserted rows=" << inserted << "\n";
         return 0;
     }
 
