@@ -63,6 +63,12 @@ Reference: `BOUNDARY_MATRIX.md`
 
 ## Documentation map
 
+- Build tooling prerequisites (Jetson/Linux):
+  - Update package index: `sudo apt update`
+  - Install GNU C++ compiler and base toolchain: `sudo apt install -y build-essential`
+  - Install CMake: `sudo apt install -y cmake`
+  - Optional faster CMake generator: `sudo apt install -y ninja-build`
+
 - Jetson setup and deployment: `SETUP.md`
 - Functional and boundary validation: `TESTING.md`
 - Boundary responsibilities: `BOUNDARY_MATRIX.md`

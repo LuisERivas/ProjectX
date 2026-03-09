@@ -21,6 +21,11 @@ def ensure_redis():
     run(["sudo", "systemctl", "start", REDIS_SYSTEMD_NAME])
 
 
+def ensure_cpp_toolchain():
+    print("\n=== Installing C++ build toolchain (requires sudo) ===")
+    run(["sudo", "apt", "install", "-y", "g++", "cmake"])
+
+
 def ensure_venv(project_root: Path):
     print("\n=== Creating Python virtualenv and installing dependencies ===")
     venv_dir = project_root / ".venv"
@@ -138,6 +143,7 @@ def main():
     print(f"Project root: {project_root}")
 
     ensure_redis()
+    ensure_cpp_toolchain()
     venv_dir = ensure_venv(project_root)
     write_systemd_units(project_root, venv_dir)
 

@@ -45,6 +45,7 @@ Exit codes:
 - Gateway running as `redis-gateway.service`.
 - Worker running as `redis-echo-worker.service`.
 - `curl` and `redis-cli` available.
+- C++ build toolchain available on Jetson (`g++`, `cmake`) for local vector DB build/test steps.
 
 Ensure services are active:
 
@@ -52,6 +53,13 @@ Ensure services are active:
 sudo systemctl status redis
 sudo systemctl status redis-gateway.service
 sudo systemctl status redis-echo-worker.service
+```
+
+Verify build tools are installed:
+
+```bash
+g++ --version
+cmake --version
 ```
 
 ## 4) Health check
