@@ -7,17 +7,32 @@ from contract.shared.group_ops import ensure_worker_group as ensure_worker_group
 from contract.shared.types import QueueMessage
 
 
-async def ensure_worker_group(r: redis.Redis) -> None:
-    await ensure_worker_group_shared(r)
+async def ensure_worker_group(
+    r: redis.Redis,
+    *,
+    queue_stream_key: str = QUEUE_STREAM_KEY,
+    worker_group: str = WORKER_GROUP,
+) -> None:
+    await ensure_worker_group_shared(
+        r,
+        stream_key=queue_stream_key,
+        group_name=worker_group,
+    )
 
 
 async def readgroup(
-    r: redis.Redis, *, consumer: str, count: int, block_ms: int
+    r: redis.Redis,
+    *,
+    consumer: str,
+    count: int,
+    block_ms: int,
+    queue_stream_key: str = QUEUE_STREAM_KEY,
+    worker_group: str = WORKER_GROUP,
 ) -> List[QueueMessage]:
     resp = await r.xreadgroup(
-        groupname=WORKER_GROUP,
+        groupname=worker_group,
         consumername=consumer,
-        streams={QUEUE_STREAM_KEY: ">"},
+        streams={queue_stream_key: ">"},
         count=count,
         block=block_ms,
     )
@@ -37,10 +52,12 @@ async def autoclaim(
     min_idle_ms: int,
     count: int,
     start_id: str = "0-0",
+    queue_stream_key: str = QUEUE_STREAM_KEY,
+    worker_group: str = WORKER_GROUP,
 ) -> Tuple[str, List[QueueMessage]]:
     next_start_id, messages, _deleted = await r.xautoclaim(
-        name=QUEUE_STREAM_KEY,
-        groupname=WORKER_GROUP,
+        name=queue_stream_key,
+        groupname=worker_group,
         consumername=consumer,
         min_idle_time=min_idle_ms,
         start_id=start_id,

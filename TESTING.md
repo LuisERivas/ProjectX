@@ -44,6 +44,7 @@ Exit codes:
 - Redis running locally (`redis://127.0.0.1:6379/0` by default).
 - Gateway running as `redis-gateway.service`.
 - Worker running as `redis-echo-worker.service`.
+- Communications worker running as `redis-communications-worker.service`.
 - `curl` and `redis-cli` available.
 - C++/CUDA build toolchain available on Jetson (`g++`, `cmake`, `nvcc`) for local vector DB build/test steps.
 
@@ -53,6 +54,7 @@ Ensure services are active:
 sudo systemctl status redis
 sudo systemctl status redis-gateway.service
 sudo systemctl status redis-echo-worker.service
+sudo systemctl status redis-communications-worker.service
 ```
 
 Verify build tools are installed:
@@ -176,7 +178,33 @@ sudo systemctl start redis-echo-worker.service
 Expected:
 - Worker recovers and processes pending work.
 
-## 10) Boundary rule tests (static guardrails)
+## 10) Communications worker flow
+
+Prepare root file:
+
+```bash
+cat > communications.txt <<'EOF'
+hello from communications worker
+EOF
+```
+
+Run client helper:
+
+```bash
+python scripts/communications_client.py --host 127.0.0.1 --port 8000
+```
+
+Expected:
+- First submitted job (`sync_communications`) reaches `done`.
+- Second submitted job (`print_communications`) reaches `done`.
+- Script prints text that matches `communications.txt`.
+- Redis value exists:
+
+```bash
+redis-cli -u redis://127.0.0.1:6379/0 GET communications:text
+```
+
+## 11) Boundary rule tests (static guardrails)
 
 From project root, run:
 
@@ -190,7 +218,7 @@ Expected:
   - `gateway/main.py`
   - `worker/worker_main.py`
 
-## 11) Suggested regression checklist
+## 12) Suggested regression checklist
 
 Run this minimum suite after code changes:
 - Verify systemd services are active
@@ -198,5 +226,6 @@ Run this minimum suite after code changes:
 - Submit/read/stream one job
 - Idempotency test
 - Cancel test
+- Communications worker sync/print test
 - Redis ground-truth checks
 - `pytest tests/test_boundary_rules.py`

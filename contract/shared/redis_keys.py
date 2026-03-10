@@ -9,3 +9,7 @@ def events_key(job_id: str) -> str:
 def dlq_stream_key() -> str:
     return "jobs:dlq"
 
+
+def communications_text_key() -> str:
+    return "communications:text"
+

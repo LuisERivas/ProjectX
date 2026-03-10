@@ -74,6 +74,8 @@ Defaults are already present in code and are suitable for local Jetson deploymen
 - `REDIS_URL` (default `redis://127.0.0.1:6379/0`)
 - `QUEUE_STREAM_KEY` (default `jobs:stream`)
 - `WORKER_GROUP` (default `workers`)
+- `COMM_QUEUE_STREAM_KEY` (default `jobs:communications:stream`)
+- `COMM_WORKER_GROUP` (default `communications-workers`)
 
 ### Gateway variables
 
@@ -93,6 +95,18 @@ Defaults are already present in code and are suitable for local Jetson deploymen
 - `CLAIM_COUNT` (default `25`)
 - `CLAIM_EVERY_S` (default `2.0`)
 - `JOB_TIMEOUT_S` (default `0`, disabled)
+
+### Communications worker variables
+
+- `COMM_CONSUMER` (default `communications-<pid>`)
+- `COMM_BLOCK_MS` (default `5000`)
+- `COMM_COUNT` (default `10`)
+- `COMM_MAX_INFLIGHT` (default `4`)
+- `COMM_DEFAULT_TTL_S` (default `3600`)
+- `COMM_CLAIM_IDLE_MS` (default `60000`)
+- `COMM_CLAIM_COUNT` (default `25`)
+- `COMM_CLAIM_EVERY_S` (default `2.0`)
+- `COMM_JOB_TIMEOUT_S` (default `0`, disabled)
 
 ## 6) Run in development mode
 
@@ -138,16 +152,18 @@ This script:
 - Writes and installs:
   - `/etc/systemd/system/redis-gateway.service`
   - `/etc/systemd/system/redis-echo-worker.service`
+  - `/etc/systemd/system/redis-communications-worker.service`
 - Reloads systemd and starts both services.
 
 ### Option B: manual service management
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable redis-gateway.service redis-echo-worker.service
-sudo systemctl start redis-gateway.service redis-echo-worker.service
+sudo systemctl enable redis-gateway.service redis-echo-worker.service redis-communications-worker.service
+sudo systemctl start redis-gateway.service redis-echo-worker.service redis-communications-worker.service
 sudo systemctl status redis-gateway.service
 sudo systemctl status redis-echo-worker.service
+sudo systemctl status redis-communications-worker.service
 ```
 
 ## 8) Operational checks
@@ -155,7 +171,20 @@ sudo systemctl status redis-echo-worker.service
 - Redis is healthy: `sudo systemctl status redis`
 - Gateway is healthy: `curl -sS http://127.0.0.1:8000/health`
 - Worker is running: `sudo systemctl status redis-echo-worker.service`
+- Communications worker is running: `sudo systemctl status redis-communications-worker.service`
 - Cancel API is reachable (replace with a real job id): `curl -sS -X POST http://127.0.0.1:8000/v1/jobs/<job_id>/cancel -H "Content-Type: application/json" -d "{\"reason\":{\"by\":\"ops\"}}"`
+
+## 10) Communications worker quick run
+
+From project root, create/update `communications.txt`, then run:
+
+```bash
+python scripts/communications_client.py --host 127.0.0.1 --port 8000
+```
+
+Expected:
+- Sync job stores file text in Redis key `communications:text`.
+- Print job returns the stored text and prints it to stdout.
 
 ## 9) Common issues
 

@@ -43,6 +43,13 @@ class GatewayContract:
         r = await self.client()
         await ensure_worker_group(r)
 
+    @staticmethod
+    def _is_communications_job(task: str, payload: Dict[str, Any]) -> bool:
+        if task != "tool":
+            return False
+        action = str(payload.get("action") or "").strip().lower()
+        return action in {"sync_communications", "print_communications"}
+
     async def ping(self) -> None:
         r = await self.client()
         await r.ping()
@@ -102,7 +109,18 @@ class GatewayContract:
         idem_key: str | None,
     ) -> Dict[str, Any]:
         r = await self.client()
-        await self.ensure_worker_group()
+        route_comm = self._is_communications_job(task, payload)
+        queue_stream_key = (
+            shared_config.COMM_QUEUE_STREAM_KEY if route_comm else shared_config.QUEUE_STREAM_KEY
+        )
+        queue_group = (
+            shared_config.COMM_WORKER_GROUP if route_comm else shared_config.WORKER_GROUP
+        )
+        await ensure_worker_group(
+            r,
+            stream_key=queue_stream_key,
+            group_name=queue_group,
+        )
 
         job_id = str(uuid.uuid4())
         created = now_ms()
@@ -115,7 +133,7 @@ class GatewayContract:
                 idem_redis_key,
                 job_key(job_id),
                 events_key(job_id),
-                shared_config.QUEUE_STREAM_KEY,
+                queue_stream_key,
             ],
             args=[
                 "1" if idem_key else "0",

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 import redis.asyncio as redis
 
 from contract.shared import config as shared_config
-from contract.shared.redis_keys import events_key, job_key
+from contract.shared.redis_keys import communications_text_key, events_key, job_key
 from contract.shared.schema import validate_queue_message
 from contract.shared.serde import dumps
 from contract.shared.types import JobEnvelope, QueueMessage
@@ -22,9 +22,18 @@ def _now_ms() -> int:
 
 
 class ContractClient:
-    def __init__(self, r: redis.Redis, *, default_ttl_s: int) -> None:
+    def __init__(
+        self,
+        r: redis.Redis,
+        *,
+        default_ttl_s: int,
+        queue_stream_key: str = shared_config.QUEUE_STREAM_KEY,
+        worker_group: str = shared_config.WORKER_GROUP,
+    ) -> None:
         self._r = r
         self._default_ttl_s = default_ttl_s
+        self._queue_stream_key = queue_stream_key
+        self._worker_group = worker_group
         scripts_dir = Path(__file__).with_name("scripts")
         self._finalize_and_ack = self._r.register_script(
             scripts_dir.joinpath("finalize_and_ack.lua").read_text(encoding="utf-8")
@@ -34,14 +43,27 @@ class ContractClient:
         )
 
     async def readgroup(self, *, consumer: str, count: int, block_ms: int) -> List[JobEnvelope]:
-        msgs = await readgroup(self._r, consumer=consumer, count=count, block_ms=block_ms)
+        msgs = await readgroup(
+            self._r,
+            consumer=consumer,
+            count=count,
+            block_ms=block_ms,
+            queue_stream_key=self._queue_stream_key,
+            worker_group=self._worker_group,
+        )
         return [self._to_envelope(m) for m in msgs]
 
     async def autoclaim(
         self, *, consumer: str, min_idle_ms: int, count: int, start_id: str = "0-0"
     ) -> Tuple[str, List[JobEnvelope]]:
         next_id, msgs = await autoclaim(
-            self._r, consumer=consumer, min_idle_ms=min_idle_ms, count=count, start_id=start_id
+            self._r,
+            consumer=consumer,
+            min_idle_ms=min_idle_ms,
+            count=count,
+            start_id=start_id,
+            queue_stream_key=self._queue_stream_key,
+            worker_group=self._worker_group,
         )
         return next_id, [self._to_envelope(m) for m in msgs]
 
@@ -63,7 +85,11 @@ class ContractClient:
         )
 
     async def ensure_worker_group(self) -> None:
-        await ensure_worker_group(self._r)
+        await ensure_worker_group(
+            self._r,
+            queue_stream_key=self._queue_stream_key,
+            worker_group=self._worker_group,
+        )
 
     async def status(self, job_id: str) -> str:
         raw = await self._r.hget(job_key(job_id), "status")
@@ -73,15 +99,15 @@ class ContractClient:
         return await self.status(job_id) == "canceled"
 
     async def ack(self, msg_id: str) -> None:
-        await self._r.xack(shared_config.QUEUE_STREAM_KEY, shared_config.WORKER_GROUP, msg_id)
+        await self._r.xack(self._queue_stream_key, self._worker_group, msg_id)
 
     async def mark_running(self, envelope: JobEnvelope, *, step: str, consumer: str) -> bool:
         job_id = envelope.job_id
         started = _now_ms()
         out = await self._mark_running(
-            keys=[job_key(job_id), events_key(job_id), shared_config.QUEUE_STREAM_KEY],
+            keys=[job_key(job_id), events_key(job_id), self._queue_stream_key],
             args=[
-                shared_config.WORKER_GROUP,
+                self._worker_group,
                 envelope.msg_id,
                 str(self._default_ttl_s),
                 str(started),
@@ -129,9 +155,9 @@ class ContractClient:
         duration_ms = done_ts - started_ms
 
         await self._finalize_and_ack(
-            keys=[job_key(job_id), events_key(job_id), shared_config.QUEUE_STREAM_KEY],
+            keys=[job_key(job_id), events_key(job_id), self._queue_stream_key],
             args=[
-                shared_config.WORKER_GROUP,
+                self._worker_group,
                 envelope.msg_id,
                 str(ttl_s),
                 "done",
@@ -155,8 +181,8 @@ class ContractClient:
         ttl_s = envelope.ttl_s or self._default_ttl_s
         err_ts = _now_ms()
         dlq_fields: Dict[str, str] = {
-            "src_stream": shared_config.QUEUE_STREAM_KEY,
-            "src_group": shared_config.WORKER_GROUP,
+            "src_stream": self._queue_stream_key,
+            "src_group": self._worker_group,
             "src_msg_id": envelope.msg_id,
             "consumer": "",
             "ts": str(err_ts),
@@ -170,9 +196,9 @@ class ContractClient:
         await push_dlq(self._r, dlq_fields)
 
         await self._finalize_and_ack(
-            keys=[job_key(job_id), events_key(job_id), shared_config.QUEUE_STREAM_KEY],
+            keys=[job_key(job_id), events_key(job_id), self._queue_stream_key],
             args=[
-                shared_config.WORKER_GROUP,
+                self._worker_group,
                 envelope.msg_id,
                 str(ttl_s),
                 "error",
@@ -183,4 +209,13 @@ class ContractClient:
                 dumps(error_obj),
             ],
         )
+
+    async def set_communications_text(self, text: str) -> None:
+        await self._r.set(communications_text_key(), text)
+
+    async def get_communications_text(self) -> str | None:
+        raw = await self._r.get(communications_text_key())
+        if raw is None:
+            return None
+        return str(raw)
 

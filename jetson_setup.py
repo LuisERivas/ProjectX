@@ -123,10 +123,38 @@ RestartSec=5
 WantedBy=multi-user.target
 """
 
+    comm_worker_unit = f"""[Unit]
+Description=ProjectX Redis communications worker
+After=network-online.target {REDIS_SYSTEMD_UNIT}
+Wants=network-online.target
+
+[Service]
+User={user}
+Group={user}
+WorkingDirectory={project_workdir}
+Environment=PYTHONPATH={project_root}
+Environment=REDIS_URL=redis://127.0.0.1:6379/0
+Environment=COMM_QUEUE_STREAM_KEY=jobs:communications:stream
+Environment=COMM_WORKER_GROUP=communications-workers
+Environment=COMM_DEFAULT_TTL_S=3600
+Environment=COMM_BLOCK_MS=5000
+Environment=COMM_COUNT=10
+Environment=COMM_MAX_INFLIGHT=4
+Environment=COMM_JOB_TIMEOUT_S=0
+ExecStart={python_bin} -m worker.communications_worker_main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
     tmp_gateway = project_root / "redis-gateway.service"
     tmp_worker = project_root / "redis-echo-worker.service"
+    tmp_comm_worker = project_root / "redis-communications-worker.service"
     tmp_gateway.write_text(gateway_unit, encoding="utf-8")
     tmp_worker.write_text(worker_unit, encoding="utf-8")
+    tmp_comm_worker.write_text(comm_worker_unit, encoding="utf-8")
 
     run(
         [
@@ -144,11 +172,21 @@ WantedBy=multi-user.target
             "/etc/systemd/system/redis-echo-worker.service",
         ]
     )
+    run(
+        [
+            "sudo",
+            "cp",
+            str(tmp_comm_worker),
+            "/etc/systemd/system/redis-communications-worker.service",
+        ]
+    )
     run(["sudo", "systemctl", "daemon-reload"])
     run(["sudo", "systemctl", "enable", "redis-gateway.service"])
     run(["sudo", "systemctl", "enable", "redis-echo-worker.service"])
+    run(["sudo", "systemctl", "enable", "redis-communications-worker.service"])
     run(["sudo", "systemctl", "start", "redis-gateway.service"])
     run(["sudo", "systemctl", "start", "redis-echo-worker.service"])
+    run(["sudo", "systemctl", "start", "redis-communications-worker.service"])
 
 
 def main():
@@ -165,6 +203,7 @@ def main():
     print("You can check services with:")
     print("  sudo systemctl status redis-gateway.service")
     print("  sudo systemctl status redis-echo-worker.service")
+    print("  sudo systemctl status redis-communications-worker.service")
 
 
 if __name__ == "__main__":
