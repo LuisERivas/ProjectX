@@ -1,6 +1,8 @@
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 
+import worker.communications_worker_main as comm_worker
 from worker.communications_worker_main import process_one
 
 
@@ -91,3 +93,30 @@ def test_print_action_errors_when_missing_text() -> None:
     assert client.done_calls == []
     assert len(client.error_calls) == 1
     assert client.error_calls[0]["step"] == "communications.error"
+
+
+def test_sync_from_file_reads_worker_file_and_finalizes_done(tmp_path: Path) -> None:
+    client = _FakeClient()
+    source_file = tmp_path / "communications.txt"
+    source_file.write_text("from-worker-file", encoding="utf-8")
+
+    old_root = comm_worker.PROJECT_ROOT
+    comm_worker.PROJECT_ROOT = tmp_path
+    try:
+        env = _Envelope(
+            job_id="job-sync-file",
+            msg_id="4-0",
+            task="tool",
+            payload_raw='{"action":"sync_communications_from_file","file_path":"communications.txt"}',
+            ttl_s=0,
+            fields={"job_id": "job-sync-file", "task": "tool"},
+        )
+        asyncio.run(process_one(client, env))
+    finally:
+        comm_worker.PROJECT_ROOT = old_root
+
+    assert client.text_store == "from-worker-file"
+    assert len(client.done_calls) == 1
+    assert client.done_calls[0]["step"] == "communications.sync_file.done"
+    assert client.done_calls[0]["result"]["source_file"].endswith("communications.txt")
+    assert client.error_calls == []

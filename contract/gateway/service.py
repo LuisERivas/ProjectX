@@ -48,7 +48,11 @@ class GatewayContract:
         if task != "tool":
             return False
         action = str(payload.get("action") or "").strip().lower()
-        return action in {"sync_communications", "print_communications"}
+        return action in {
+            "sync_communications",
+            "sync_communications_from_file",
+            "print_communications",
+        }
 
     async def ping(self) -> None:
         r = await self.client()

@@ -7,6 +7,7 @@ import os
 import signal
 import time
 import traceback
+from pathlib import Path
 from typing import Dict
 
 from contract.shared import config as shared_config
@@ -24,6 +25,7 @@ CLAIM_EVERY_S = float(os.getenv("COMM_CLAIM_EVERY_S", "2.0"))
 JOB_TIMEOUT_S = float(os.getenv("COMM_JOB_TIMEOUT_S", "0"))
 
 _shutdown = asyncio.Event()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def now_ms() -> int:
@@ -59,6 +61,31 @@ async def process_one(client: ContractClient, envelope) -> None:
                 envelope,
                 step="communications.sync.done",
                 result_obj={"stored": True, "chars": len(text_value), "ms": now_ms() - started},
+                started_ms=started,
+            )
+            return
+
+        if action == "sync_communications_from_file":
+            rel_path = str(payload_obj.get("file_path") or "communications.txt").strip()
+            if not rel_path:
+                rel_path = "communications.txt"
+            # Prevent path traversal outside project root.
+            candidate = (PROJECT_ROOT / rel_path).resolve()
+            if PROJECT_ROOT not in candidate.parents and candidate != PROJECT_ROOT:
+                raise ValueError("file_path must resolve within project root")
+            if not candidate.exists():
+                raise ValueError(f"communications source file not found: {candidate}")
+            text_value = candidate.read_text(encoding="utf-8")
+            await client.set_communications_text(text_value)
+            await client.finalize_done(
+                envelope,
+                step="communications.sync_file.done",
+                result_obj={
+                    "stored": True,
+                    "chars": len(text_value),
+                    "source_file": str(candidate),
+                    "ms": now_ms() - started,
+                },
                 started_ms=started,
             )
             return

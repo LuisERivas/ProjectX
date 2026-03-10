@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from pathlib import Path
 from typing import Any, Dict
 from urllib import error, request
 
@@ -58,9 +57,9 @@ def main() -> int:
     parser.add_argument("--timeout-s", type=float, default=45.0, help="Request/poll timeout seconds")
     parser.add_argument("--poll-s", type=float, default=0.5, help="Poll interval seconds")
     parser.add_argument(
-        "--file",
+        "--worker-file",
         default="communications.txt",
-        help="Path to communications text file (default: project-root communications.txt)",
+        help="File path (on worker host project root) to read before syncing to Redis.",
     )
     parser.add_argument(
         "--skip-sync",
@@ -69,24 +68,16 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    project_root = Path(__file__).resolve().parents[1]
-    txt_path = Path(args.file)
-    if not txt_path.is_absolute():
-        txt_path = (project_root / txt_path).resolve()
-
     base_url = f"http://{args.host}:{args.port}"
 
     if not args.skip_sync:
-        if not txt_path.exists():
-            raise SystemExit(f"communications file not found: {txt_path}")
-        text = txt_path.read_text(encoding="utf-8")
         sync_job_id = _create_job(
             base_url,
             payload={
                 "task": "tool",
                 "payload": {
-                    "action": "sync_communications",
-                    "text": text,
+                    "action": "sync_communications_from_file",
+                    "file_path": args.worker_file,
                 },
             },
             timeout_s=args.timeout_s,
