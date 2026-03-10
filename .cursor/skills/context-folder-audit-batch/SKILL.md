@@ -1,13 +1,13 @@
 ---
 name: context-folder-audit-batch
-description: Runs context-folder-audit across multiple specified folders (one folder per run, non-recursive) and writes CONTEXTCHECK.md in each folder, with an optional aggregate summary file. Use when auditing more than one folder at once.
+description: Audits multiple specified folders (one folder per run, non-recursive), writes CONTEXTCHECK.md in each folder, then runs create-summary for each immediate file to enrich file summaries. Use when auditing more than one folder at once.
 ---
 
 # Context Folder Audit Batch
 
 ## Purpose
 
-Run the single-folder `context-folder-audit` workflow on a list of folders in one request.
+Run a non-recursive folder audit workflow on a list of folders in one request, without relying on `CONTEXT.md`.
 
 ## Inputs
 
@@ -18,8 +18,11 @@ Run the single-folder `context-folder-audit` workflow on a list of folders in on
 
 1. Parse the folder list from the user request.
 2. For each folder path:
-   - Run the same logic as `context-folder-audit` (single-folder, non-recursive).
-   - Create or overwrite that folder's `CONTEXTCHECK.md`.
+   - Audit only immediate contents in that folder (single-folder, non-recursive).
+   - Do not read, compare, or require `CONTEXT.md`.
+   - Create or overwrite that folder's `CONTEXTCHECK.md` with a `## File Summaries` section and one placeholder entry per immediate file.
+   - After writing `CONTEXTCHECK.md`, run the `create-summary` skill once per immediate file in that folder.
+   - Each `create-summary` run must replace the target file entry with a 5-10 line summary that includes functionality and related files.
 3. After all folders are processed, create/update aggregate summary file with:
    - run timestamp
    - folders processed
@@ -33,10 +36,27 @@ Run the single-folder `context-folder-audit` workflow on a list of folders in on
 - Use only immediate files in that folder for findings.
 - Do not inspect descendant folders unless they are explicitly listed as separate targets.
 - Do not use external files as evidence.
+- Do not read, compare against, or mention `CONTEXT.md` as a source of truth.
 
 ## Per-folder output rule
 
-For each folder, write `CONTEXTCHECK.md` using the format defined by `context-folder-audit`.
+For each folder, write `CONTEXTCHECK.md` as a self-contained folder audit report (no `CONTEXT.md` comparison), then enrich each file entry by running `create-summary` after the report is created.
+
+Use this section at the end of each folder report:
+
+```markdown
+## File Summaries
+
+- `<filename>`: `<1-sentence summary>`
+- `<filename>`: `<1-3 sentence summary>`
+```
+
+File summary constraints:
+
+- Include immediate files only (no recursive file summaries).
+- Final summaries must follow `create-summary` output: 5-10 lines per file entry, including a related-files line.
+- Use neutral, evidence-based wording based on the file's observed role/content.
+- If a folder has no immediate files, write `- None`.
 
 ## Aggregate summary format
 
@@ -60,7 +80,7 @@ Write summary markdown in this structure:
 
 ## Status rules
 
-- Folder status is `PASS` when no discrepancies are found.
+- Folder status is `PASS` when no discrepancies are found in the immediate folder audit.
 - Folder status is `NEEDS_UPDATE` when one or more issues are found.
 
 ## Invocation examples

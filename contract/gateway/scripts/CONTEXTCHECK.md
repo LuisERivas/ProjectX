@@ -1,6 +1,6 @@
 # CONTEXTCHECK
 
-- **Folder:** `contract/worker/scripts`
+- **Folder:** `contract/gateway/scripts`
 - **Last run:** `2026-03-10 15:52:42 Pacific Daylight Time`
 - **Checker:** `context-folder-audit-batch`
 - **Scope:** `non-recursive immediate files only`
@@ -16,25 +16,25 @@
 
 ## File Summaries
 - `CONTEXTCHECK.md`:
-  - Markdown documentation/report file maintained in `contract/worker/scripts`.
+  - Markdown documentation/report file maintained in `contract/gateway/scripts`.
   - Provides human-readable operational context rather than executable logic.
   - Captures run metadata, findings, and references for maintainers.
   - Accuracy depends on synchronization with current code and folder contents.
   - related files: none identified
-  - Observed size is 701 bytes across 20 lines (16 non-empty lines).
+  - Observed size is 694 bytes across 20 lines (16 non-empty lines).
 
-- `finalize_and_ack.lua`:
-  - Lua script in `contract/worker/scripts` intended for runtime scripting operations.
+- `cancel_job.lua`:
+  - Lua script in `contract/gateway/scripts` intended for runtime scripting operations.
   - Executes command logic when invoked by the surrounding orchestration flow.
   - Consumes runtime-provided inputs and emits script-level outputs/results.
   - Includes guard behavior through conditional branches in the script body.
-  - related files: mark_running.lua
-  - Observed size is 3563 bytes across 114 lines (97 non-empty lines).
+  - related files: create_job.lua
+  - Observed size is 1419 bytes across 58 lines (49 non-empty lines).
 
-- `mark_running.lua`:
-  - Lua script in `contract/worker/scripts` intended for runtime scripting operations.
+- `create_job.lua`:
+  - Lua script in `contract/gateway/scripts` intended for runtime scripting operations.
   - Executes command logic when invoked by the surrounding orchestration flow.
   - Consumes runtime-provided inputs and emits script-level outputs/results.
   - Includes guard behavior through conditional branches in the script body.
-  - related files: finalize_and_ack.lua
-  - Observed size is 2070 bytes across 76 lines (67 non-empty lines).
+  - related files: cancel_job.lua
+  - Observed size is 2283 bytes across 95 lines (85 non-empty lines).

@@ -1,16 +1,19 @@
 Server Side Host (e.g. Jetson)
 │
-├── Process manager (e.g. systemd)
-│   ├── redis-server.service
-│   ├── redis-gateway.service
-│   └── redis-echo-worker.service
+├── Process manager (e.g. systemd; unit names may vary by environment)
+│   ├── Redis service (for example: redis.service)
+│   ├── Gateway service (for example: redis-gateway.service)
+│   ├── Main worker service (for example: redis-echo-worker.service)
+│   └── Communications worker service (for example: redis-communications-worker.service)
 │
 ├── Redis (process + data store)
 │   ├── jobs:stream                    (queue stream; consumer group "workers")
+│   ├── jobs:communications:stream      (communications queue; consumer group "communications-workers")
 │   ├── job:{id}                       (hash per job: status, payload, result, error, ttl_s, timestamps)
 │   ├── job:{id}:events                (stream per job: type, ts, step, data)
 │   ├── jobs:dlq                       (dead-letter stream)
-│   └── idempotency:{key}              (optional key used by gateway)
+│   ├── idempotency:{key}              (optional key used by gateway)
+│   └── communications:text            (latest synchronized communications text)
 │
 ├── Gateway (process: uvicorn + FastAPI)
 │   └── main.py (FastAPI app)
@@ -19,6 +22,8 @@ Server Side Host (e.g. Jetson)
 │       ├── POST /v1/jobs/{id}/cancel  (delegates cancellation to contract layer)
 │       ├── GET /v1/jobs/{id}          (delegates job reads to contract layer)
 │       ├── GET /v1/jobs/{id}/events   (SSE transport + formatting)
+│       ├── Routes communications actions (`task=tool`, `sync_communications`, `sync_communications_from_file`, `print_communications`)
+│       │                               to `jobs:communications:stream`
 │       └── GET /health                (contract-backed Redis health/backlog summary)
 │
 ├── Worker (process: python -m worker.worker_main)
@@ -30,6 +35,18 @@ Server Side Host (e.g. Jetson)
 │       ├── readgroup / autoclaim      (consume from jobs:stream)
 │       ├── mark_running               (job hash + running event + TTL)
 │       ├── emit_message               (message event + TTL)
+│       ├── finalize_done              (Lua: hash + done event + TTL + XACK)
+│       └── finalize_error             (DLQ + Lua: hash + error event + TTL + XACK)
+│
+├── Communications Worker (process: python -m worker.communications_worker_main)
+│   ├── communications_worker_main.py
+│   │   ├── Main loop                  (readgroup → spawn process_one)
+│   │   ├── Pending recovery loop      (autoclaim)
+│   │   └── process_one                (communications sync/print actions)
+│   └── ContractClient (contract.worker)
+│       ├── readgroup / autoclaim      (consume from jobs:communications:stream)
+│       ├── set_communications_text    (write `communications:text`)
+│       ├── get_communications_text    (read `communications:text`)
 │       ├── finalize_done              (Lua: hash + done event + TTL + XACK)
 │       └── finalize_error             (DLQ + Lua: hash + error event + TTL + XACK)
 │

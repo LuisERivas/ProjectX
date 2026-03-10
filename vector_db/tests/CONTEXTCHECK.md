@@ -1,13 +1,13 @@
 # CONTEXTCHECK
 
-- **Folder:** `contract/gateway`
+- **Folder:** `vector_db/tests`
 - **Last run:** `2026-03-10 15:52:42 Pacific Daylight Time`
 - **Checker:** `context-folder-audit-batch`
 - **Scope:** `non-recursive immediate files only`
 - **CONTEXT.md dependency:** `disabled`
 
 ## Findings
-- Reviewed `3` immediate files in this folder.
+- Reviewed `4` immediate files in this folder.
 - No discrepancies detected under the non-recursive folder-only audit criteria.
 
 ## Status
@@ -16,25 +16,33 @@
 
 ## File Summaries
 - `CONTEXTCHECK.md`:
-  - Markdown documentation/report file maintained in `contract/gateway`.
+  - Markdown documentation/report file maintained in `vector_db/tests`.
   - Provides human-readable operational context rather than executable logic.
   - Captures run metadata, findings, and references for maintainers.
   - Accuracy depends on synchronization with current code and folder contents.
   - related files: none identified
-  - Observed size is 679 bytes across 20 lines (16 non-empty lines).
+  - Observed size is 765 bytes across 21 lines (17 non-empty lines).
 
-- `__init__.py`:
-  - Python module in `contract/gateway` with 0 classes and 0 functions.
+- `benchmark_phase3.py`:
+  - Python module in `vector_db/tests` with 0 classes and 4 functions.
   - Contains executable logic used by this package and its call sites.
   - Defines symbols consumed through imports and module-level interfaces.
   - Edge-case behavior depends on explicit checks and raised exceptions in code paths.
-  - related files: service.py
-  - Observed size is 119 bytes across 6 lines (4 non-empty lines).
+  - related files: smoke_cli.py
+  - Observed size is 2698 bytes across 87 lines (71 non-empty lines).
 
-- `service.py`:
-  - Python module in `contract/gateway` with 1 classes and 3 functions.
+- `smoke_cli.py`:
+  - Python module in `vector_db/tests` with 0 classes and 3 functions.
   - Contains executable logic used by this package and its call sites.
   - Defines symbols consumed through imports and module-level interfaces.
   - Edge-case behavior depends on explicit checks and raised exceptions in code paths.
-  - related files: __init__.py
-  - Observed size is 7180 bytes across 218 lines (189 non-empty lines).
+  - related files: benchmark_phase3.py
+  - Observed size is 4141 bytes across 98 lines (82 non-empty lines).
+
+- `test_phase1.cpp`:
+  - C/C++ source/header used by `vector_db/tests` with 8 include directives.
+  - Implements compiled logic and type contracts used by neighboring translation units.
+  - Exposes or consumes interfaces through declarations, includes, and function signatures.
+  - Handles edge cases through status checks, guard clauses, and return-path decisions.
+  - related files: none identified
+  - Observed size is 10945 bytes across 312 lines (289 non-empty lines).

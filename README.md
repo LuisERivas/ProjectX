@@ -23,7 +23,7 @@ a contract layer that centralizes Redis data-plane behavior.
   - Async runtime loop and concurrency orchestration (`worker_main.py`).
   - Reads and reclaims jobs, runs business logic (currently echo placeholder), handles graceful shutdown.
   - Delegates Redis lifecycle/event/state transitions to `contract/worker/*`.
-  - Includes dedicated communications worker (`communications_worker_main.py`) for `sync_communications` and `print_communications` actions.
+  - Includes dedicated communications worker (`communications_worker_main.py`) for `sync_communications`, `sync_communications_from_file`, and `print_communications` actions.
 
 - `contract/`
   - Canonical Redis contract implementation and shared primitives.
@@ -50,7 +50,7 @@ a contract layer that centralizes Redis data-plane behavior.
 6. Client reads final state with `GET /v1/jobs/{job_id}` or streams events via SSE.
 
 Communications flow (dedicated worker):
-1. Client submits `task=tool` with payload action `sync_communications` or `print_communications`.
+1. Client submits `task=tool` with payload action `sync_communications`, `sync_communications_from_file`, or `print_communications`.
 2. Gateway routes those jobs to `jobs:communications:stream`.
 3. `redis-communications-worker.service` consumes that stream/group and writes/reads `communications:text`.
 4. Client reads printed text from final `result.text`.

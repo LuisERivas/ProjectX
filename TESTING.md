@@ -1,6 +1,7 @@
 # TESTING
 
-This guide validates that ProjectX works end-to-end and that architectural boundaries remain intact.
+This guide combines automated smoke checks and manual validation steps for ProjectX.
+The remote runner covers a core API subset only; full end-to-end confidence still requires the manual sections below.
 
 ## 1) Scope note
 
@@ -10,7 +11,7 @@ Dev-mode test flow will be expanded in a future update and can be ignored for no
 
 ## 2) Remote automated runner (no SSH)
 
-If you are testing from another machine, you can run the remote helper script that prompts for Jetson IP and executes the non-disruptive API flow from this document.
+If you are testing from another machine, you can run the remote helper script that prompts for Jetson IP and executes non-disruptive core API checks from this document.
 
 From project root:
 
@@ -30,10 +31,16 @@ What it automates:
 - Idempotency check (`Idempotency-Key` reused)
 - Cancel endpoint check (`POST /v1/jobs/{job_id}/cancel`)
 
+What it does not automate:
+- SSE event progression checks
+- Redis ground-truth checks with `redis-cli`
+- Recovery behavior checks
+- Communications worker flow (`scripts/communications_client.py`)
+- Boundary static test (`python -m pytest tests/test_boundary_rules.py`)
+
 What remains manual without SSH:
 - `systemctl` status checks on Jetson
-- Redis ground-truth checks with `redis-cli`
-- Boundary static test (`python -m pytest tests/test_boundary_rules.py`)
+- Toolchain checks (`g++`, `cmake`, `nvcc`)
 
 Exit codes:
 - `0`: all automated checks passed
@@ -73,9 +80,9 @@ curl -sS http://127.0.0.1:8000/health
 
 Expected:
 - `"ok": true`
-- `queue_stream` and `worker_group` fields present
+- Additional health fields may be present depending on runtime configuration
 
-## 5) End-to-end job flow
+## 5) API job flow
 
 ### 4.1 Submit a job
 
@@ -220,10 +227,11 @@ Expected:
 
 ## 12) Suggested regression checklist
 
-Run this minimum suite after code changes:
+Run this minimum suite after code changes (automated + manual):
 - Verify systemd services are active
 - `GET /health`
-- Submit/read/stream one job
+- Submit/read one job
+- Stream one job over SSE (manual)
 - Idempotency test
 - Cancel test
 - Communications worker sync/print test

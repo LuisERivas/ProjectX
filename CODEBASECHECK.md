@@ -1,43 +1,55 @@
 # CODEBASE Check Report
 
 - **Root folder:** `ProjectX/`
-- **Last checked:** `2026-03-07 21:45:29 -08:00`
+- **Last checked:** `2026-03-10 15:59:01 -07:00`
 - **Checker:** `codebase-check`
 
 ## Summary
 
-- Files scanned: `64`
-- Findings: `3`
+- Files scanned: `93`
+- Findings: `5`
 - High: `2`
-- Medium: `0`
+- Medium: `2`
 - Low: `1`
 - Status: `NEEDS_UPDATE`
 
 ## Findings (By Severity)
 
 ### HIGH
-- Timeout path can leave jobs pending and repeatedly reclaimed.
-  - **Paths:** `worker/worker_main.py`, `contract/worker/contract_client.py`
-  - **Why it matters:** `asyncio.wait_for` timeout in task execution is not finalized/acked in the timeout path, so jobs can loop through reclaim/retry indefinitely.
-  - **Recommended fix:** catch timeout explicitly in worker task execution and route to deterministic terminal handling (`finalize_error` or DLQ + ACK).
+- Unbounded retry risk on job timeout can keep messages pending and repeatedly reclaimed.
+  - **Paths:** `worker/worker_main.py`, `worker/communications_worker_main.py`, `contract/worker/contract_client.py`
+  - **Why it matters:** timeout-wrapped execution paths are not consistently terminalized/acked, which can cause replay loops, queue churn, and reliability degradation.
+  - **Recommended fix:** explicitly handle timeout at `_process_one_with_timeout` call sites and force deterministic terminal handling (`finalize_error` plus ACK path, with optional DLQ tagging).
 
-- Malformed queue messages can stall processing without DLQ/ACK.
-  - **Paths:** `contract/worker/contract_client.py`, `contract/shared/schema.py`, `worker/worker_main.py`
-  - **Why it matters:** schema validation failures in `_to_envelope` bubble to run loop, which backs off but does not quarantine/ack the bad message.
-  - **Recommended fix:** add poison-message handling path (DLQ + ACK) for envelope/schema errors.
+- Malformed queue message poison handling lacks guaranteed quarantine+ack path.
+  - **Paths:** `contract/worker/contract_client.py`, `contract/shared/schema.py`, `worker/worker_main.py`, `worker/communications_worker_main.py`
+  - **Why it matters:** validation failures at envelope conversion can re-enter processing/recovery loops instead of being safely isolated, risking repeated failures.
+  - **Recommended fix:** add a poison-message path at dequeue/envelope boundary that captures raw payload, writes to DLQ, and ACKs safely.
+
+### MEDIUM
+- Worker runtime resilience differs between main and communications workers due to duplicated orchestration.
+  - **Paths:** `worker/worker_main.py`, `worker/communications_worker_main.py`
+  - **Why it matters:** one worker loop includes stronger transient exception containment/backoff behavior, while the other can exit on runtime exceptions, creating operational drift.
+  - **Recommended fix:** extract shared worker loop/recovery orchestration into a common module and apply one exception/retry contract to both workers.
+
+- Testing documentation claims exceed what the remote runner verifies for communications flow.
+  - **Paths:** `TESTING.md`, `scripts/run_testing_md_remote.py`
+  - **Why it matters:** mismatch between documented validation scope and actual automation can produce false confidence in communications readiness.
+  - **Recommended fix:** either expand `run_testing_md_remote.py` to include communications checks or narrow `TESTING.md` claims to match current runner coverage.
 
 ### LOW
-- DLQ stream name is hardcoded while queue/group are env-configurable.
-  - **Paths:** `contract/shared/redis_keys.py`, `contract/shared/config.py`
-  - **Why it matters:** environment namespacing can drift for DLQ in multi-env deployments.
-  - **Recommended fix:** move DLQ key default into shared config and reference from key helper.
+- Stale architecture document omits active communications topology.
+  - **Paths:** `docs/treeArchitecture`, `README.md`, `worker/communications_worker_main.py`, `contract/shared/config.py`
+  - **Why it matters:** onboarding and operations decisions may follow outdated system topology and miss communications components.
+  - **Recommended fix:** update `docs/treeArchitecture` to include `redis-communications-worker.service`, `jobs:communications:stream`, and `communications-workers`.
 
 ## Validation Gaps
-- No automated Redis test for timeout/reclaim + malformed-message poison handling.
-- No automated check ensures docs/check reports remain synchronized after rapid code changes.
-- Local host Python session still lacks `pytest`; tests are expected to run from project venv.
+- No automated test proving timeout behavior (`JOB_TIMEOUT_S`) always terminalizes and ACKs.
+- No automated poison-message test asserting malformed queue payloads are DLQ'd and ACK'd.
+- No test ensuring communications worker loop survives transient Redis/read exceptions.
+- No automated backpressure test at gateway backlog threshold.
 
 ## Recommended Next Steps
-1. Add deterministic timeout handling path (terminalize or DLQ + ACK) in worker execution wrapper.
-2. Add poison-message handling for schema/envelope failures (DLQ + ACK).
-3. Add integration tests for timeout + poison-message quarantine/ack behavior, then re-run `codebase-check`.
+1. Implement deterministic timeout and poison-message handling with guaranteed ACK semantics.
+2. Deduplicate worker orchestration into shared runtime loop logic to remove resilience drift.
+3. Add targeted integration tests (timeout, poison, communications resilience, backpressure), then rerun `codebase-check`.
