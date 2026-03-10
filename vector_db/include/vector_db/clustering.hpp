@@ -115,6 +115,30 @@ Status cuda_reduce_centroids_top1(
     std::size_t k_centroids,
     std::size_t dim,
     std::vector<float>* out_centroids_row_major);
+Status cuda_kmeans_iteration_top1(
+    const std::vector<float>& vectors_row_major,
+    const std::vector<float>& centroids_row_major,
+    std::size_t n_vectors,
+    std::size_t k_centroids,
+    std::size_t dim,
+    std::vector<float>* out_centroids_row_major,
+    std::vector<std::uint32_t>* out_labels,
+    std::vector<float>* out_best_scores,
+    bool* out_tensor_core_enabled,
+    std::string* out_backend_name,
+    double* out_scoring_ms);
+Status cuda_topm_from_centroids(
+    const std::vector<float>& vectors_row_major,
+    const std::vector<float>& centroids_row_major,
+    std::size_t n_vectors,
+    std::size_t k_centroids,
+    std::size_t dim,
+    std::size_t top_m,
+    std::vector<std::vector<std::uint32_t>>* out_top_m,
+    std::vector<float>* out_scores_row_major,
+    bool* out_tensor_core_enabled,
+    std::string* out_backend_name,
+    double* out_scoring_ms);
 
 }  // namespace vector_db
 

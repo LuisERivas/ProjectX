@@ -38,9 +38,13 @@ def generate_dataset(
     clusters: int,
     noise_std: float,
     normalized: bool,
+    gpu: bool,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     vectors_path = out_dir / "vectors.fp16bin"
+    vectors_fp32_path = out_dir / "vectors.fp32bin"
+    ids_path = out_dir / "ids.u64bin"
+    meta_path = out_dir / "meta.jsonl"
     metadata_path = out_dir / "metadata.jsonl"
     cli_payloads_path = out_dir / "insert_payloads.jsonl"
     manifest_path = out_dir / "manifest.json"
@@ -49,22 +53,80 @@ def generate_dataset(
     centroids = _build_centroids(clusters, dim, rng)
     row_pack = struct.Struct("<" + ("e" * dim))
     row_unpack = struct.Struct("<" + ("e" * dim))
+    row_pack_fp32 = struct.Struct("<" + ("f" * dim))
+    id_pack = struct.Struct("<Q")
 
     cluster_counts = [0 for _ in range(clusters)]
     with (
         vectors_path.open("wb") as vf,
+        vectors_fp32_path.open("wb") as v32f,
+        ids_path.open("wb") as idf,
+        meta_path.open("w", encoding="utf-8") as mjf,
         metadata_path.open("w", encoding="utf-8") as mf,
         cli_payloads_path.open("w", encoding="utf-8") as cf,
     ):
+        if gpu:
+            try:
+                import cupy as cp  # type: ignore
+
+                cp.random.seed(seed)
+                cp_centroids = cp.asarray(centroids, dtype=cp.float32)
+                ids_cp = cp.arange(count, dtype=cp.int64)
+                cluster_ids = cp.random.randint(0, clusters, size=count, dtype=cp.int64)
+                chosen = cp_centroids[cluster_ids]
+                noise = cp.random.normal(0.0, noise_std, size=(count, dim)).astype(cp.float32)
+                vectors = chosen + noise
+                if normalized:
+                    norms = cp.linalg.norm(vectors, axis=1, keepdims=True)
+                    norms = cp.maximum(norms, 1e-12)
+                    vectors = vectors / norms
+                vectors_host = cp.asnumpy(vectors)
+                cluster_ids_host = cp.asnumpy(cluster_ids)
+                ids_host = cp.asnumpy(ids_cp)
+                for i in range(count):
+                    cid = int(cluster_ids_host[i])
+                    cluster_counts[cid] += 1
+                    vec = [float(x) for x in vectors_host[i]]
+                    packed = row_pack.pack(*vec)
+                    vf.write(packed)  # Quantizes to FP16 on write.
+                    vec_fp16 = row_unpack.unpack(packed)
+                    v32f.write(row_pack_fp32.pack(*vec))
+                    rid = int(ids_host[i])
+                    idf.write(id_pack.pack(rid))
+                    vec_csv = ",".join(f"{v:.6f}" for v in vec_fp16)
+                    meta_json = {"kind": "synthetic", "cluster": cid}
+                    meta_text = json.dumps(meta_json, separators=(",", ":"))
+                    mjf.write(meta_text + "\n")
+                    mf.write(json.dumps({"id": rid, "cluster": cid}) + "\n")
+                    cf.write(
+                        json.dumps(
+                            {
+                                "id": rid,
+                                "vec_csv": vec_csv,
+                                "meta_json": meta_text,
+                            }
+                        )
+                        + "\n"
+                    )
+                gpu = True
+            except Exception:
+                gpu = False
+
         for i in range(count):
+            if gpu:
+                break
             cid = rng.randrange(clusters)
             cluster_counts[cid] += 1
             vec = _make_vector(centroids[cid], noise_std, normalized, rng)
             packed = row_pack.pack(*vec)
             vf.write(packed)  # Quantizes to FP16 on write.
             vec_fp16 = row_unpack.unpack(packed)
+            v32f.write(row_pack_fp32.pack(*vec))
+            idf.write(id_pack.pack(i))
             vec_csv = ",".join(f"{v:.6f}" for v in vec_fp16)
             meta_json = {"kind": "synthetic", "cluster": cid}
+            meta_text = json.dumps(meta_json, separators=(",", ":"))
+            mjf.write(meta_text + "\n")
             mf.write(json.dumps({"id": i, "cluster": cid}) + "\n")
             # Format plugs directly into existing vectordb_cli insert usage:
             # vectordb_cli insert --id <id> --vec <vec_csv> --meta <meta_json>
@@ -73,7 +135,7 @@ def generate_dataset(
                     {
                         "id": i,
                         "vec_csv": vec_csv,
-                        "meta_json": json.dumps(meta_json, separators=(",", ":")),
+                        "meta_json": meta_text,
                     }
                 )
                 + "\n"
@@ -90,10 +152,14 @@ def generate_dataset(
         "noise_std": noise_std,
         "files": {
             "vectors": vectors_path.name,
+            "vectors_fp32": vectors_fp32_path.name,
+            "ids": ids_path.name,
+            "meta": meta_path.name,
             "metadata": metadata_path.name,
             "cli_payloads": cli_payloads_path.name,
         },
         "cluster_counts": cluster_counts,
+        "gpu_generation_used": gpu,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -122,6 +188,11 @@ def main() -> int:
         default="vector_db/synthetic_dataset_10k_fp16",
         help="Output directory path.",
     )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Attempt GPU generation via CuPy (falls back to CPU if unavailable).",
+    )
     args = parser.parse_args()
 
     if args.count <= 0:
@@ -142,6 +213,7 @@ def main() -> int:
         clusters=args.clusters,
         noise_std=args.noise_std,
         normalized=not args.no_normalize,
+        gpu=args.gpu,
     )
     print(f"ok: wrote dataset to {out_dir}")
     return 0

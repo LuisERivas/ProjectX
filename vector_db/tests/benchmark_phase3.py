@@ -25,6 +25,21 @@ def make_vec(seed: int) -> str:
     return ",".join(f"{v:.6f}" for v in vals)
 
 
+def build_payloads(path: Path, total: int) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for i in range(total):
+            f.write(
+                json.dumps(
+                    {
+                        "id": 10000 + i,
+                        "vec_csv": make_vec(i),
+                        "meta_json": '{"kind":"bench"}',
+                    }
+                )
+                + "\n"
+            )
+
+
 def main() -> int:
     build_dir = Path("build")
     bin_name = "vectordb_cli.exe" if sys.platform.startswith("win") else "vectordb_cli"
@@ -38,8 +53,9 @@ def main() -> int:
 
     run([str(cli), "init", "--path", str(data_dir)])
     total = 256
-    for i in range(total):
-        run([str(cli), "insert", "--path", str(data_dir), "--id", str(10000 + i), "--vec", make_vec(i), "--meta", '{"kind":"bench"}'])
+    payloads = data_dir / "benchmark_payloads.jsonl"
+    build_payloads(payloads, total)
+    run([str(cli), "bulk-insert", "--path", str(data_dir), "--input", str(payloads)])
 
     t0 = time.perf_counter()
     run([str(cli), "build-initial-clusters", "--path", str(data_dir), "--seed", "42"])

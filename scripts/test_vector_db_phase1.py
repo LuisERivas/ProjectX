@@ -99,7 +99,6 @@ def run_step(name: str, cmd: list[str], cwd: Path, estimate_s: int) -> None:
 def clear_old_test_paths(vector_db_dir: Path) -> None:
     stale_dirs = [
         vector_db_dir / "smoke_data",
-        vector_db_dir / "benchmark_data",
         vector_db_dir / "tc_check_data",
     ]
     print("\n== Cleanup old test paths ==")
@@ -132,7 +131,6 @@ def main() -> int:
         "CTest": 90,
         "Generate synthetic dataset": 20,
         "CLI smoke": 240,
-        "Phase3 benchmark sanity": 60,
     }
 
     try:
@@ -166,12 +164,6 @@ def main() -> int:
             [sys.executable, "tests/smoke_cli.py"],
             cwd=vector_db_dir,
             estimate_s=estimates_s["CLI smoke"],
-        )
-        run_step(
-            "Phase3 benchmark sanity",
-            [sys.executable, "tests/benchmark_phase3.py"],
-            cwd=vector_db_dir,
-            estimate_s=estimates_s["Phase3 benchmark sanity"],
         )
     except FileNotFoundError as e:
         print(f"[FAIL] Missing tool: {e}")

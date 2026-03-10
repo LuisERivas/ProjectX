@@ -178,6 +178,7 @@ void print_usage() {
               << "  checkpoint --path <data_dir>\n"
               << "  wal-stats --path <data_dir>\n"
               << "  bulk-insert --path <data_dir> --input <insert_payloads.jsonl>\n"
+              << "  bulk-insert-bin --path <data_dir> --vectors <vectors.fp32bin> --ids <ids.u64bin> --meta <meta.jsonl>\n"
               << "  build-initial-clusters --path <data_dir> [--seed <u32>]\n"
               << "  cluster-stats --path <data_dir>\n"
               << "  cluster-health --path <data_dir>\n";
@@ -286,6 +287,79 @@ int main(int argc, char** argv) {
             }
         }
         std::cout << "ok: bulk inserted rows=" << inserted << "\n";
+        return 0;
+    }
+
+    if (command == "bulk-insert-bin") {
+        const std::string vectors_path = get_arg(args, "--vectors");
+        const std::string ids_path = get_arg(args, "--ids");
+        const std::string meta_path = get_arg(args, "--meta");
+        if (vectors_path.empty() || ids_path.empty() || meta_path.empty()) {
+            print_usage();
+            return 2;
+        }
+        if (!open_or_fail()) {
+            return 1;
+        }
+        std::ifstream ids_in(ids_path, std::ios::binary);
+        std::ifstream vec_in(vectors_path, std::ios::binary);
+        std::ifstream meta_in(meta_path, std::ios::binary);
+        if (!ids_in || !vec_in || !meta_in) {
+            std::cerr << "error: failed opening binary bulk input files\n";
+            return 1;
+        }
+        std::vector<std::uint64_t> ids;
+        while (true) {
+            std::uint64_t id = 0;
+            ids_in.read(reinterpret_cast<char*>(&id), static_cast<std::streamsize>(sizeof(id)));
+            if (ids_in.eof()) {
+                break;
+            }
+            if (!ids_in.good()) {
+                std::cerr << "error: failed reading ids file\n";
+                return 1;
+            }
+            ids.push_back(id);
+        }
+        std::vector<std::string> metas;
+        std::string mline;
+        while (std::getline(meta_in, mline)) {
+            if (!mline.empty()) {
+                metas.push_back(mline);
+            }
+        }
+        if (ids.empty() || ids.size() != metas.size()) {
+            std::cerr << "error: ids/meta row count mismatch\n";
+            return 1;
+        }
+        vec_in.seekg(0, std::ios::end);
+        const auto vec_bytes = vec_in.tellg();
+        vec_in.seekg(0, std::ios::beg);
+        const std::size_t row_bytes = vector_db::kVectorDim * sizeof(float);
+        if (vec_bytes <= 0 || static_cast<std::size_t>(vec_bytes) != ids.size() * row_bytes) {
+            std::cerr << "error: vectors file size mismatch for 1024-fp32 rows\n";
+            return 1;
+        }
+        std::vector<float> row(vector_db::kVectorDim, 0.0f);
+        std::size_t inserted = 0;
+        std::cout << "progress: binary bulk insert started\n";
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            vec_in.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row_bytes));
+            if (!vec_in.good()) {
+                std::cerr << "error: failed reading vector row " << i << "\n";
+                return 1;
+            }
+            const auto s = store.insert(ids[i], row, metas[i]);
+            if (!s.ok) {
+                std::cerr << "error: insert failed at row " << i << ": " << s.message << "\n";
+                return 1;
+            }
+            ++inserted;
+            if (inserted % 1000 == 0) {
+                std::cout << "progress: inserted " << inserted << " rows\n";
+            }
+        }
+        std::cout << "ok: binary bulk inserted rows=" << inserted << "\n";
         return 0;
     }
 
