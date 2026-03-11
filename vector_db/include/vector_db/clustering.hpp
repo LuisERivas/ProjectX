@@ -118,7 +118,7 @@ struct InitialClusteringConfig {
     bool elbow_prune_enabled = true;
     double elbow_prune_margin = 0.01;
     bool elbow_trace_full_grid = false;
-    bool elbow_int8_search_enabled = false;
+    bool elbow_int8_search_enabled = true;
     bool elbow_int8_require_hardware = true;
     std::string elbow_int8_scale_mode = "per_tensor_symmetric";
 };

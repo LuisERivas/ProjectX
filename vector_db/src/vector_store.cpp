@@ -1797,12 +1797,9 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     cfg.elbow_trace_full_grid = env_flag_enabled(
         "VECTOR_DB_ELBOW_TRACE_FULL_GRID",
         cfg.elbow_trace_full_grid);
-    cfg.elbow_int8_search_enabled = env_flag_enabled(
-        "VECTOR_DB_ELBOW_INT8_SEARCH",
-        cfg.elbow_int8_search_enabled);
-    cfg.elbow_int8_require_hardware = env_flag_enabled(
-        "VECTOR_DB_ELBOW_INT8_REQUIRE_HARDWARE",
-        cfg.elbow_int8_require_hardware);
+    // INT8 elbow search is mandatory now; keep hard-fail when unavailable.
+    cfg.elbow_int8_search_enabled = true;
+    cfg.elbow_int8_require_hardware = true;
     const char* int8_scale_mode_env = std::getenv("VECTOR_DB_ELBOW_INT8_SCALE_MODE");
     if (int8_scale_mode_env != nullptr && std::string(int8_scale_mode_env).size() > 0) {
         cfg.elbow_int8_scale_mode = int8_scale_mode_env;
