@@ -534,7 +534,18 @@ int main(int argc, char** argv) {
                   << "  \"tensor_core_enabled\": " << (st.tensor_core_enabled ? "true" : "false") << ",\n"
                   << "  \"gpu_backend\": \"" << st.gpu_backend << "\",\n"
                   << "  \"scoring_ms_total\": " << st.scoring_ms_total << ",\n"
-                  << "  \"scoring_calls\": " << st.scoring_calls << "\n"
+                  << "  \"scoring_calls\": " << st.scoring_calls << ",\n"
+                  << "  \"elbow_k_evaluated_count\": " << st.elbow_k_evaluated_count << ",\n"
+                  << "  \"elbow_stage_a_candidates\": " << st.elbow_stage_a_candidates << ",\n"
+                  << "  \"elbow_stage_b_candidates\": " << st.elbow_stage_b_candidates << ",\n"
+                  << "  \"elbow_early_stop_reason\": \"" << st.elbow_early_stop_reason << "\",\n"
+                  << "  \"stability_runs_executed\": " << st.stability_runs_executed << ",\n"
+                  << "  \"load_live_vectors_ms\": " << st.load_live_vectors_ms << ",\n"
+                  << "  \"id_estimation_ms\": " << st.id_estimation_ms << ",\n"
+                  << "  \"elbow_ms\": " << st.elbow_ms << ",\n"
+                  << "  \"stability_ms\": " << st.stability_ms << ",\n"
+                  << "  \"write_artifacts_ms\": " << st.write_artifacts_ms << ",\n"
+                  << "  \"total_build_ms\": " << st.total_build_ms << "\n"
                   << "}\n";
         return 0;
     }

@@ -866,6 +866,39 @@ struct VectorStore::Impl {
         if (const auto v = extract_u64_field(text, "scoring_calls"); v.has_value()) {
             cluster_stats_cache.scoring_calls = static_cast<std::size_t>(*v);
         }
+        if (const auto v = extract_u64_field(text, "elbow_k_evaluated_count"); v.has_value()) {
+            cluster_stats_cache.elbow_k_evaluated_count = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "elbow_stage_a_candidates"); v.has_value()) {
+            cluster_stats_cache.elbow_stage_a_candidates = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "elbow_stage_b_candidates"); v.has_value()) {
+            cluster_stats_cache.elbow_stage_b_candidates = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_string_field(text, "elbow_early_stop_reason"); v.has_value()) {
+            cluster_stats_cache.elbow_early_stop_reason = *v;
+        }
+        if (const auto v = extract_u64_field(text, "stability_runs_executed"); v.has_value()) {
+            cluster_stats_cache.stability_runs_executed = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_double_field(text, "load_live_vectors_ms"); v.has_value()) {
+            cluster_stats_cache.load_live_vectors_ms = *v;
+        }
+        if (const auto v = extract_double_field(text, "id_estimation_ms"); v.has_value()) {
+            cluster_stats_cache.id_estimation_ms = *v;
+        }
+        if (const auto v = extract_double_field(text, "elbow_ms"); v.has_value()) {
+            cluster_stats_cache.elbow_ms = *v;
+        }
+        if (const auto v = extract_double_field(text, "stability_ms"); v.has_value()) {
+            cluster_stats_cache.stability_ms = *v;
+        }
+        if (const auto v = extract_double_field(text, "write_artifacts_ms"); v.has_value()) {
+            cluster_stats_cache.write_artifacts_ms = *v;
+        }
+        if (const auto v = extract_double_field(text, "total_build_ms"); v.has_value()) {
+            cluster_stats_cache.total_build_ms = *v;
+        }
         if (const auto v = extract_double_field(text, "mean_nmi"); v.has_value()) {
             cluster_health_cache.mean_nmi = *v;
         }
@@ -904,6 +937,17 @@ struct VectorStore::Impl {
         os << "  \"gpu_backend\": \"" << json_escape(stats.gpu_backend) << "\",\n";
         os << "  \"scoring_ms_total\": " << stats.scoring_ms_total << ",\n";
         os << "  \"scoring_calls\": " << stats.scoring_calls << ",\n";
+        os << "  \"elbow_k_evaluated_count\": " << stats.elbow_k_evaluated_count << ",\n";
+        os << "  \"elbow_stage_a_candidates\": " << stats.elbow_stage_a_candidates << ",\n";
+        os << "  \"elbow_stage_b_candidates\": " << stats.elbow_stage_b_candidates << ",\n";
+        os << "  \"elbow_early_stop_reason\": \"" << json_escape(stats.elbow_early_stop_reason) << "\",\n";
+        os << "  \"stability_runs_executed\": " << stats.stability_runs_executed << ",\n";
+        os << "  \"load_live_vectors_ms\": " << stats.load_live_vectors_ms << ",\n";
+        os << "  \"id_estimation_ms\": " << stats.id_estimation_ms << ",\n";
+        os << "  \"elbow_ms\": " << stats.elbow_ms << ",\n";
+        os << "  \"stability_ms\": " << stats.stability_ms << ",\n";
+        os << "  \"write_artifacts_ms\": " << stats.write_artifacts_ms << ",\n";
+        os << "  \"total_build_ms\": " << stats.total_build_ms << ",\n";
         os << "  \"id_sample_size\": " << idr.sample_size << ",\n";
         os << "  \"id_m_low\": " << idr.m_low << ",\n";
         os << "  \"id_m_high\": " << idr.m_high << ",\n";
@@ -1289,12 +1333,15 @@ Status VectorStore::checkpoint() {
 }
 
 Status VectorStore::build_initial_clusters(std::uint32_t seed) {
+    const auto t_build_start = std::chrono::steady_clock::now();
     if (!impl_->opened) {
         if (const Status s = open(); !s.ok) {
             return s;
         }
     }
+    const auto t_live_start = std::chrono::steady_clock::now();
     const auto live = impl_->collect_live_vectors();
+    const auto t_live_end = std::chrono::steady_clock::now();
     if (live.size() < 8) {
         return Status::Error("need at least 8 live vectors to build initial clusters");
     }
@@ -1310,27 +1357,35 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     cfg.max_sample = std::max<std::size_t>(256, std::min<std::size_t>(4096, vectors.size()));
 
     IdEstimateRange idr;
+    const auto t_id_start = std::chrono::steady_clock::now();
     std::cout << "progress: clustering step 1/4 id estimation\n";
     if (const Status s = estimate_intrinsic_dimensionality(vectors, cfg.seed, cfg.min_sample, cfg.max_sample, &idr); !s.ok) {
         return s;
     }
+    const auto t_id_end = std::chrono::steady_clock::now();
     KMeansModel model;
     ElbowSelection elbow;
+    const auto t_elbow_start = std::chrono::steady_clock::now();
     std::cout << "progress: clustering step 2/4 binary elbow k selection\n";
     if (const Status s = select_k_binary_elbow(vectors, idr, cfg, &model, &elbow); !s.ok) {
         return s;
     }
+    const auto t_elbow_end = std::chrono::steady_clock::now();
     StabilityMetrics stability;
+    const auto t_stability_start = std::chrono::steady_clock::now();
     std::cout << "progress: clustering step 3/4 stability evaluation\n";
     if (const Status s = evaluate_stability(vectors, model.k, cfg, &stability); !s.ok) {
         return s;
     }
+    const auto t_stability_end = std::chrono::steady_clock::now();
 
     const std::uint64_t version = impl_->next_cluster_version();
+    const auto t_write_start = std::chrono::steady_clock::now();
     std::cout << "progress: clustering step 4/4 writing artifacts version=" << version << "\n";
     if (const Status s = impl_->write_initial_cluster_artifacts(version, idr, elbow, model, stability, live); !s.ok) {
         return s;
     }
+    const auto t_write_end = std::chrono::steady_clock::now();
 
     ClusterStats st{};
     st.available = true;
@@ -1346,6 +1401,17 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     st.gpu_backend = model.gpu_backend;
     st.scoring_ms_total = model.scoring_ms_total;
     st.scoring_calls = model.scoring_calls;
+    st.elbow_k_evaluated_count = elbow.k_evaluated_count;
+    st.elbow_stage_a_candidates = elbow.stage_a_candidates;
+    st.elbow_stage_b_candidates = elbow.stage_b_candidates;
+    st.elbow_early_stop_reason = elbow.early_stop_reason;
+    st.stability_runs_executed = stability.runs_executed;
+    st.load_live_vectors_ms = std::chrono::duration<double, std::milli>(t_live_end - t_live_start).count();
+    st.id_estimation_ms = std::chrono::duration<double, std::milli>(t_id_end - t_id_start).count();
+    st.elbow_ms = std::chrono::duration<double, std::milli>(t_elbow_end - t_elbow_start).count();
+    st.stability_ms = std::chrono::duration<double, std::milli>(t_stability_end - t_stability_start).count();
+    st.write_artifacts_ms = std::chrono::duration<double, std::milli>(t_write_end - t_write_start).count();
+    st.total_build_ms = std::chrono::duration<double, std::milli>(t_write_end - t_build_start).count();
 
     ClusterHealth health{};
     health.available = true;

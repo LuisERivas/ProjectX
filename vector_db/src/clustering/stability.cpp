@@ -1,9 +1,11 @@
 #include "vector_db/clustering.hpp"
 
 #include <algorithm>
+#include <future>
 #include <cmath>
 #include <cstdint>
 #include <numeric>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -112,6 +114,63 @@ double centroid_drift(const KMeansModel& a, const KMeansModel& b) {
     return sum / static_cast<double>(a.k);
 }
 
+StabilityMetrics compute_metrics_from_models(const std::vector<KMeansModel>& models) {
+    StabilityMetrics out{};
+    std::vector<double> nmis;
+    std::vector<double> jaccs;
+    std::vector<double> drifts;
+    for (std::size_t i = 0; i < models.size(); ++i) {
+        for (std::size_t j = i + 1; j < models.size(); ++j) {
+            nmis.push_back(nmi(models[i].labels, models[j].labels));
+            jaccs.push_back(jaccard(models[i].assignments, models[j].assignments));
+            drifts.push_back(centroid_drift(models[i], models[j]));
+        }
+    }
+    auto mean = [](const std::vector<double>& v) -> double {
+        if (v.empty()) {
+            return 0.0;
+        }
+        const double s = std::accumulate(v.begin(), v.end(), 0.0);
+        return s / static_cast<double>(v.size());
+    };
+    const double mean_nmi = mean(nmis);
+    const double mean_jacc = mean(jaccs);
+    const double mean_drift = mean(drifts);
+    double var_nmi = 0.0;
+    for (double x : nmis) {
+        const double d = x - mean_nmi;
+        var_nmi += d * d;
+    }
+    if (!nmis.empty()) {
+        var_nmi /= static_cast<double>(nmis.size());
+    }
+    const double std_nmi = std::sqrt(var_nmi);
+    out.mean_nmi = mean_nmi;
+    out.std_nmi = std_nmi;
+    out.mean_jaccard = mean_jacc;
+    out.mean_centroid_drift = mean_drift;
+    out.passed =
+        (mean_nmi >= 0.90) &&
+        (std_nmi <= 0.03) &&
+        (mean_jacc >= 0.85) &&
+        (mean_drift <= 0.02);
+    out.runs_executed = models.size();
+    return out;
+}
+
+bool confidently_resolved(const StabilityMetrics& m, const InitialClusteringConfig& cfg) {
+    const bool clear_pass =
+        m.mean_nmi >= (0.90 + cfg.stability_pass_margin_nmi)
+        && m.std_nmi <= std::max(0.0, 0.03 - cfg.stability_pass_margin_nmi)
+        && m.mean_jaccard >= (0.85 + cfg.stability_pass_margin_jaccard)
+        && m.mean_centroid_drift <= std::max(0.0, 0.02 - cfg.stability_pass_margin_drift);
+    const bool clear_fail =
+        m.mean_nmi <= std::max(0.0, 0.90 - cfg.stability_fail_margin_nmi)
+        || m.mean_jaccard <= std::max(0.0, 0.85 - cfg.stability_fail_margin_jaccard)
+        || m.mean_centroid_drift >= (0.02 + cfg.stability_fail_margin_drift);
+    return clear_pass || clear_fail;
+}
+
 }  // namespace
 
 Status evaluate_stability(
@@ -132,61 +191,66 @@ Status evaluate_stability(
     }
     std::vector<KMeansModel> models;
     models.reserve(cfg.stability_runs);
-    for (std::size_t r = 0; r < cfg.stability_runs; ++r) {
-        KMeansModel model;
-        const Status s = fit_spherical_kmeans_packed(
-            vectors,
-            vectors_row_major,
-            chosen_k,
-            cfg,
-            cfg.seed + 1000U + static_cast<std::uint32_t>(r),
-            &model);
-        if (!s.ok) {
-            return s;
+    if (cfg.stability_parallel_enabled && !cfg.stability_adaptive_runs_enabled) {
+        const std::size_t workers = std::max<std::size_t>(1, cfg.stability_parallel_workers);
+        std::vector<std::optional<KMeansModel>> ordered(cfg.stability_runs);
+        for (std::size_t base = 0; base < cfg.stability_runs; base += workers) {
+            const std::size_t chunk = std::min(workers, cfg.stability_runs - base);
+            std::vector<std::future<std::pair<Status, KMeansModel>>> futs;
+            futs.reserve(chunk);
+            for (std::size_t i = 0; i < chunk; ++i) {
+                const std::size_t run_idx = base + i;
+                futs.push_back(std::async(std::launch::async, [&, run_idx]() {
+                    KMeansModel model;
+                    const Status s = fit_spherical_kmeans_packed(
+                        vectors,
+                        vectors_row_major,
+                        chosen_k,
+                        cfg,
+                        cfg.seed + 1000U + static_cast<std::uint32_t>(run_idx),
+                        &model);
+                    return std::make_pair(s, std::move(model));
+                }));
+            }
+            for (std::size_t i = 0; i < chunk; ++i) {
+                auto [s, model] = futs[i].get();
+                if (!s.ok) {
+                    return s;
+                }
+                ordered[base + i] = std::move(model);
+            }
         }
-        models.push_back(std::move(model));
-    }
-
-    std::vector<double> nmis;
-    std::vector<double> jaccs;
-    std::vector<double> drifts;
-    for (std::size_t i = 0; i < models.size(); ++i) {
-        for (std::size_t j = i + 1; j < models.size(); ++j) {
-            nmis.push_back(nmi(models[i].labels, models[j].labels));
-            jaccs.push_back(jaccard(models[i].assignments, models[j].assignments));
-            drifts.push_back(centroid_drift(models[i], models[j]));
+        for (const auto& maybe_model : ordered) {
+            if (maybe_model.has_value()) {
+                models.push_back(*maybe_model);
+            }
+        }
+    } else {
+        const std::size_t min_runs = cfg.stability_adaptive_runs_enabled
+            ? std::min<std::size_t>(cfg.stability_runs, std::max<std::size_t>(2, cfg.stability_min_runs))
+            : cfg.stability_runs;
+        for (std::size_t r = 0; r < cfg.stability_runs; ++r) {
+            KMeansModel model;
+            const Status s = fit_spherical_kmeans_packed(
+                vectors,
+                vectors_row_major,
+                chosen_k,
+                cfg,
+                cfg.seed + 1000U + static_cast<std::uint32_t>(r),
+                &model);
+            if (!s.ok) {
+                return s;
+            }
+            models.push_back(std::move(model));
+            if (cfg.stability_adaptive_runs_enabled && models.size() >= min_runs) {
+                const StabilityMetrics provisional = compute_metrics_from_models(models);
+                if (confidently_resolved(provisional, cfg)) {
+                    break;
+                }
+            }
         }
     }
-
-    auto mean = [](const std::vector<double>& v) -> double {
-        if (v.empty()) {
-            return 0.0;
-        }
-        const double s = std::accumulate(v.begin(), v.end(), 0.0);
-        return s / static_cast<double>(v.size());
-    };
-    const double mean_nmi = mean(nmis);
-    const double mean_jacc = mean(jaccs);
-    const double mean_drift = mean(drifts);
-    double var_nmi = 0.0;
-    for (double x : nmis) {
-        const double d = x - mean_nmi;
-        var_nmi += d * d;
-    }
-    if (!nmis.empty()) {
-        var_nmi /= static_cast<double>(nmis.size());
-    }
-    const double std_nmi = std::sqrt(var_nmi);
-
-    out_metrics->mean_nmi = mean_nmi;
-    out_metrics->std_nmi = std_nmi;
-    out_metrics->mean_jaccard = mean_jacc;
-    out_metrics->mean_centroid_drift = mean_drift;
-    out_metrics->passed =
-        (mean_nmi >= 0.90) &&
-        (std_nmi <= 0.03) &&
-        (mean_jacc >= 0.85) &&
-        (mean_drift <= 0.02);
+    *out_metrics = compute_metrics_from_models(models);
     return Status::Ok();
 }
 

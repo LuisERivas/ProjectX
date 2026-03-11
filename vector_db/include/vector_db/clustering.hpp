@@ -27,6 +27,10 @@ struct ElbowSelection {
     std::size_t chosen_k = 0;
     bool used_fallback = false;
     std::vector<ElbowPoint> trace;
+    std::size_t k_evaluated_count = 0;
+    std::size_t stage_a_candidates = 0;
+    std::size_t stage_b_candidates = 0;
+    std::string early_stop_reason;
 };
 
 struct KMeansModel {
@@ -48,6 +52,7 @@ struct StabilityMetrics {
     double mean_jaccard = 0.0;
     double mean_centroid_drift = 0.0;
     bool passed = false;
+    std::size_t runs_executed = 0;
 };
 
 struct InitialClusteringConfig {
@@ -62,6 +67,29 @@ struct InitialClusteringConfig {
     double elbow_flat_threshold = 0.02;
     double min_norm_guard = 0.999;
     double max_norm_guard = 1.001;
+
+    bool elbow_two_stage_enabled = true;
+    double elbow_stage_a_sample_ratio = 0.30;
+    std::size_t elbow_stage_b_topk = 3;
+
+    bool elbow_adaptive_iters_enabled = true;
+    std::size_t elbow_exploratory_iters = 8;
+
+    bool elbow_gain_early_stop_enabled = false;
+    std::size_t elbow_low_gain_patience = 2;
+    double elbow_gain_delta_epsilon = 0.005;
+
+    bool stability_adaptive_runs_enabled = true;
+    std::size_t stability_min_runs = 2;
+    double stability_pass_margin_nmi = 0.02;
+    double stability_pass_margin_jaccard = 0.03;
+    double stability_pass_margin_drift = 0.01;
+    double stability_fail_margin_nmi = 0.10;
+    double stability_fail_margin_jaccard = 0.10;
+    double stability_fail_margin_drift = 0.10;
+
+    bool stability_parallel_enabled = false;
+    std::size_t stability_parallel_workers = 2;
 };
 
 Status estimate_intrinsic_dimensionality(

@@ -277,6 +277,7 @@ Outputs:
 - Per-command elapsed times printed in terminal
 - Ranked slowest steps
 - JSON report with timing breakdown
+- Cluster stats now include elbow/stability telemetry fields (`elbow_k_evaluated_count`, `elbow_stage_a_candidates`, `elbow_stage_b_candidates`, `stability_runs_executed`, and per-stage ms timings) for latency validation.
 
 ### 12.4 Do you need to delete `vector_db/build` each run?
 

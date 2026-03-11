@@ -88,6 +88,17 @@ def main() -> int:
     assert "tensor_core_enabled" in cluster_stats
     assert "scoring_ms_total" in cluster_stats
     assert "scoring_calls" in cluster_stats
+    assert "elbow_k_evaluated_count" in cluster_stats
+    assert "elbow_stage_a_candidates" in cluster_stats
+    assert "elbow_stage_b_candidates" in cluster_stats
+    assert "elbow_early_stop_reason" in cluster_stats
+    assert "stability_runs_executed" in cluster_stats
+    assert "load_live_vectors_ms" in cluster_stats
+    assert "id_estimation_ms" in cluster_stats
+    assert "elbow_ms" in cluster_stats
+    assert "stability_ms" in cluster_stats
+    assert "write_artifacts_ms" in cluster_stats
+    assert "total_build_ms" in cluster_stats
     assert cluster_health["available"] is True
     assert (data_dir / "clusters" / "initial" / "cluster_manifest.json").exists()
 

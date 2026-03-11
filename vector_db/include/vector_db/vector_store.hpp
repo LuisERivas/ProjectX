@@ -60,6 +60,17 @@ struct ClusterStats {
     std::string gpu_backend = "cpu";
     double scoring_ms_total = 0.0;
     std::size_t scoring_calls = 0;
+    std::size_t elbow_k_evaluated_count = 0;
+    std::size_t elbow_stage_a_candidates = 0;
+    std::size_t elbow_stage_b_candidates = 0;
+    std::string elbow_early_stop_reason;
+    std::size_t stability_runs_executed = 0;
+    double load_live_vectors_ms = 0.0;
+    double id_estimation_ms = 0.0;
+    double elbow_ms = 0.0;
+    double stability_ms = 0.0;
+    double write_artifacts_ms = 0.0;
+    double total_build_ms = 0.0;
 };
 
 struct ClusterHealth {
