@@ -225,7 +225,83 @@ Expected:
   - `gateway/main.py`
   - `worker/worker_main.py`
 
-## 12) Suggested regression checklist
+## 12) Vector DB phase test and profiling
+
+These commands validate the Vector DB Phase 3 flow (CMake build, CTest, dataset generation, and CLI smoke checks).
+
+### 12.1 Prerequisites
+
+- Build toolchain installed and available in PATH (`g++`, `cmake`, `ctest`, `nvcc` when CUDA build is desired).
+- Python available for helper scripts.
+- Run from project root unless noted otherwise.
+
+Verify tools:
+
+```bash
+g++ --version
+cmake --version
+ctest --version
+nvcc --version
+```
+
+### 12.2 Standard Phase test run
+
+From project root:
+
+```bash
+python scripts/test_vector_db_phase1.py
+```
+
+What it runs:
+- CMake configure/build
+- CTest for `vectordb_tests`
+- Synthetic dataset generation
+- CLI smoke integration flow
+
+### 12.3 CLI smoke profiling run (separate script)
+
+From `vector_db/`:
+
+```bash
+python tests/smoke_cli_profile.py
+```
+
+Optional:
+
+```bash
+python tests/smoke_cli_profile.py --keep-data --json-out smoke_cli_profile_report.json
+```
+
+Outputs:
+- Per-command elapsed times printed in terminal
+- Ranked slowest steps
+- JSON report with timing breakdown
+
+### 12.4 Do you need to delete `vector_db/build` each run?
+
+No. For normal testing, reuse `vector_db/build`.
+
+Use a clean rebuild only when:
+- toolchain changed (compiler/CUDA/CMake version),
+- CMake options or build config changed,
+- build artifacts appear stale/corrupted,
+- unexplained configure/build failures occur.
+
+Preferred clean order:
+
+```bash
+cmake --build vector_db/build --target clean
+```
+
+If issues persist, remove the full build directory and reconfigure:
+
+```bash
+rm -rf vector_db/build
+cmake -S vector_db -B vector_db/build
+cmake --build vector_db/build --config Release
+```
+
+## 13) Suggested regression checklist
 
 Run this minimum suite after code changes (automated + manual):
 - Verify systemd services are active
