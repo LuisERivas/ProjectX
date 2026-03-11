@@ -138,6 +138,17 @@ def main() -> int:
     assert "stability_ms" in cluster_stats
     assert "write_artifacts_ms" in cluster_stats
     assert "total_build_ms" in cluster_stats
+    assert "live_vector_bytes_read" in cluster_stats
+    assert "live_vector_contiguous_spans" in cluster_stats
+    assert "live_vector_sparse_reads" in cluster_stats
+    assert "live_vector_sparse_fallback" in cluster_stats
+    assert "live_vector_async_double_buffer" in cluster_stats
+    assert "elbow_stage_a_approx_enabled" in cluster_stats
+    assert "elbow_stage_a_approx_dim" in cluster_stats
+    assert "elbow_stage_a_approx_stride" in cluster_stats
+    assert cluster_stats["elbow_stage_b_candidates"] >= 2
+    assert cluster_stats["elbow_stage_b_candidates"] >= cluster_stats["elbow_stage_a_candidates"]
+    assert cluster_stats["elbow_k_evaluated_count"] >= cluster_stats["elbow_stage_b_candidates"]
     assert cluster_health["available"] is True
     assert (data_dir / "clusters" / "initial" / "cluster_manifest.json").exists()
 
@@ -149,6 +160,8 @@ def main() -> int:
     assert stats_after_restart["dirty_ranges"] >= 3
     cluster_stats_after = json.loads(do("restart check cluster stats", [str(cli), "cluster-stats", "--path", str(data_dir)]))
     assert cluster_stats_after["version"] == cluster_stats["version"]
+    cluster_stats_after2 = json.loads(do("restart check cluster stats repeated", [str(cli), "cluster-stats", "--path", str(data_dir)]))
+    assert cluster_stats_after2["version"] == cluster_stats_after["version"]
 
     total_s = sum(float(s["elapsed_s"]) for s in steps)
     ranked = sorted(steps, key=lambda x: float(x["elapsed_s"]), reverse=True)

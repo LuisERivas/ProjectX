@@ -31,6 +31,9 @@ struct ElbowSelection {
     std::size_t stage_a_candidates = 0;
     std::size_t stage_b_candidates = 0;
     std::string early_stop_reason;
+    bool stage_a_approx_enabled = false;
+    std::size_t stage_a_approx_dim = 0;
+    std::size_t stage_a_approx_stride = 1;
 };
 
 struct KMeansModel {
@@ -90,6 +93,15 @@ struct InitialClusteringConfig {
 
     bool stability_parallel_enabled = false;
     std::size_t stability_parallel_workers = 2;
+
+    // Latency rollout gates.
+    bool contiguous_live_vector_load_enabled = false;
+    std::size_t contiguous_min_span_rows = 64;
+    bool async_double_buffer_enabled = false;
+    std::size_t async_double_buffer_chunk_rows = 1024;
+    std::size_t async_double_buffer_queue_depth = 2;
+    bool elbow_stage_a_approx_enabled = false;
+    std::size_t elbow_stage_a_approx_stride = 2;
 };
 
 Status estimate_intrinsic_dimensionality(
@@ -119,9 +131,22 @@ Status select_k_binary_elbow(
     const InitialClusteringConfig& cfg,
     KMeansModel* out_best_model,
     ElbowSelection* out_selection);
+Status select_k_binary_elbow_packed(
+    const std::vector<std::vector<float>>& vectors,
+    const std::vector<float>& vectors_row_major,
+    const IdEstimateRange& id_range,
+    const InitialClusteringConfig& cfg,
+    KMeansModel* out_best_model,
+    ElbowSelection* out_selection);
 
 Status evaluate_stability(
     const std::vector<std::vector<float>>& vectors,
+    std::size_t chosen_k,
+    const InitialClusteringConfig& cfg,
+    StabilityMetrics* out_metrics);
+Status evaluate_stability_packed(
+    const std::vector<std::vector<float>>& vectors,
+    const std::vector<float>& vectors_row_major,
     std::size_t chosen_k,
     const InitialClusteringConfig& cfg,
     StabilityMetrics* out_metrics);

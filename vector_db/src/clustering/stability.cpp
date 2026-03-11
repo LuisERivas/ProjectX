@@ -13,7 +13,6 @@
 namespace vector_db {
 
 namespace {
-constexpr std::size_t kDim = 1024;
 
 double entropy(const std::unordered_map<std::uint32_t, std::size_t>& counts, std::size_t n) {
     if (n == 0) {
@@ -178,16 +177,34 @@ Status evaluate_stability(
     std::size_t chosen_k,
     const InitialClusteringConfig& cfg,
     StabilityMetrics* out_metrics) {
+    std::vector<float> vectors_row_major;
+    if (!vectors.empty()) {
+        const std::size_t dim = vectors.front().size();
+        vectors_row_major.reserve(vectors.size() * dim);
+        for (const auto& v : vectors) {
+            vectors_row_major.insert(vectors_row_major.end(), v.begin(), v.end());
+        }
+    }
+    return evaluate_stability_packed(vectors, vectors_row_major, chosen_k, cfg, out_metrics);
+}
+
+Status evaluate_stability_packed(
+    const std::vector<std::vector<float>>& vectors,
+    const std::vector<float>& vectors_row_major,
+    std::size_t chosen_k,
+    const InitialClusteringConfig& cfg,
+    StabilityMetrics* out_metrics) {
     if (out_metrics == nullptr) {
         return Status::Error("stability output pointer is null");
     }
     if (cfg.stability_runs < 2) {
         return Status::Error("stability requires at least 2 runs");
     }
-    std::vector<float> vectors_row_major;
-    vectors_row_major.reserve(vectors.size() * kDim);
-    for (const auto& v : vectors) {
-        vectors_row_major.insert(vectors_row_major.end(), v.begin(), v.end());
+    if (!vectors.empty()) {
+        const std::size_t dim = vectors.front().size();
+        if (vectors_row_major.size() != vectors.size() * dim) {
+            return Status::Error("stability packed vectors buffer size mismatch");
+        }
     }
     std::vector<KMeansModel> models;
     models.reserve(cfg.stability_runs);

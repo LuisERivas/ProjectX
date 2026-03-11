@@ -71,6 +71,14 @@ struct ClusterStats {
     double stability_ms = 0.0;
     double write_artifacts_ms = 0.0;
     double total_build_ms = 0.0;
+    std::size_t live_vector_bytes_read = 0;
+    std::size_t live_vector_contiguous_spans = 0;
+    std::size_t live_vector_sparse_reads = 0;
+    bool live_vector_sparse_fallback = false;
+    bool live_vector_async_double_buffer = false;
+    bool elbow_stage_a_approx_enabled = false;
+    std::size_t elbow_stage_a_approx_dim = 0;
+    std::size_t elbow_stage_a_approx_stride = 1;
 };
 
 struct ClusterHealth {

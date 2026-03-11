@@ -545,7 +545,18 @@ int main(int argc, char** argv) {
                   << "  \"elbow_ms\": " << st.elbow_ms << ",\n"
                   << "  \"stability_ms\": " << st.stability_ms << ",\n"
                   << "  \"write_artifacts_ms\": " << st.write_artifacts_ms << ",\n"
-                  << "  \"total_build_ms\": " << st.total_build_ms << "\n"
+                  << "  \"total_build_ms\": " << st.total_build_ms << ",\n"
+                  << "  \"live_vector_bytes_read\": " << st.live_vector_bytes_read << ",\n"
+                  << "  \"live_vector_contiguous_spans\": " << st.live_vector_contiguous_spans << ",\n"
+                  << "  \"live_vector_sparse_reads\": " << st.live_vector_sparse_reads << ",\n"
+                  << "  \"live_vector_sparse_fallback\": "
+                  << (st.live_vector_sparse_fallback ? "true" : "false") << ",\n"
+                  << "  \"live_vector_async_double_buffer\": "
+                  << (st.live_vector_async_double_buffer ? "true" : "false") << ",\n"
+                  << "  \"elbow_stage_a_approx_enabled\": "
+                  << (st.elbow_stage_a_approx_enabled ? "true" : "false") << ",\n"
+                  << "  \"elbow_stage_a_approx_dim\": " << st.elbow_stage_a_approx_dim << ",\n"
+                  << "  \"elbow_stage_a_approx_stride\": " << st.elbow_stage_a_approx_stride << "\n"
                   << "}\n";
         return 0;
     }

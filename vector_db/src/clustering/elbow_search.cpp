@@ -6,27 +6,23 @@
 #include <limits>
 #include <random>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace vector_db {
 
 namespace {
 
-constexpr std::size_t kDim = 1024;
-
-std::vector<std::size_t> power_of_two_grid(std::size_t k_min, std::size_t k_max) {
+std::vector<std::size_t> integer_k_grid(std::size_t k_min, std::size_t k_max) {
     std::vector<std::size_t> out;
     if (k_min == 0 || k_max == 0 || k_min > k_max) {
         return out;
     }
-    std::size_t k = k_min;
-    out.push_back(k);
-    while (k < k_max) {
-        if (k > (std::numeric_limits<std::size_t>::max() >> 1U)) {
+    const std::size_t span = k_max - k_min;
+    out.reserve(span + 1);
+    for (std::size_t k = k_min; k <= k_max; ++k) {
+        out.push_back(k);
+        if (k == std::numeric_limits<std::size_t>::max()) {
             break;
         }
-        k <<= 1U;
-        out.push_back(k);
     }
     return out;
 }
@@ -41,24 +37,47 @@ bool is_in_norm_guard(const std::vector<float>& x, double min_norm, double max_n
 }
 
 std::vector<float> pack_vectors_row_major(const std::vector<std::vector<float>>& vectors) {
+    if (vectors.empty()) {
+        return {};
+    }
+    const std::size_t dim = vectors.front().size();
     std::vector<float> out;
-    out.reserve(vectors.size() * kDim);
+    out.reserve(vectors.size() * dim);
     for (const auto& v : vectors) {
         out.insert(out.end(), v.begin(), v.end());
     }
     return out;
 }
 
-std::vector<std::size_t> unique_sorted_ks(const std::vector<std::size_t>& in) {
-    std::unordered_set<std::size_t> seen;
-    std::vector<std::size_t> out;
-    out.reserve(in.size());
-    for (std::size_t k : in) {
-        if (seen.insert(k).second) {
-            out.push_back(k);
+std::vector<std::vector<float>> approximate_vectors_stride(
+    const std::vector<std::vector<float>>& vectors,
+    std::size_t stride) {
+    if (vectors.empty() || stride <= 1) {
+        return vectors;
+    }
+    const std::size_t in_dim = vectors.front().size();
+    if (in_dim == 0) {
+        return vectors;
+    }
+    const std::size_t out_dim = (in_dim + stride - 1) / stride;
+    std::vector<std::vector<float>> out(vectors.size(), std::vector<float>(out_dim, 0.0f));
+    for (std::size_t i = 0; i < vectors.size(); ++i) {
+        const auto& src = vectors[i];
+        std::size_t out_i = 0;
+        for (std::size_t d = 0; d < src.size(); d += stride) {
+            out[i][out_i++] = src[d];
+        }
+        double norm_sq = 0.0;
+        for (float v : out[i]) {
+            norm_sq += static_cast<double>(v) * static_cast<double>(v);
+        }
+        if (norm_sq > 0.0) {
+            const float inv = static_cast<float>(1.0 / std::sqrt(norm_sq));
+            for (float& v : out[i]) {
+                v *= inv;
+            }
         }
     }
-    std::sort(out.begin(), out.end());
     return out;
 }
 
@@ -111,16 +130,20 @@ Status run_kmeans_impl(
     if (k > vectors.size()) {
         return Status::Error("k cannot exceed vector count");
     }
+    const std::size_t dim = vectors.front().size();
+    if (dim == 0) {
+        return Status::Error("kmeans vectors must have non-zero dimension");
+    }
     if (!cuda_dot_products_available() || !cuda_assignment_kernels_available()) {
         return Status::Error(
             "GPU-only clustering requires CUDA scoring and assignment kernels; "
             "build with CUDA support and a compatible GPU");
     }
-    if (vectors_row_major.size() != vectors.size() * kDim) {
+    if (vectors_row_major.size() != vectors.size() * dim) {
         return Status::Error("GPU-only clustering requires a contiguous packed vectors buffer");
     }
     for (const auto& v : vectors) {
-        if (v.size() != kDim) {
+        if (v.size() != dim) {
             return Status::Error("unexpected vector dimension for kmeans");
         }
         if (!is_in_norm_guard(v, cfg.min_norm_guard, cfg.max_norm_guard)) {
@@ -135,10 +158,10 @@ Status run_kmeans_impl(
     }
     std::shuffle(idx.begin(), idx.end(), rng);
 
-    std::vector<float> centroids(k * kDim, 0.0f);
+    std::vector<float> centroids(k * dim, 0.0f);
     for (std::size_t c = 0; c < k; ++c) {
         const auto& src = vectors[idx[c % vectors.size()]];
-        std::copy(src.begin(), src.end(), centroids.begin() + static_cast<std::ptrdiff_t>(c * kDim));
+        std::copy(src.begin(), src.end(), centroids.begin() + static_cast<std::ptrdiff_t>(c * dim));
     }
 
     bool tensor_core_once = false;
@@ -157,7 +180,7 @@ Status run_kmeans_impl(
                 centroids,
                 vectors.size(),
                 k,
-                kDim,
+                dim,
                 &centroids_gpu,
                 &labels_gpu,
                 &best_scores,
@@ -184,7 +207,7 @@ Status run_kmeans_impl(
             centroids,
             vectors.size(),
             k,
-            kDim,
+            dim,
             cfg.top_m,
             &top_assign,
             &scores,
@@ -255,19 +278,39 @@ Status select_k_binary_elbow(
     const InitialClusteringConfig& cfg,
     KMeansModel* out_best_model,
     ElbowSelection* out_selection) {
+    return select_k_binary_elbow_packed(
+        vectors,
+        pack_vectors_row_major(vectors),
+        id_range,
+        cfg,
+        out_best_model,
+        out_selection);
+}
+
+Status select_k_binary_elbow_packed(
+    const std::vector<std::vector<float>>& vectors,
+    const std::vector<float>& vectors_row_major,
+    const IdEstimateRange& id_range,
+    const InitialClusteringConfig& cfg,
+    KMeansModel* out_best_model,
+    ElbowSelection* out_selection) {
     if (out_best_model == nullptr || out_selection == nullptr) {
         return Status::Error("binary elbow output pointers must be non-null");
     }
-    const auto grid = power_of_two_grid(id_range.k_min, id_range.k_max);
+    const auto grid = integer_k_grid(id_range.k_min, id_range.k_max);
     if (grid.size() < 2) {
         return Status::Error("invalid k grid for binary elbow selection");
     }
     std::vector<std::size_t> stage_a_grid = grid;
     std::vector<std::size_t> stage_b_grid = grid;
     std::vector<std::vector<float>> stage_a_vectors = vectors;
-    std::vector<float> stage_a_vectors_row_major = pack_vectors_row_major(vectors);
+    std::vector<float> stage_a_vectors_row_major = vectors_row_major;
     if (cfg.elbow_two_stage_enabled) {
         stage_a_vectors = sample_vectors(vectors, cfg.seed + 77U, cfg.elbow_stage_a_sample_ratio);
+        stage_a_vectors_row_major = pack_vectors_row_major(stage_a_vectors);
+    }
+    if (cfg.elbow_stage_a_approx_enabled && cfg.elbow_stage_a_approx_stride > 1) {
+        stage_a_vectors = approximate_vectors_stride(stage_a_vectors, cfg.elbow_stage_a_approx_stride);
         stage_a_vectors_row_major = pack_vectors_row_major(stage_a_vectors);
     }
 
@@ -449,40 +492,8 @@ Status select_k_binary_elbow(
         return s;
     }
 
-    if (cfg.elbow_two_stage_enabled) {
-        std::vector<std::pair<double, std::size_t>> ranked;
-        ranked.reserve(stage_a_selection.trace.size());
-        for (const auto& p : stage_a_selection.trace) {
-            ranked.push_back({p.objective, p.k});
-        }
-        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
-            return a.first < b.first;
-        });
-        std::vector<std::size_t> shortlist;
-        const std::size_t topk = std::max<std::size_t>(1, cfg.elbow_stage_b_topk);
-        for (std::size_t i = 0; i < ranked.size() && i < topk; ++i) {
-            shortlist.push_back(ranked[i].second);
-        }
-        shortlist.push_back(stage_a_selection.chosen_k);
-        for (std::size_t k : shortlist) {
-            auto it = std::find(stage_b_grid.begin(), stage_b_grid.end(), k);
-            if (it != stage_b_grid.end()) {
-                const std::size_t pos = static_cast<std::size_t>(it - stage_b_grid.begin());
-                if (pos > 0) {
-                    shortlist.push_back(stage_b_grid[pos - 1]);
-                }
-                if (pos + 1 < stage_b_grid.size()) {
-                    shortlist.push_back(stage_b_grid[pos + 1]);
-                }
-            }
-        }
-        stage_b_grid = unique_sorted_ks(shortlist);
-        if (stage_b_grid.size() < 2) {
-            stage_b_grid = grid;
-        }
-    }
+    // Stage B always uses full integer candidate pool [k_min..k_max].
 
-    const std::vector<float> vectors_row_major = pack_vectors_row_major(vectors);
     std::size_t stage_b_eval_count = 0;
     std::string stage_b_early_reason;
     ElbowSelection stage_b_selection;
@@ -507,6 +518,12 @@ Status select_k_binary_elbow(
     out_selection->stage_b_candidates = stage_b_grid.size();
     out_selection->early_stop_reason =
         stage_b_early_reason.empty() ? stage_a_early_reason : stage_b_early_reason;
+    out_selection->stage_a_approx_enabled =
+        cfg.elbow_stage_a_approx_enabled && cfg.elbow_stage_a_approx_stride > 1;
+    out_selection->stage_a_approx_stride = out_selection->stage_a_approx_enabled
+        ? cfg.elbow_stage_a_approx_stride
+        : 1;
+    out_selection->stage_a_approx_dim = stage_a_vectors.empty() ? 0 : stage_a_vectors.front().size();
     return Status::Ok();
 }
 

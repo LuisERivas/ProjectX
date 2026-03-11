@@ -6,15 +6,20 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -210,6 +215,30 @@ std::optional<bool> extract_bool_field(const std::string& text, const std::strin
     return std::nullopt;
 }
 
+bool env_flag_enabled(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    std::string v(raw);
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+std::size_t env_size_value(const char* name, std::size_t default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    try {
+        return static_cast<std::size_t>(std::stoull(raw));
+    } catch (...) {
+        return default_value;
+    }
+}
+
 Status write_text_atomic(const fs::path& path, const std::string& content) {
     const fs::path tmp = path.string() + ".tmp";
     {
@@ -238,7 +267,9 @@ Status write_text_atomic(const fs::path& path, const std::string& content) {
 }  // namespace
 
 struct VectorStore::Impl {
-    explicit Impl(std::string root) : data_dir(std::move(root)) {}
+    explicit Impl(std::string root)
+        : data_dir(std::move(root)),
+          open_reload_cache_enabled(env_flag_enabled("VECTOR_DB_OPEN_RELOAD_CACHE", false)) {}
 
     struct Entry {
         std::uint64_t id = 0;
@@ -267,6 +298,37 @@ struct VectorStore::Impl {
     std::vector<DirtyRange> dirty_ranges;
     ClusterStats cluster_stats_cache;
     ClusterHealth cluster_health_cache;
+    bool open_reload_cache_enabled = false;
+
+    struct FileSig {
+        bool exists = false;
+        std::uint64_t size = 0;
+        std::int64_t mtime_ns = 0;
+    };
+
+    struct OpenSignature {
+        std::uint64_t active_segment_id = 0;
+        FileSig manifest;
+        FileSig dirty_ranges;
+        FileSig cluster_manifest;
+        FileSig wal;
+        FileSig ids;
+        FileSig meta;
+        FileSig tomb;
+        bool valid = false;
+    };
+
+    struct LiveVectorLoadResult {
+        std::vector<std::pair<std::uint64_t, std::vector<float>>> vectors_by_id;
+        std::vector<float> packed_row_major;
+        std::size_t bytes_read = 0;
+        std::size_t contiguous_spans = 0;
+        std::size_t sparse_reads = 0;
+        bool sparse_fallback_used = false;
+        bool async_double_buffer_used = false;
+    };
+
+    OpenSignature last_open_signature;
 
     fs::path root() const { return fs::path(data_dir); }
     fs::path segments_dir() const { return root() / "segments"; }
@@ -284,6 +346,70 @@ struct VectorStore::Impl {
     fs::path seg_ids(std::uint64_t seg_id) const { return seg_base(seg_id).string() + ".ids"; }
     fs::path seg_meta(std::uint64_t seg_id) const { return seg_base(seg_id).string() + ".meta.jsonl"; }
     fs::path seg_tomb(std::uint64_t seg_id) const { return seg_base(seg_id).string() + ".tomb"; }
+
+    static FileSig file_sig(const fs::path& p) {
+        FileSig sig{};
+        std::error_code ec;
+        sig.exists = fs::exists(p, ec) && !ec;
+        if (!sig.exists) {
+            return sig;
+        }
+        ec.clear();
+        sig.size = static_cast<std::uint64_t>(fs::file_size(p, ec));
+        if (ec) {
+            sig.size = 0;
+            ec.clear();
+        }
+        const auto ft = fs::last_write_time(p, ec);
+        if (!ec) {
+            sig.mtime_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ft.time_since_epoch()).count();
+        }
+        return sig;
+    }
+
+    OpenSignature capture_open_signature() const {
+        OpenSignature sig{};
+        sig.active_segment_id = active_segment_id;
+        sig.manifest = file_sig(manifest_path());
+        sig.dirty_ranges = file_sig(dirty_ranges_path());
+        sig.cluster_manifest = file_sig(cluster_manifest_path());
+        sig.wal = file_sig(wal_path());
+        sig.ids = file_sig(seg_ids(active_segment_id));
+        sig.meta = file_sig(seg_meta(active_segment_id));
+        sig.tomb = file_sig(seg_tomb(active_segment_id));
+        sig.valid = true;
+        return sig;
+    }
+
+    bool open_signature_unchanged() const {
+        if (!last_open_signature.valid || !open_reload_cache_enabled) {
+            return false;
+        }
+        const OpenSignature now = capture_open_signature();
+        return now.active_segment_id == last_open_signature.active_segment_id
+            && now.manifest.exists == last_open_signature.manifest.exists
+            && now.manifest.size == last_open_signature.manifest.size
+            && now.manifest.mtime_ns == last_open_signature.manifest.mtime_ns
+            && now.dirty_ranges.exists == last_open_signature.dirty_ranges.exists
+            && now.dirty_ranges.size == last_open_signature.dirty_ranges.size
+            && now.dirty_ranges.mtime_ns == last_open_signature.dirty_ranges.mtime_ns
+            && now.cluster_manifest.exists == last_open_signature.cluster_manifest.exists
+            && now.cluster_manifest.size == last_open_signature.cluster_manifest.size
+            && now.cluster_manifest.mtime_ns == last_open_signature.cluster_manifest.mtime_ns
+            && now.wal.exists == last_open_signature.wal.exists
+            && now.wal.size == last_open_signature.wal.size
+            && now.wal.mtime_ns == last_open_signature.wal.mtime_ns
+            && now.ids.exists == last_open_signature.ids.exists
+            && now.ids.size == last_open_signature.ids.size
+            && now.ids.mtime_ns == last_open_signature.ids.mtime_ns
+            && now.meta.exists == last_open_signature.meta.exists
+            && now.meta.size == last_open_signature.meta.size
+            && now.meta.mtime_ns == last_open_signature.meta.mtime_ns
+            && now.tomb.exists == last_open_signature.tomb.exists
+            && now.tomb.size == last_open_signature.tomb.size
+            && now.tomb.mtime_ns == last_open_signature.tomb.mtime_ns;
+    }
 
     Status ensure_dirs() const {
         std::error_code ec;
@@ -765,9 +891,9 @@ struct VectorStore::Impl {
         return Status::Ok();
     }
 
-    std::vector<std::pair<std::uint64_t, std::vector<float>>> collect_live_vectors() const {
-        std::vector<std::pair<std::uint64_t, std::vector<float>>> out;
-        out.reserve(entries.size());
+    LiveVectorLoadResult collect_live_vectors(const InitialClusteringConfig& cfg) const {
+        LiveVectorLoadResult out;
+        out.vectors_by_id.reserve(entries.size());
         std::vector<std::pair<std::size_t, std::uint64_t>> live_rows;
         live_rows.reserve(entries.size());
         for (const auto& kv : entries) {
@@ -782,31 +908,245 @@ struct VectorStore::Impl {
             return a.first < b.first;
         });
 
-        std::ifstream vec_in(seg_vec(active_segment_id), std::ios::binary);
+        const fs::path vec_path = seg_vec(active_segment_id);
+        std::ifstream vec_in(vec_path, std::ios::binary);
         if (!vec_in) {
             return out;
         }
+        struct Span {
+            std::size_t begin = 0;
+            std::size_t end = 0;
+        };
+        std::vector<Span> spans;
+        spans.reserve(live_rows.size());
+        std::size_t span_begin = 0;
+        for (std::size_t i = 1; i <= live_rows.size(); ++i) {
+            const bool contiguous =
+                (i < live_rows.size()) && (live_rows[i].first == live_rows[i - 1].first + 1);
+            if (!contiguous) {
+                spans.push_back(Span{span_begin, i - 1});
+                span_begin = i;
+            }
+        }
+        out.contiguous_spans = spans.size();
 
-        std::vector<float> buf(kVectorDim, 0.0f);
-        for (const auto& [row, id] : live_rows) {
-            const std::uint64_t byte_off =
-                static_cast<std::uint64_t>(row) * static_cast<std::uint64_t>(kVectorDim) * sizeof(float);
+        const auto read_sparse_row = [&](std::size_t row, std::vector<float>* dst) -> bool {
+            const std::uint64_t byte_off = static_cast<std::uint64_t>(row)
+                * static_cast<std::uint64_t>(kVectorDim) * sizeof(float);
             vec_in.seekg(static_cast<std::streamoff>(byte_off), std::ios::beg);
             if (!vec_in.good()) {
-                continue;
+                vec_in.clear();
+                return false;
             }
             vec_in.read(
-                reinterpret_cast<char*>(buf.data()),
+                reinterpret_cast<char*>(dst->data()),
                 static_cast<std::streamsize>(kVectorDim * sizeof(float)));
             if (!vec_in.good()) {
                 vec_in.clear();
-                continue;
+                return false;
             }
-            out.push_back({id, buf});
+            out.bytes_read += kVectorDim * sizeof(float);
+            out.sparse_reads += 1;
+            return true;
+        };
+
+        const bool contiguous_enabled = cfg.contiguous_live_vector_load_enabled;
+        const std::size_t min_span_rows = std::max<std::size_t>(2, cfg.contiguous_min_span_rows);
+
+        if (!contiguous_enabled) {
+            std::vector<float> buf(kVectorDim, 0.0f);
+            for (const auto& [row, id] : live_rows) {
+                if (read_sparse_row(row, &buf)) {
+                    out.vectors_by_id.push_back({id, buf});
+                }
+            }
+        } else if (cfg.async_double_buffer_enabled) {
+            out.async_double_buffer_used = true;
+            struct Chunk {
+                std::size_t start = 0;
+                std::size_t rows = 0;
+                std::vector<float> data;
+                bool ok = true;
+            };
+            std::deque<Chunk> queue;
+            std::mutex mu;
+            std::condition_variable cv_push;
+            std::condition_variable cv_pop;
+            bool done = false;
+            const std::size_t max_queue = std::max<std::size_t>(1, cfg.async_double_buffer_queue_depth);
+            std::string producer_error;
+
+            std::thread producer([&]() {
+                std::ifstream pin(vec_path, std::ios::binary);
+                if (!pin) {
+                    producer_error = "failed opening vector file for async live load: " + vec_path.string();
+                    done = true;
+                    cv_pop.notify_all();
+                    return;
+                }
+                for (const Span& sp : spans) {
+                    const std::size_t span_rows = sp.end - sp.begin + 1;
+                    if (span_rows < min_span_rows) {
+                        continue;
+                    }
+                    const std::size_t chunk_rows =
+                        std::max<std::size_t>(1, cfg.async_double_buffer_chunk_rows);
+                    for (std::size_t offset = 0; offset < span_rows; offset += chunk_rows) {
+                        const std::size_t rows_this = std::min(chunk_rows, span_rows - offset);
+                        const std::size_t start_idx = sp.begin + offset;
+                        const std::size_t row0 = live_rows[start_idx].first;
+                        const std::uint64_t byte_off = static_cast<std::uint64_t>(row0)
+                            * static_cast<std::uint64_t>(kVectorDim) * sizeof(float);
+                        Chunk c{};
+                        c.start = start_idx;
+                        c.rows = rows_this;
+                        c.data.resize(rows_this * kVectorDim, 0.0f);
+                        pin.seekg(static_cast<std::streamoff>(byte_off), std::ios::beg);
+                        if (!pin.good()) {
+                            pin.clear();
+                            c.ok = false;
+                        } else {
+                            pin.read(
+                                reinterpret_cast<char*>(c.data.data()),
+                                static_cast<std::streamsize>(c.data.size() * sizeof(float)));
+                            if (!pin.good()) {
+                                pin.clear();
+                                c.ok = false;
+                            }
+                        }
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv_push.wait(lk, [&]() { return queue.size() < max_queue; });
+                        queue.push_back(std::move(c));
+                        lk.unlock();
+                        cv_pop.notify_one();
+                    }
+                }
+                std::unique_lock<std::mutex> lk(mu);
+                done = true;
+                lk.unlock();
+                cv_pop.notify_all();
+            });
+
+            for (;;) {
+                Chunk c;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv_pop.wait(lk, [&]() { return done || !queue.empty(); });
+                    if (queue.empty()) {
+                        break;
+                    }
+                    c = std::move(queue.front());
+                    queue.pop_front();
+                    lk.unlock();
+                    cv_push.notify_one();
+                }
+                if (c.ok) {
+                    out.bytes_read += c.data.size() * sizeof(float);
+                    for (std::size_t i = 0; i < c.rows; ++i) {
+                        const std::size_t row_idx = c.start + i;
+                        const std::uint64_t id = live_rows[row_idx].second;
+                        std::vector<float> v(kVectorDim, 0.0f);
+                        std::copy_n(
+                            c.data.data() + static_cast<std::ptrdiff_t>(i * kVectorDim),
+                            kVectorDim,
+                            v.data());
+                        out.vectors_by_id.push_back({id, std::move(v)});
+                    }
+                } else {
+                    out.sparse_fallback_used = true;
+                    std::vector<float> buf(kVectorDim, 0.0f);
+                    for (std::size_t i = 0; i < c.rows; ++i) {
+                        const std::size_t row_idx = c.start + i;
+                        if (read_sparse_row(live_rows[row_idx].first, &buf)) {
+                            out.vectors_by_id.push_back({live_rows[row_idx].second, buf});
+                        }
+                    }
+                }
+            }
+            producer.join();
+            if (!producer_error.empty()) {
+                out.vectors_by_id.clear();
+                out.packed_row_major.clear();
+                return out;
+            }
+            // Any short span rows are processed via sparse fallback.
+            std::vector<float> buf(kVectorDim, 0.0f);
+            for (const Span& sp : spans) {
+                const std::size_t span_rows = sp.end - sp.begin + 1;
+                if (span_rows >= min_span_rows) {
+                    continue;
+                }
+                out.sparse_fallback_used = true;
+                for (std::size_t i = sp.begin; i <= sp.end; ++i) {
+                    if (read_sparse_row(live_rows[i].first, &buf)) {
+                        out.vectors_by_id.push_back({live_rows[i].second, buf});
+                    }
+                }
+            }
+        } else {
+            std::vector<float> buf(kVectorDim, 0.0f);
+            for (const Span& sp : spans) {
+                const std::size_t span_rows = sp.end - sp.begin + 1;
+                if (span_rows < min_span_rows) {
+                    out.sparse_fallback_used = true;
+                    for (std::size_t i = sp.begin; i <= sp.end; ++i) {
+                        if (read_sparse_row(live_rows[i].first, &buf)) {
+                            out.vectors_by_id.push_back({live_rows[i].second, buf});
+                        }
+                    }
+                    continue;
+                }
+                const std::size_t start_row = live_rows[sp.begin].first;
+                const std::uint64_t byte_off = static_cast<std::uint64_t>(start_row)
+                    * static_cast<std::uint64_t>(kVectorDim) * sizeof(float);
+                std::vector<float> chunk(span_rows * kVectorDim, 0.0f);
+                vec_in.seekg(static_cast<std::streamoff>(byte_off), std::ios::beg);
+                if (!vec_in.good()) {
+                    vec_in.clear();
+                    out.sparse_fallback_used = true;
+                    for (std::size_t i = sp.begin; i <= sp.end; ++i) {
+                        if (read_sparse_row(live_rows[i].first, &buf)) {
+                            out.vectors_by_id.push_back({live_rows[i].second, buf});
+                        }
+                    }
+                    continue;
+                }
+                vec_in.read(
+                    reinterpret_cast<char*>(chunk.data()),
+                    static_cast<std::streamsize>(chunk.size() * sizeof(float)));
+                if (!vec_in.good()) {
+                    vec_in.clear();
+                    out.sparse_fallback_used = true;
+                    for (std::size_t i = sp.begin; i <= sp.end; ++i) {
+                        if (read_sparse_row(live_rows[i].first, &buf)) {
+                            out.vectors_by_id.push_back({live_rows[i].second, buf});
+                        }
+                    }
+                    continue;
+                }
+                out.bytes_read += chunk.size() * sizeof(float);
+                for (std::size_t i = 0; i < span_rows; ++i) {
+                    const std::uint64_t id = live_rows[sp.begin + i].second;
+                    std::vector<float> v(kVectorDim, 0.0f);
+                    std::copy_n(
+                        chunk.data() + static_cast<std::ptrdiff_t>(i * kVectorDim),
+                        kVectorDim,
+                        v.data());
+                    out.vectors_by_id.push_back({id, std::move(v)});
+                }
+            }
         }
-        std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+
+        std::sort(out.vectors_by_id.begin(), out.vectors_by_id.end(), [](const auto& a, const auto& b) {
             return a.first < b.first;
         });
+        out.packed_row_major.reserve(out.vectors_by_id.size() * kVectorDim);
+        for (const auto& kv : out.vectors_by_id) {
+            out.packed_row_major.insert(
+                out.packed_row_major.end(),
+                kv.second.begin(),
+                kv.second.end());
+        }
         return out;
     }
 
@@ -899,6 +1239,30 @@ struct VectorStore::Impl {
         if (const auto v = extract_double_field(text, "total_build_ms"); v.has_value()) {
             cluster_stats_cache.total_build_ms = *v;
         }
+        if (const auto v = extract_u64_field(text, "live_vector_bytes_read"); v.has_value()) {
+            cluster_stats_cache.live_vector_bytes_read = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "live_vector_contiguous_spans"); v.has_value()) {
+            cluster_stats_cache.live_vector_contiguous_spans = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "live_vector_sparse_reads"); v.has_value()) {
+            cluster_stats_cache.live_vector_sparse_reads = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_bool_field(text, "live_vector_sparse_fallback"); v.has_value()) {
+            cluster_stats_cache.live_vector_sparse_fallback = *v;
+        }
+        if (const auto v = extract_bool_field(text, "live_vector_async_double_buffer"); v.has_value()) {
+            cluster_stats_cache.live_vector_async_double_buffer = *v;
+        }
+        if (const auto v = extract_bool_field(text, "elbow_stage_a_approx_enabled"); v.has_value()) {
+            cluster_stats_cache.elbow_stage_a_approx_enabled = *v;
+        }
+        if (const auto v = extract_u64_field(text, "elbow_stage_a_approx_dim"); v.has_value()) {
+            cluster_stats_cache.elbow_stage_a_approx_dim = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "elbow_stage_a_approx_stride"); v.has_value()) {
+            cluster_stats_cache.elbow_stage_a_approx_stride = static_cast<std::size_t>(*v);
+        }
         if (const auto v = extract_double_field(text, "mean_nmi"); v.has_value()) {
             cluster_health_cache.mean_nmi = *v;
         }
@@ -948,6 +1312,17 @@ struct VectorStore::Impl {
         os << "  \"stability_ms\": " << stats.stability_ms << ",\n";
         os << "  \"write_artifacts_ms\": " << stats.write_artifacts_ms << ",\n";
         os << "  \"total_build_ms\": " << stats.total_build_ms << ",\n";
+        os << "  \"live_vector_bytes_read\": " << stats.live_vector_bytes_read << ",\n";
+        os << "  \"live_vector_contiguous_spans\": " << stats.live_vector_contiguous_spans << ",\n";
+        os << "  \"live_vector_sparse_reads\": " << stats.live_vector_sparse_reads << ",\n";
+        os << "  \"live_vector_sparse_fallback\": "
+           << (stats.live_vector_sparse_fallback ? "true" : "false") << ",\n";
+        os << "  \"live_vector_async_double_buffer\": "
+           << (stats.live_vector_async_double_buffer ? "true" : "false") << ",\n";
+        os << "  \"elbow_stage_a_approx_enabled\": "
+           << (stats.elbow_stage_a_approx_enabled ? "true" : "false") << ",\n";
+        os << "  \"elbow_stage_a_approx_dim\": " << stats.elbow_stage_a_approx_dim << ",\n";
+        os << "  \"elbow_stage_a_approx_stride\": " << stats.elbow_stage_a_approx_stride << ",\n";
         os << "  \"id_sample_size\": " << idr.sample_size << ",\n";
         os << "  \"id_m_low\": " << idr.m_low << ",\n";
         os << "  \"id_m_high\": " << idr.m_high << ",\n";
@@ -1281,6 +1656,10 @@ Status VectorStore::open() {
     if (const Status s = init(); !s.ok) {
         return s;
     }
+    if (impl_->open_signature_unchanged()) {
+        impl_->opened = true;
+        return Status::Ok();
+    }
     if (const Status s = impl_->load_manifest(); !s.ok) {
         return s;
     }
@@ -1305,6 +1684,7 @@ Status VectorStore::open() {
     if (const Status s = flush(); !s.ok) {
         return s;
     }
+    impl_->last_open_signature = impl_->capture_open_signature();
     impl_->opened = true;
     return Status::Ok();
 }
@@ -1316,6 +1696,7 @@ Status VectorStore::flush() {
     if (const Status s = impl_->write_dirty_ranges(); !s.ok) {
         return s;
     }
+    impl_->last_open_signature = impl_->capture_open_signature();
     return Status::Ok();
 }
 
@@ -1339,8 +1720,33 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
             return s;
         }
     }
+    InitialClusteringConfig cfg;
+    cfg.seed = seed;
+    cfg.contiguous_live_vector_load_enabled = env_flag_enabled(
+        "VECTOR_DB_CONTIGUOUS_LOAD",
+        cfg.contiguous_live_vector_load_enabled);
+    cfg.contiguous_min_span_rows = env_size_value(
+        "VECTOR_DB_CONTIGUOUS_MIN_SPAN",
+        cfg.contiguous_min_span_rows);
+    cfg.async_double_buffer_enabled = env_flag_enabled(
+        "VECTOR_DB_ASYNC_DOUBLE_BUFFER",
+        cfg.async_double_buffer_enabled);
+    cfg.async_double_buffer_chunk_rows = env_size_value(
+        "VECTOR_DB_ASYNC_CHUNK_ROWS",
+        cfg.async_double_buffer_chunk_rows);
+    cfg.async_double_buffer_queue_depth = env_size_value(
+        "VECTOR_DB_ASYNC_QUEUE_DEPTH",
+        cfg.async_double_buffer_queue_depth);
+    cfg.elbow_stage_a_approx_enabled = env_flag_enabled(
+        "VECTOR_DB_ELBOW_APPROX_STAGE_A",
+        cfg.elbow_stage_a_approx_enabled);
+    cfg.elbow_stage_a_approx_stride = env_size_value(
+        "VECTOR_DB_ELBOW_APPROX_STRIDE",
+        cfg.elbow_stage_a_approx_stride);
+
     const auto t_live_start = std::chrono::steady_clock::now();
-    const auto live = impl_->collect_live_vectors();
+    const auto live_result = impl_->collect_live_vectors(cfg);
+    const auto& live = live_result.vectors_by_id;
     const auto t_live_end = std::chrono::steady_clock::now();
     if (live.size() < 8) {
         return Status::Error("need at least 8 live vectors to build initial clusters");
@@ -1352,8 +1758,6 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
         vectors.push_back(kv.second);
     }
 
-    InitialClusteringConfig cfg;
-    cfg.seed = seed;
     cfg.max_sample = std::max<std::size_t>(256, std::min<std::size_t>(4096, vectors.size()));
 
     IdEstimateRange idr;
@@ -1366,15 +1770,34 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     KMeansModel model;
     ElbowSelection elbow;
     const auto t_elbow_start = std::chrono::steady_clock::now();
+    const std::size_t elbow_candidate_count =
+        (idr.k_max >= idr.k_min) ? ((idr.k_max - idr.k_min) + 1) : 0;
+    std::cout << "progress: elbow integer candidate span "
+              << "k_min=" << idr.k_min
+              << " k_max=" << idr.k_max
+              << " count=" << elbow_candidate_count << "\n";
     std::cout << "progress: clustering step 2/4 binary elbow k selection\n";
-    if (const Status s = select_k_binary_elbow(vectors, idr, cfg, &model, &elbow); !s.ok) {
+    if (const Status s = select_k_binary_elbow_packed(
+            vectors,
+            live_result.packed_row_major,
+            idr,
+            cfg,
+            &model,
+            &elbow);
+        !s.ok) {
         return s;
     }
     const auto t_elbow_end = std::chrono::steady_clock::now();
     StabilityMetrics stability;
     const auto t_stability_start = std::chrono::steady_clock::now();
     std::cout << "progress: clustering step 3/4 stability evaluation\n";
-    if (const Status s = evaluate_stability(vectors, model.k, cfg, &stability); !s.ok) {
+    if (const Status s = evaluate_stability_packed(
+            vectors,
+            live_result.packed_row_major,
+            model.k,
+            cfg,
+            &stability);
+        !s.ok) {
         return s;
     }
     const auto t_stability_end = std::chrono::steady_clock::now();
@@ -1412,6 +1835,14 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     st.stability_ms = std::chrono::duration<double, std::milli>(t_stability_end - t_stability_start).count();
     st.write_artifacts_ms = std::chrono::duration<double, std::milli>(t_write_end - t_write_start).count();
     st.total_build_ms = std::chrono::duration<double, std::milli>(t_write_end - t_build_start).count();
+    st.live_vector_bytes_read = live_result.bytes_read;
+    st.live_vector_contiguous_spans = live_result.contiguous_spans;
+    st.live_vector_sparse_reads = live_result.sparse_reads;
+    st.live_vector_sparse_fallback = live_result.sparse_fallback_used;
+    st.live_vector_async_double_buffer = live_result.async_double_buffer_used;
+    st.elbow_stage_a_approx_enabled = elbow.stage_a_approx_enabled;
+    st.elbow_stage_a_approx_dim = elbow.stage_a_approx_dim;
+    st.elbow_stage_a_approx_stride = elbow.stage_a_approx_stride;
 
     ClusterHealth health{};
     health.available = true;
@@ -1425,6 +1856,7 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     if (const Status s = impl_->write_cluster_manifest(st, health, idr, elbow.used_fallback); !s.ok) {
         return s;
     }
+    impl_->last_open_signature = impl_->capture_open_signature();
     impl_->cluster_stats_cache = st;
     impl_->cluster_health_cache = health;
     std::cout << "progress: clustering done chosen_k=" << st.chosen_k
