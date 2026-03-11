@@ -1263,6 +1263,33 @@ struct VectorStore::Impl {
         if (const auto v = extract_u64_field(text, "elbow_stage_a_approx_stride"); v.has_value()) {
             cluster_stats_cache.elbow_stage_a_approx_stride = static_cast<std::size_t>(*v);
         }
+        if (const auto v = extract_u64_field(text, "elbow_stage_b_pruned_candidates"); v.has_value()) {
+            cluster_stats_cache.elbow_stage_b_pruned_candidates = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "elbow_stage_b_window_k_min"); v.has_value()) {
+            cluster_stats_cache.elbow_stage_b_window_k_min = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_u64_field(text, "elbow_stage_b_window_k_max"); v.has_value()) {
+            cluster_stats_cache.elbow_stage_b_window_k_max = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_string_field(text, "elbow_stage_b_prune_reason"); v.has_value()) {
+            cluster_stats_cache.elbow_stage_b_prune_reason = *v;
+        }
+        if (const auto v = extract_bool_field(text, "elbow_int8_search_enabled"); v.has_value()) {
+            cluster_stats_cache.elbow_int8_search_enabled = *v;
+        }
+        if (const auto v = extract_bool_field(text, "elbow_int8_tensor_core_used"); v.has_value()) {
+            cluster_stats_cache.elbow_int8_tensor_core_used = *v;
+        }
+        if (const auto v = extract_u64_field(text, "elbow_int8_eval_count"); v.has_value()) {
+            cluster_stats_cache.elbow_int8_eval_count = static_cast<std::size_t>(*v);
+        }
+        if (const auto v = extract_string_field(text, "elbow_int8_scale_mode"); v.has_value()) {
+            cluster_stats_cache.elbow_int8_scale_mode = *v;
+        }
+        if (const auto v = extract_string_field(text, "elbow_scoring_precision"); v.has_value()) {
+            cluster_stats_cache.elbow_scoring_precision = *v;
+        }
         if (const auto v = extract_double_field(text, "mean_nmi"); v.has_value()) {
             cluster_health_cache.mean_nmi = *v;
         }
@@ -1323,6 +1350,20 @@ struct VectorStore::Impl {
            << (stats.elbow_stage_a_approx_enabled ? "true" : "false") << ",\n";
         os << "  \"elbow_stage_a_approx_dim\": " << stats.elbow_stage_a_approx_dim << ",\n";
         os << "  \"elbow_stage_a_approx_stride\": " << stats.elbow_stage_a_approx_stride << ",\n";
+        os << "  \"elbow_stage_b_pruned_candidates\": " << stats.elbow_stage_b_pruned_candidates << ",\n";
+        os << "  \"elbow_stage_b_window_k_min\": " << stats.elbow_stage_b_window_k_min << ",\n";
+        os << "  \"elbow_stage_b_window_k_max\": " << stats.elbow_stage_b_window_k_max << ",\n";
+        os << "  \"elbow_stage_b_prune_reason\": \"" << json_escape(stats.elbow_stage_b_prune_reason)
+           << "\",\n";
+        os << "  \"elbow_int8_search_enabled\": "
+           << (stats.elbow_int8_search_enabled ? "true" : "false") << ",\n";
+        os << "  \"elbow_int8_tensor_core_used\": "
+           << (stats.elbow_int8_tensor_core_used ? "true" : "false") << ",\n";
+        os << "  \"elbow_int8_eval_count\": " << stats.elbow_int8_eval_count << ",\n";
+        os << "  \"elbow_int8_scale_mode\": \"" << json_escape(stats.elbow_int8_scale_mode)
+           << "\",\n";
+        os << "  \"elbow_scoring_precision\": \"" << json_escape(stats.elbow_scoring_precision)
+           << "\",\n";
         os << "  \"id_sample_size\": " << idr.sample_size << ",\n";
         os << "  \"id_m_low\": " << idr.m_low << ",\n";
         os << "  \"id_m_high\": " << idr.m_high << ",\n";
@@ -1743,6 +1784,29 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     cfg.elbow_stage_a_approx_stride = env_size_value(
         "VECTOR_DB_ELBOW_APPROX_STRIDE",
         cfg.elbow_stage_a_approx_stride);
+    cfg.elbow_prune_enabled = env_flag_enabled(
+        "VECTOR_DB_ELBOW_PRUNE",
+        cfg.elbow_prune_enabled);
+    const char* prune_margin_env = std::getenv("VECTOR_DB_ELBOW_PRUNE_MARGIN");
+    if (prune_margin_env != nullptr) {
+        try {
+            cfg.elbow_prune_margin = std::stod(prune_margin_env);
+        } catch (...) {
+        }
+    }
+    cfg.elbow_trace_full_grid = env_flag_enabled(
+        "VECTOR_DB_ELBOW_TRACE_FULL_GRID",
+        cfg.elbow_trace_full_grid);
+    cfg.elbow_int8_search_enabled = env_flag_enabled(
+        "VECTOR_DB_ELBOW_INT8_SEARCH",
+        cfg.elbow_int8_search_enabled);
+    cfg.elbow_int8_require_hardware = env_flag_enabled(
+        "VECTOR_DB_ELBOW_INT8_REQUIRE_HARDWARE",
+        cfg.elbow_int8_require_hardware);
+    const char* int8_scale_mode_env = std::getenv("VECTOR_DB_ELBOW_INT8_SCALE_MODE");
+    if (int8_scale_mode_env != nullptr && std::string(int8_scale_mode_env).size() > 0) {
+        cfg.elbow_int8_scale_mode = int8_scale_mode_env;
+    }
 
     const auto t_live_start = std::chrono::steady_clock::now();
     const auto live_result = impl_->collect_live_vectors(cfg);
@@ -1843,6 +1907,16 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
     st.elbow_stage_a_approx_enabled = elbow.stage_a_approx_enabled;
     st.elbow_stage_a_approx_dim = elbow.stage_a_approx_dim;
     st.elbow_stage_a_approx_stride = elbow.stage_a_approx_stride;
+    st.elbow_stage_b_pruned_candidates = elbow.stage_b_pruned_candidates;
+    st.elbow_stage_b_window_k_min = elbow.stage_b_window_k_min;
+    st.elbow_stage_b_window_k_max = elbow.stage_b_window_k_max;
+    st.elbow_stage_b_prune_reason = elbow.stage_b_prune_reason;
+    st.elbow_int8_search_enabled = elbow.int8_search_enabled;
+    st.elbow_int8_tensor_core_used = elbow.int8_tensor_core_used;
+    st.elbow_int8_eval_count = elbow.int8_eval_count;
+    st.elbow_int8_scale_mode = cfg.elbow_int8_scale_mode;
+    st.elbow_scoring_precision =
+        (model.scoring_precision == CudaScorePrecision::INT8) ? "int8-search/fp16-final" : "fp16";
 
     ClusterHealth health{};
     health.available = true;

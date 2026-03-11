@@ -9,6 +9,11 @@
 
 namespace vector_db {
 
+enum class CudaScorePrecision {
+    FP16 = 0,
+    INT8 = 1,
+};
+
 struct IdEstimateRange {
     std::size_t sample_size = 0;
     double m_low = 0.0;
@@ -34,6 +39,13 @@ struct ElbowSelection {
     bool stage_a_approx_enabled = false;
     std::size_t stage_a_approx_dim = 0;
     std::size_t stage_a_approx_stride = 1;
+    std::size_t stage_b_pruned_candidates = 0;
+    std::size_t stage_b_window_k_min = 0;
+    std::size_t stage_b_window_k_max = 0;
+    std::string stage_b_prune_reason;
+    bool int8_search_enabled = false;
+    bool int8_tensor_core_used = false;
+    std::size_t int8_eval_count = 0;
 };
 
 struct KMeansModel {
@@ -47,6 +59,7 @@ struct KMeansModel {
     std::vector<float> centroids;  // row-major [k][1024]
     std::vector<std::vector<std::uint32_t>> assignments;  // top-m centroid ids per vector
     std::vector<std::uint32_t> labels;  // top-1 centroid id per vector
+    CudaScorePrecision scoring_precision = CudaScorePrecision::FP16;
 };
 
 struct StabilityMetrics {
@@ -102,6 +115,12 @@ struct InitialClusteringConfig {
     std::size_t async_double_buffer_queue_depth = 2;
     bool elbow_stage_a_approx_enabled = false;
     std::size_t elbow_stage_a_approx_stride = 2;
+    bool elbow_prune_enabled = true;
+    double elbow_prune_margin = 0.01;
+    bool elbow_trace_full_grid = false;
+    bool elbow_int8_search_enabled = false;
+    bool elbow_int8_require_hardware = true;
+    std::string elbow_int8_scale_mode = "per_tensor_symmetric";
 };
 
 Status estimate_intrinsic_dimensionality(
@@ -153,6 +172,7 @@ Status evaluate_stability_packed(
 
 bool cuda_dot_products_available();
 bool cuda_assignment_kernels_available();
+bool cuda_int8_dot_products_available();
 Status cuda_compute_dot_products(
     const std::vector<float>& vectors_row_major,
     const std::vector<float>& centroids_row_major,
@@ -161,7 +181,8 @@ Status cuda_compute_dot_products(
     std::size_t dim,
     std::vector<float>* out_scores_row_major,
     bool* out_tensor_core_enabled,
-    std::string* out_backend_name);
+    std::string* out_backend_name,
+    CudaScorePrecision precision = CudaScorePrecision::FP16);
 Status cuda_assign_top1_labels(
     const std::vector<float>& scores_row_major,
     std::size_t n_vectors,
@@ -186,7 +207,8 @@ Status cuda_kmeans_iteration_top1(
     std::vector<float>* out_best_scores,
     bool* out_tensor_core_enabled,
     std::string* out_backend_name,
-    double* out_scoring_ms);
+    double* out_scoring_ms,
+    CudaScorePrecision precision = CudaScorePrecision::FP16);
 Status cuda_topm_from_centroids(
     const std::vector<float>& vectors_row_major,
     const std::vector<float>& centroids_row_major,
@@ -198,7 +220,8 @@ Status cuda_topm_from_centroids(
     std::vector<float>* out_scores_row_major,
     bool* out_tensor_core_enabled,
     std::string* out_backend_name,
-    double* out_scoring_ms);
+    double* out_scoring_ms,
+    CudaScorePrecision precision = CudaScorePrecision::FP16);
 
 }  // namespace vector_db
 

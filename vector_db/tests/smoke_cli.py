@@ -119,11 +119,24 @@ def main() -> int:
             "elbow_stage_a_approx_enabled",
             "elbow_stage_a_approx_dim",
             "elbow_stage_a_approx_stride",
+            "elbow_stage_b_pruned_candidates",
+            "elbow_stage_b_window_k_min",
+            "elbow_stage_b_window_k_max",
+            "elbow_stage_b_prune_reason",
+            "elbow_int8_search_enabled",
+            "elbow_int8_tensor_core_used",
+            "elbow_int8_eval_count",
+            "elbow_int8_scale_mode",
+            "elbow_scoring_precision",
         ],
         "cluster-stats output",
     )
     assert cluster_stats["elbow_stage_b_candidates"] >= 2
-    assert cluster_stats["elbow_stage_b_candidates"] >= cluster_stats["elbow_stage_a_candidates"]
+    assert cluster_stats["elbow_stage_b_pruned_candidates"] <= cluster_stats["elbow_stage_b_candidates"]
+    assert cluster_stats["elbow_stage_b_window_k_min"] >= cluster_stats["k_min"]
+    assert cluster_stats["elbow_stage_b_window_k_max"] <= cluster_stats["k_max"]
+    assert cluster_stats["elbow_int8_eval_count"] >= 0
+    assert cluster_stats["elbow_scoring_precision"] in ("fp16", "int8-search/fp16-final")
     assert cluster_stats["elbow_k_evaluated_count"] >= cluster_stats["elbow_stage_b_candidates"]
     assert cluster_health["available"] is True
     assert (data_dir / "clusters" / "initial" / "cluster_manifest.json").exists()

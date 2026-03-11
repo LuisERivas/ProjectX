@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace vector_db {
@@ -189,12 +190,39 @@ __global__ void normalize_centroids_kernel(
     }
 }
 
+__global__ void convert_scores_i32_to_f32_kernel(
+    const std::int32_t* in_scores,
+    float* out_scores,
+    std::size_t count,
+    float scale_mul) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x)
+        + static_cast<std::size_t>(threadIdx.x);
+    if (i >= count) {
+        return;
+    }
+    out_scores[i] = static_cast<float>(in_scores[i]) * scale_mul;
+}
+
 std::vector<__half> fp32_to_fp16(const std::vector<float>& in) {
     std::vector<__half> out(in.size());
     for (std::size_t i = 0; i < in.size(); ++i) {
         out[i] = __float2half(in[i]);
     }
     return out;
+}
+
+std::pair<std::vector<std::int8_t>, float> quantize_symmetric_int8(const std::vector<float>& in) {
+    float max_abs = 0.0f;
+    for (float v : in) {
+        max_abs = std::max(max_abs, std::abs(v));
+    }
+    const float scale = (max_abs <= 1e-12f) ? 1.0f : (max_abs / 127.0f);
+    std::vector<std::int8_t> out(in.size(), 0);
+    for (std::size_t i = 0; i < in.size(); ++i) {
+        const int q = static_cast<int>(std::lrint(in[i] / scale));
+        out[i] = static_cast<std::int8_t>(std::max(-127, std::min(127, q)));
+    }
+    return {std::move(out), scale};
 }
 
 bool set_row_major(cublasLtMatrixLayout_t layout) {
@@ -210,7 +238,10 @@ bool set_row_major(cublasLtMatrixLayout_t layout) {
 struct GpuContextCache {
     __half* d_vectors_fp16 = nullptr;
     __half* d_centroids_fp16 = nullptr;
+    std::int8_t* d_vectors_int8 = nullptr;
+    std::int8_t* d_centroids_int8 = nullptr;
     float* d_scores = nullptr;
+    std::int32_t* d_scores_i32 = nullptr;
     float* d_vectors_fp32 = nullptr;
     std::uint32_t* d_labels = nullptr;
     float* d_best_scores = nullptr;
@@ -228,7 +259,11 @@ struct GpuContextCache {
     const float* last_vectors_host_ptr = nullptr;
     std::size_t last_vectors_host_count = 0;
     bool vectors_fp16_loaded = false;
+    bool vectors_int8_loaded = false;
     bool vectors_fp32_loaded = false;
+    CudaScorePrecision vectors_fp16_precision = CudaScorePrecision::FP16;
+    float vectors_int8_scale = 1.0f;
+    float centroids_int8_scale = 1.0f;
     cublasLtHandle_t lt = nullptr;
     bool initialized = false;
 };
@@ -241,7 +276,10 @@ GpuContextCache& gpu_cache() {
 void free_cache_buffers(GpuContextCache& c) {
     if (c.d_vectors_fp16 != nullptr) cudaFree(c.d_vectors_fp16);
     if (c.d_centroids_fp16 != nullptr) cudaFree(c.d_centroids_fp16);
+    if (c.d_vectors_int8 != nullptr) cudaFree(c.d_vectors_int8);
+    if (c.d_centroids_int8 != nullptr) cudaFree(c.d_centroids_int8);
     if (c.d_scores != nullptr) cudaFree(c.d_scores);
+    if (c.d_scores_i32 != nullptr) cudaFree(c.d_scores_i32);
     if (c.d_vectors_fp32 != nullptr) cudaFree(c.d_vectors_fp32);
     if (c.d_labels != nullptr) cudaFree(c.d_labels);
     if (c.d_best_scores != nullptr) cudaFree(c.d_best_scores);
@@ -272,7 +310,10 @@ Status ensure_cache(
     c.cap_blocks = n_blocks;
     const std::size_t vectors_fp16_bytes = n_vectors * dim * sizeof(__half);
     const std::size_t centroids_fp16_bytes = k_centroids * dim * sizeof(__half);
+    const std::size_t vectors_int8_bytes = n_vectors * dim * sizeof(std::int8_t);
+    const std::size_t centroids_int8_bytes = k_centroids * dim * sizeof(std::int8_t);
     const std::size_t scores_bytes = n_vectors * k_centroids * sizeof(float);
+    const std::size_t scores_i32_bytes = n_vectors * k_centroids * sizeof(std::int32_t);
     const std::size_t vectors_fp32_bytes = n_vectors * dim * sizeof(float);
     const std::size_t labels_bytes = n_vectors * sizeof(std::uint32_t);
     const std::size_t best_scores_bytes = n_vectors * sizeof(float);
@@ -283,7 +324,10 @@ Status ensure_cache(
     cudaError_t alloc_status = cudaSuccess;
     if ((alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_vectors_fp16), vectors_fp16_bytes)) != cudaSuccess
         || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_centroids_fp16), centroids_fp16_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_vectors_int8), vectors_int8_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_centroids_int8), centroids_int8_bytes)) != cudaSuccess
         || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_scores), scores_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_scores_i32), scores_i32_bytes)) != cudaSuccess
         || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_vectors_fp32), vectors_fp32_bytes)) != cudaSuccess
         || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_labels), labels_bytes)) != cudaSuccess
         || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_best_scores), best_scores_bytes)) != cudaSuccess
@@ -312,12 +356,14 @@ Status upload_vectors_if_needed(
     std::size_t n_vectors,
     std::size_t dim,
     bool need_fp16,
-    bool need_fp32) {
+    bool need_fp32,
+    CudaScorePrecision fp16_precision) {
     const float* host_ptr = vectors_row_major.empty() ? nullptr : vectors_row_major.data();
     const std::size_t host_count = vectors_row_major.size();
     const bool changed = (host_ptr != c.last_vectors_host_ptr) || (host_count != c.last_vectors_host_count);
     if (changed) {
         c.vectors_fp16_loaded = false;
+        c.vectors_int8_loaded = false;
         c.vectors_fp32_loaded = false;
     }
     if (need_fp32 && !c.vectors_fp32_loaded) {
@@ -325,11 +371,22 @@ Status upload_vectors_if_needed(
         cudaMemcpy(c.d_vectors_fp32, vectors_row_major.data(), bytes, cudaMemcpyHostToDevice);
         c.vectors_fp32_loaded = true;
     }
-    if (need_fp16 && !c.vectors_fp16_loaded) {
-        const std::vector<__half> vectors_fp16 = fp32_to_fp16(vectors_row_major);
-        const std::size_t bytes = n_vectors * dim * sizeof(__half);
-        cudaMemcpy(c.d_vectors_fp16, vectors_fp16.data(), bytes, cudaMemcpyHostToDevice);
-        c.vectors_fp16_loaded = true;
+    if (need_fp16) {
+        if (fp16_precision == CudaScorePrecision::INT8) {
+            if (!c.vectors_int8_loaded) {
+                auto [vectors_int8, scale] = quantize_symmetric_int8(vectors_row_major);
+                const std::size_t bytes = n_vectors * dim * sizeof(std::int8_t);
+                cudaMemcpy(c.d_vectors_int8, vectors_int8.data(), bytes, cudaMemcpyHostToDevice);
+                c.vectors_int8_scale = scale;
+                c.vectors_int8_loaded = true;
+            }
+        } else if (!c.vectors_fp16_loaded || c.vectors_fp16_precision != fp16_precision) {
+            const std::vector<__half> vectors_fp16 = fp32_to_fp16(vectors_row_major);
+            const std::size_t bytes = n_vectors * dim * sizeof(__half);
+            cudaMemcpy(c.d_vectors_fp16, vectors_fp16.data(), bytes, cudaMemcpyHostToDevice);
+            c.vectors_fp16_loaded = true;
+            c.vectors_fp16_precision = fp16_precision;
+        }
     }
     c.last_vectors_host_ptr = host_ptr;
     c.last_vectors_host_count = host_count;
@@ -340,7 +397,15 @@ Status upload_centroids_fp16(
     GpuContextCache& c,
     const std::vector<float>& centroids_row_major,
     std::size_t k_centroids,
-    std::size_t dim) {
+    std::size_t dim,
+    CudaScorePrecision precision) {
+    if (precision == CudaScorePrecision::INT8) {
+        auto [centroids_int8, scale] = quantize_symmetric_int8(centroids_row_major);
+        const std::size_t bytes = k_centroids * dim * sizeof(std::int8_t);
+        cudaMemcpy(c.d_centroids_int8, centroids_int8.data(), bytes, cudaMemcpyHostToDevice);
+        c.centroids_int8_scale = scale;
+        return Status::Ok();
+    }
     const std::vector<__half> centroids_fp16 = fp32_to_fp16(centroids_row_major);
     const std::size_t bytes = k_centroids * dim * sizeof(__half);
     cudaMemcpy(c.d_centroids_fp16, centroids_fp16.data(), bytes, cudaMemcpyHostToDevice);
@@ -352,6 +417,7 @@ Status matmul_scores_cached(
     std::size_t n_vectors,
     std::size_t k_centroids,
     std::size_t dim,
+    CudaScorePrecision precision,
     bool* out_tensor_core_enabled,
     std::string* out_backend_name) {
     cublasLtMatmulDesc_t op_desc = nullptr;
@@ -362,14 +428,22 @@ Status matmul_scores_cached(
 
     cublasOperation_t transa = CUBLAS_OP_N;
     cublasOperation_t transb = CUBLAS_OP_T;
-    if (cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) {
+    const cublasComputeType_t compute_type =
+        (precision == CudaScorePrecision::INT8) ? CUBLAS_COMPUTE_32I : CUBLAS_COMPUTE_32F;
+    const cudaDataType_t scale_type =
+        (precision == CudaScorePrecision::INT8) ? CUDA_R_32I : CUDA_R_32F;
+    if (cublasLtMatmulDescCreate(&op_desc, compute_type, scale_type) != CUBLAS_STATUS_SUCCESS) {
         return Status::Error("cublasLtMatmulDescCreate failed");
     }
     cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
     cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb));
-    if (cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16F, static_cast<std::uint64_t>(n_vectors), static_cast<std::uint64_t>(dim), static_cast<std::int64_t>(dim)) != CUBLAS_STATUS_SUCCESS
-        || cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16F, static_cast<std::uint64_t>(k_centroids), static_cast<std::uint64_t>(dim), static_cast<std::int64_t>(dim)) != CUBLAS_STATUS_SUCCESS
-        || cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, static_cast<std::uint64_t>(n_vectors), static_cast<std::uint64_t>(k_centroids), static_cast<std::int64_t>(k_centroids)) != CUBLAS_STATUS_SUCCESS) {
+    const cudaDataType_t ab_type =
+        (precision == CudaScorePrecision::INT8) ? CUDA_R_8I : CUDA_R_16F;
+    const cudaDataType_t c_type =
+        (precision == CudaScorePrecision::INT8) ? CUDA_R_32I : CUDA_R_32F;
+    if (cublasLtMatrixLayoutCreate(&a_desc, ab_type, static_cast<std::uint64_t>(n_vectors), static_cast<std::uint64_t>(dim), static_cast<std::int64_t>(dim)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutCreate(&b_desc, ab_type, static_cast<std::uint64_t>(k_centroids), static_cast<std::uint64_t>(dim), static_cast<std::int64_t>(dim)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutCreate(&c_desc, c_type, static_cast<std::uint64_t>(n_vectors), static_cast<std::uint64_t>(k_centroids), static_cast<std::int64_t>(k_centroids)) != CUBLAS_STATUS_SUCCESS) {
         if (a_desc != nullptr) cublasLtMatrixLayoutDestroy(a_desc);
         if (b_desc != nullptr) cublasLtMatrixLayoutDestroy(b_desc);
         if (c_desc != nullptr) cublasLtMatrixLayoutDestroy(c_desc);
@@ -398,20 +472,36 @@ Status matmul_scores_cached(
         cublasLtMatmulDescDestroy(op_desc);
         return Status::Error("cublasLtMatmulAlgoGetHeuristic failed");
     }
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    const float alpha_f = 1.0f;
+    const float beta_f = 0.0f;
+    const std::int32_t alpha_i = 1;
+    const std::int32_t beta_i = 0;
+    const void* alpha = (precision == CudaScorePrecision::INT8)
+        ? static_cast<const void*>(&alpha_i)
+        : static_cast<const void*>(&alpha_f);
+    const void* beta = (precision == CudaScorePrecision::INT8)
+        ? static_cast<const void*>(&beta_i)
+        : static_cast<const void*>(&beta_f);
     const cublasStatus_t st = cublasLtMatmul(
         c.lt,
         op_desc,
-        &alpha,
-        c.d_vectors_fp16,
+        alpha,
+        (precision == CudaScorePrecision::INT8)
+            ? static_cast<const void*>(c.d_vectors_int8)
+            : static_cast<const void*>(c.d_vectors_fp16),
         a_desc,
-        c.d_centroids_fp16,
+        (precision == CudaScorePrecision::INT8)
+            ? static_cast<const void*>(c.d_centroids_int8)
+            : static_cast<const void*>(c.d_centroids_fp16),
         b_desc,
-        &beta,
-        c.d_scores,
+        beta,
+        (precision == CudaScorePrecision::INT8)
+            ? static_cast<void*>(c.d_scores_i32)
+            : static_cast<void*>(c.d_scores),
         c_desc,
-        c.d_scores,
+        (precision == CudaScorePrecision::INT8)
+            ? static_cast<void*>(c.d_scores_i32)
+            : static_cast<void*>(c.d_scores),
         c_desc,
         &heuristic.algo,
         c.workspace,
@@ -483,10 +573,45 @@ Status reduce_centroids_from_device_labels(
     return Status::Ok();
 }
 
+Status dequantize_scores_if_needed(
+    GpuContextCache& c,
+    std::size_t score_count,
+    CudaScorePrecision precision) {
+    if (precision != CudaScorePrecision::INT8) {
+        return Status::Ok();
+    }
+    const int threads = 256;
+    const std::size_t n_blocks =
+        (score_count + static_cast<std::size_t>(threads) - 1U) / static_cast<std::size_t>(threads);
+    const float scale_mul = c.vectors_int8_scale * c.centroids_int8_scale;
+    convert_scores_i32_to_f32_kernel<<<static_cast<int>(n_blocks), threads>>>(
+        c.d_scores_i32,
+        c.d_scores,
+        score_count,
+        scale_mul);
+    if (const cudaError_t st = cudaGetLastError(); st != cudaSuccess) {
+        return Status::Error("int8 score dequant kernel launch failed: " + cuda_error_string(st));
+    }
+    return Status::Ok();
+}
+
 }  // namespace
 
 bool cuda_dot_products_available() { return true; }
 bool cuda_assignment_kernels_available() { return true; }
+bool cuda_int8_dot_products_available() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        return false;
+    }
+    int major = 0;
+    int minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess
+        || cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        return false;
+    }
+    return major >= 8;
+}
 
 Status cuda_compute_dot_products(
     const std::vector<float>& vectors_row_major,
@@ -496,7 +621,8 @@ Status cuda_compute_dot_products(
     std::size_t dim,
     std::vector<float>* out_scores_row_major,
     bool* out_tensor_core_enabled,
-    std::string* out_backend_name) {
+    std::string* out_backend_name,
+    CudaScorePrecision precision) {
     if (out_scores_row_major == nullptr) {
         return Status::Error("cuda output buffer is null");
     }
@@ -505,6 +631,9 @@ Status cuda_compute_dot_products(
     }
     if (out_backend_name != nullptr) {
         *out_backend_name = "cuda_kernel";
+    }
+    if (precision == CudaScorePrecision::INT8 && !cuda_int8_dot_products_available()) {
+        return Status::Error("INT8 scoring requested but unsupported on this GPU");
     }
     const std::size_t score_count = n_vectors * k_centroids;
     out_scores_row_major->assign(score_count, 0.0f);
@@ -522,14 +651,30 @@ Status cuda_compute_dot_products(
         return s;
     }
     const std::size_t s_bytes = score_count * sizeof(float);
-    if (const Status s = upload_vectors_if_needed(cache, vectors_row_major, n_vectors, dim, true, false); !s.ok) {
+    if (const Status s = upload_vectors_if_needed(
+            cache, vectors_row_major, n_vectors, dim, true, false, precision);
+        !s.ok) {
         return s;
     }
-    if (const Status s = upload_centroids_fp16(cache, centroids_row_major, k_centroids, dim); !s.ok) {
+    if (const Status s = upload_centroids_fp16(cache, centroids_row_major, k_centroids, dim, precision); !s.ok) {
         return s;
     }
-    if (const Status s = matmul_scores_cached(cache, n_vectors, k_centroids, dim, out_tensor_core_enabled, out_backend_name); !s.ok) {
+    if (const Status s = matmul_scores_cached(
+            cache,
+            n_vectors,
+            k_centroids,
+            dim,
+            precision,
+            out_tensor_core_enabled,
+            out_backend_name);
+        !s.ok) {
         return s;
+    }
+    if (const Status s = dequantize_scores_if_needed(cache, score_count, precision); !s.ok) {
+        return s;
+    }
+    if (out_backend_name != nullptr && precision == CudaScorePrecision::INT8) {
+        *out_backend_name = "cublaslt_int8q";
     }
     cudaDeviceSynchronize();
     cudaMemcpy(out_scores_row_major->data(), cache.d_scores, s_bytes, cudaMemcpyDeviceToHost);
@@ -594,7 +739,15 @@ Status cuda_reduce_centroids_top1(
     }
     const std::size_t l_bytes = labels.size() * sizeof(std::uint32_t);
     const std::size_t s_bytes = k_centroids * dim * sizeof(float);
-    if (const Status s = upload_vectors_if_needed(cache, vectors_row_major, n_vectors, dim, false, true); !s.ok) {
+    if (const Status s = upload_vectors_if_needed(
+            cache,
+            vectors_row_major,
+            n_vectors,
+            dim,
+            false,
+            true,
+            CudaScorePrecision::FP16);
+        !s.ok) {
         return s;
     }
     cudaMemcpy(cache.d_labels, labels.data(), l_bytes, cudaMemcpyHostToDevice);
@@ -617,7 +770,11 @@ Status cuda_kmeans_iteration_top1(
     std::vector<float>* out_best_scores,
     bool* out_tensor_core_enabled,
     std::string* out_backend_name,
-    double* out_scoring_ms) {
+    double* out_scoring_ms,
+    CudaScorePrecision precision) {
+    if (precision == CudaScorePrecision::INT8 && !cuda_int8_dot_products_available()) {
+        return Status::Error("INT8 scoring requested but unsupported on this GPU");
+    }
     if (out_centroids_row_major == nullptr || out_labels == nullptr || out_best_scores == nullptr) {
         return Status::Error("null output pointers for cuda_kmeans_iteration_top1");
     }
@@ -630,14 +787,27 @@ Status cuda_kmeans_iteration_top1(
     if (const Status s = ensure_cache(cache, n_vectors, k_centroids, dim, 1, n_blocks); !s.ok) {
         return s;
     }
-    if (const Status s = upload_vectors_if_needed(cache, vectors_row_major, n_vectors, dim, true, true); !s.ok) {
+    if (const Status s = upload_vectors_if_needed(
+            cache, vectors_row_major, n_vectors, dim, true, true, precision);
+        !s.ok) {
         return s;
     }
-    if (const Status s = upload_centroids_fp16(cache, centroids_row_major, k_centroids, dim); !s.ok) {
+    if (const Status s = upload_centroids_fp16(cache, centroids_row_major, k_centroids, dim, precision); !s.ok) {
         return s;
     }
     auto t0 = std::chrono::steady_clock::now();
-    if (const Status s = matmul_scores_cached(cache, n_vectors, k_centroids, dim, out_tensor_core_enabled, out_backend_name); !s.ok) {
+    if (const Status s = matmul_scores_cached(
+            cache,
+            n_vectors,
+            k_centroids,
+            dim,
+            precision,
+            out_tensor_core_enabled,
+            out_backend_name);
+        !s.ok) {
+        return s;
+    }
+    if (const Status s = dequantize_scores_if_needed(cache, n_vectors * k_centroids, precision); !s.ok) {
         return s;
     }
     assign_top1_kernel<<<static_cast<int>(n_blocks), threads>>>(
@@ -666,6 +836,9 @@ Status cuda_kmeans_iteration_top1(
     if (out_scoring_ms != nullptr) {
         *out_scoring_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
+    if (out_backend_name != nullptr && precision == CudaScorePrecision::INT8) {
+        *out_backend_name = "cublaslt_int8q";
+    }
     return Status::Ok();
 }
 
@@ -680,7 +853,11 @@ Status cuda_topm_from_centroids(
     std::vector<float>* out_scores_row_major,
     bool* out_tensor_core_enabled,
     std::string* out_backend_name,
-    double* out_scoring_ms) {
+    double* out_scoring_ms,
+    CudaScorePrecision precision) {
+    if (precision == CudaScorePrecision::INT8 && !cuda_int8_dot_products_available()) {
+        return Status::Error("INT8 scoring requested but unsupported on this GPU");
+    }
     if (out_top_m == nullptr || out_scores_row_major == nullptr) {
         return Status::Error("null outputs for cuda_topm_from_centroids");
     }
@@ -693,14 +870,27 @@ Status cuda_topm_from_centroids(
     if (const Status s = ensure_cache(cache, n_vectors, k_centroids, dim, std::max<std::size_t>(top_m, 1), n_blocks); !s.ok) {
         return s;
     }
-    if (const Status s = upload_vectors_if_needed(cache, vectors_row_major, n_vectors, dim, true, false); !s.ok) {
+    if (const Status s = upload_vectors_if_needed(
+            cache, vectors_row_major, n_vectors, dim, true, false, precision);
+        !s.ok) {
         return s;
     }
-    if (const Status s = upload_centroids_fp16(cache, centroids_row_major, k_centroids, dim); !s.ok) {
+    if (const Status s = upload_centroids_fp16(cache, centroids_row_major, k_centroids, dim, precision); !s.ok) {
         return s;
     }
     auto t0 = std::chrono::steady_clock::now();
-    if (const Status s = matmul_scores_cached(cache, n_vectors, k_centroids, dim, out_tensor_core_enabled, out_backend_name); !s.ok) {
+    if (const Status s = matmul_scores_cached(
+            cache,
+            n_vectors,
+            k_centroids,
+            dim,
+            precision,
+            out_tensor_core_enabled,
+            out_backend_name);
+        !s.ok) {
+        return s;
+    }
+    if (const Status s = dequantize_scores_if_needed(cache, n_vectors * k_centroids, precision); !s.ok) {
         return s;
     }
     assign_topm_kernel<<<static_cast<int>(n_blocks), threads>>>(
@@ -729,6 +919,9 @@ Status cuda_topm_from_centroids(
     auto t1 = std::chrono::steady_clock::now();
     if (out_scoring_ms != nullptr) {
         *out_scoring_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+    if (out_backend_name != nullptr && precision == CudaScorePrecision::INT8) {
+        *out_backend_name = "cublaslt_int8q";
     }
     return Status::Ok();
 }

@@ -79,6 +79,15 @@ struct ClusterStats {
     bool elbow_stage_a_approx_enabled = false;
     std::size_t elbow_stage_a_approx_dim = 0;
     std::size_t elbow_stage_a_approx_stride = 1;
+    std::size_t elbow_stage_b_pruned_candidates = 0;
+    std::size_t elbow_stage_b_window_k_min = 0;
+    std::size_t elbow_stage_b_window_k_max = 0;
+    std::string elbow_stage_b_prune_reason;
+    bool elbow_int8_search_enabled = false;
+    bool elbow_int8_tensor_core_used = false;
+    std::size_t elbow_int8_eval_count = 0;
+    std::string elbow_int8_scale_mode = "per_tensor_symmetric";
+    std::string elbow_scoring_precision = "fp16";
 };
 
 struct ClusterHealth {

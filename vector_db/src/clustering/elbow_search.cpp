@@ -120,6 +120,7 @@ Status run_kmeans_impl(
     const InitialClusteringConfig& cfg,
     std::uint32_t seed,
     std::size_t iteration_budget,
+    CudaScorePrecision precision,
     KMeansModel* out_model) {
     if (vectors.empty()) {
         return Status::Error("kmeans requires non-empty vectors");
@@ -138,6 +139,11 @@ Status run_kmeans_impl(
         return Status::Error(
             "GPU-only clustering requires CUDA scoring and assignment kernels; "
             "build with CUDA support and a compatible GPU");
+    }
+    if (precision == CudaScorePrecision::INT8 && cfg.elbow_int8_require_hardware
+        && !cuda_int8_dot_products_available()) {
+        return Status::Error(
+            "INT8 elbow search requested but unavailable on this CUDA build/GPU");
     }
     if (vectors_row_major.size() != vectors.size() * dim) {
         return Status::Error("GPU-only clustering requires a contiguous packed vectors buffer");
@@ -186,7 +192,8 @@ Status run_kmeans_impl(
                 &best_scores,
                 &tensor_iter,
                 &backend_iter,
-                &scoring_ms);
+                &scoring_ms,
+                precision);
             !s.ok) {
             return Status::Error("GPU kmeans iteration failed: " + s.message);
         }
@@ -213,7 +220,8 @@ Status run_kmeans_impl(
             &scores,
             &tensor_final,
             &backend_final,
-            &scoring_ms_final);
+            &scoring_ms_final,
+            precision);
         !s.ok) {
         return Status::Error("GPU top-m assignment failed: " + s.message);
     }
@@ -241,6 +249,7 @@ Status run_kmeans_impl(
     out_model->centroids = std::move(centroids);
     out_model->assignments = std::move(top_assign);
     out_model->labels = std::move(labels);
+    out_model->scoring_precision = precision;
     return Status::Ok();
 }
 
@@ -256,7 +265,8 @@ Status fit_spherical_kmeans(
         return Status::Error("null output model for fit_spherical_kmeans");
     }
     const std::vector<float> vectors_row_major = pack_vectors_row_major(vectors);
-    return run_kmeans_impl(vectors, vectors_row_major, k, cfg, seed, cfg.iters, out_model);
+    return run_kmeans_impl(
+        vectors, vectors_row_major, k, cfg, seed, cfg.iters, CudaScorePrecision::FP16, out_model);
 }
 
 Status fit_spherical_kmeans_packed(
@@ -269,7 +279,8 @@ Status fit_spherical_kmeans_packed(
     if (out_model == nullptr) {
         return Status::Error("null output model for fit_spherical_kmeans_packed");
     }
-    return run_kmeans_impl(vectors, vectors_row_major, k, cfg, seed, cfg.iters, out_model);
+    return run_kmeans_impl(
+        vectors, vectors_row_major, k, cfg, seed, cfg.iters, CudaScorePrecision::FP16, out_model);
 }
 
 Status select_k_binary_elbow(
@@ -313,11 +324,15 @@ Status select_k_binary_elbow_packed(
         stage_a_vectors = approximate_vectors_stride(stage_a_vectors, cfg.elbow_stage_a_approx_stride);
         stage_a_vectors_row_major = pack_vectors_row_major(stage_a_vectors);
     }
+    std::vector<float> stage_b_vectors_row_major = vectors_row_major;
+    std::vector<std::vector<float>> stage_b_vectors = vectors;
 
     auto run_elbow = [&](const std::vector<std::vector<float>>& vectors_ref,
                          const std::vector<float>& vectors_row_major_ref,
                          const std::vector<std::size_t>& k_grid,
                          const InitialClusteringConfig& cfg_ref,
+                         bool use_int8_search,
+                         bool full_trace,
                          std::size_t* out_eval_count,
                          std::string* out_early_stop_reason,
                          KMeansModel* out_best_model_local,
@@ -339,6 +354,7 @@ Status select_k_binary_elbow_packed(
                 cfg_ref,
                 cfg_ref.seed + static_cast<std::uint32_t>(k),
                 iter_budget,
+                use_int8_search ? CudaScorePrecision::INT8 : CudaScorePrecision::FP16,
                 &m);
             if (!s.ok) {
                 return s;
@@ -428,6 +444,7 @@ Status select_k_binary_elbow_packed(
                 cfg_ref,
                 cfg_ref.seed + static_cast<std::uint32_t>(chosen_k) + 9000U,
                 cfg_ref.iters,
+                use_int8_search ? CudaScorePrecision::INT8 : CudaScorePrecision::FP16,
                 &refined);
             if (!s.ok) {
                 return s;
@@ -444,32 +461,36 @@ Status select_k_binary_elbow_packed(
         out_selection_local->chosen_k = chosen_k;
         out_selection_local->used_fallback = fallback;
         out_selection_local->trace.clear();
-        for (std::size_t i = 0; i + 1 < k_grid.size(); ++i) {
-            const std::size_t k = k_grid[i];
-            const std::size_t k2 = k_grid[i + 1];
-            if (model_cache.find(k) == model_cache.end()) {
-                if (const Status s = ensure_model(k); !s.ok) {
-                    return s;
+        std::vector<std::size_t> trace_keys;
+        if (full_trace) {
+            trace_keys = k_grid;
+            for (std::size_t k : trace_keys) {
+                if (model_cache.find(k) == model_cache.end()) {
+                    if (const Status s = ensure_model(k); !s.ok) {
+                        return s;
+                    }
                 }
             }
-            if (model_cache.find(k2) == model_cache.end()) {
-                if (const Status s = ensure_model(k2); !s.ok) {
-                    return s;
+        } else {
+            trace_keys.reserve(model_cache.size());
+            for (const auto& kv : model_cache) {
+                trace_keys.push_back(kv.first);
+            }
+            std::sort(trace_keys.begin(), trace_keys.end());
+        }
+        for (std::size_t i = 0; i < trace_keys.size(); ++i) {
+            const std::size_t k = trace_keys[i];
+            double g = 0.0;
+            if (i + 1 < trace_keys.size()) {
+                const std::size_t k2 = trace_keys[i + 1];
+                if (k2 == k + 1) {
+                    const double j1 = model_cache[k].objective;
+                    const double j2 = model_cache[k2].objective;
+                    g = (j1 <= 0.0) ? 0.0 : ((j1 - j2) / j1);
                 }
             }
-            const double g = (model_cache[k].objective <= 0.0)
-                ? 0.0
-                : ((model_cache[k].objective - model_cache[k2].objective)
-                   / model_cache[k].objective);
             out_selection_local->trace.push_back(ElbowPoint{k, model_cache[k].objective, g});
         }
-        if (model_cache.find(k_grid.back()) == model_cache.end()) {
-            if (const Status s = ensure_model(k_grid.back()); !s.ok) {
-                return s;
-            }
-        }
-        out_selection_local->trace.push_back(
-            ElbowPoint{k_grid.back(), model_cache[k_grid.back()].objective, 0.0});
         *out_eval_count = model_cache.size();
         *out_early_stop_reason = early_reason;
         return Status::Ok();
@@ -484,6 +505,8 @@ Status select_k_binary_elbow_packed(
             stage_a_vectors_row_major,
             stage_a_grid,
             cfg,
+            cfg.elbow_int8_search_enabled,
+            true,
             &stage_a_eval_count,
             &stage_a_early_reason,
             &stage_a_model,
@@ -492,23 +515,72 @@ Status select_k_binary_elbow_packed(
         return s;
     }
 
-    // Stage B always uses full integer candidate pool [k_min..k_max].
+    if (cfg.elbow_prune_enabled) {
+        std::size_t crossing_idx = stage_a_grid.size() - 1;
+        bool found_crossing = false;
+        for (std::size_t i = 0; i + 1 < stage_a_selection.trace.size(); ++i) {
+            if (stage_a_selection.trace[i].gain_to_2k <= cfg.elbow_gain_threshold) {
+                crossing_idx = i;
+                found_crossing = true;
+                break;
+            }
+        }
+        std::size_t lo = found_crossing ? stage_a_grid[crossing_idx] : stage_a_grid.front();
+        std::size_t hi = found_crossing ? stage_a_grid[crossing_idx + 1] : stage_a_grid.back();
+        for (std::size_t i = 0; i + 1 < stage_a_selection.trace.size(); ++i) {
+            const double g = stage_a_selection.trace[i].gain_to_2k;
+            if (std::abs(g - cfg.elbow_gain_threshold) <= cfg.elbow_prune_margin) {
+                lo = std::min(lo, stage_a_selection.trace[i].k);
+                hi = std::max(hi, stage_a_selection.trace[i].k + 1);
+            }
+        }
+        const std::size_t guard = std::max<std::size_t>(2, stage_a_grid.size() / 20);
+        lo = (lo > guard) ? (lo - guard) : stage_a_grid.front();
+        hi = std::min(stage_a_grid.back(), hi + guard);
+        stage_b_grid.clear();
+        for (std::size_t k : grid) {
+            if (k >= lo && k <= hi) {
+                stage_b_grid.push_back(k);
+            }
+        }
+        if (stage_b_grid.size() < 2) {
+            stage_b_grid = grid;
+        }
+    }
 
     std::size_t stage_b_eval_count = 0;
     std::string stage_b_early_reason;
     ElbowSelection stage_b_selection;
     KMeansModel stage_b_model;
     if (const Status s = run_elbow(
-            vectors,
-            vectors_row_major,
+            stage_b_vectors,
+            stage_b_vectors_row_major,
             stage_b_grid,
             cfg,
+            cfg.elbow_int8_search_enabled,
+            cfg.elbow_trace_full_grid,
             &stage_b_eval_count,
             &stage_b_early_reason,
             &stage_b_model,
             &stage_b_selection);
         !s.ok) {
         return s;
+    }
+    if (cfg.elbow_int8_search_enabled) {
+        KMeansModel fp16_refit;
+        const Status s = run_kmeans_impl(
+            vectors,
+            vectors_row_major,
+            stage_b_selection.chosen_k,
+            cfg,
+            cfg.seed + static_cast<std::uint32_t>(stage_b_selection.chosen_k) + 17000U,
+            cfg.iters,
+            CudaScorePrecision::FP16,
+            &fp16_refit);
+        if (!s.ok) {
+            return s;
+        }
+        stage_b_model = std::move(fp16_refit);
     }
 
     *out_best_model = std::move(stage_b_model);
@@ -524,12 +596,24 @@ Status select_k_binary_elbow_packed(
         ? cfg.elbow_stage_a_approx_stride
         : 1;
     out_selection->stage_a_approx_dim = stage_a_vectors.empty() ? 0 : stage_a_vectors.front().size();
+    out_selection->stage_b_pruned_candidates = stage_b_grid.size();
+    out_selection->stage_b_window_k_min = stage_b_grid.empty() ? 0 : stage_b_grid.front();
+    out_selection->stage_b_window_k_max = stage_b_grid.empty() ? 0 : stage_b_grid.back();
+    out_selection->stage_b_prune_reason = cfg.elbow_prune_enabled ? "stage_a_gain_window" : "disabled";
+    out_selection->int8_search_enabled = cfg.elbow_int8_search_enabled;
+    out_selection->int8_eval_count = cfg.elbow_int8_search_enabled
+        ? (stage_a_eval_count + stage_b_eval_count)
+        : 0;
+    out_selection->int8_tensor_core_used =
+        cfg.elbow_int8_search_enabled
+        && (out_best_model->tensor_core_enabled || stage_a_model.tensor_core_enabled);
     return Status::Ok();
 }
 
 #ifndef VECTOR_DB_USE_CUDA
 bool cuda_dot_products_available() { return false; }
 bool cuda_assignment_kernels_available() { return false; }
+bool cuda_int8_dot_products_available() { return false; }
 Status cuda_compute_dot_products(
     const std::vector<float>&,
     const std::vector<float>&,
@@ -538,7 +622,8 @@ Status cuda_compute_dot_products(
     std::size_t,
     std::vector<float>*,
     bool* out_tensor_core_enabled,
-    std::string* out_backend_name) {
+    std::string* out_backend_name,
+    CudaScorePrecision) {
     if (out_tensor_core_enabled != nullptr) {
         *out_tensor_core_enabled = false;
     }
@@ -575,7 +660,8 @@ Status cuda_kmeans_iteration_top1(
     std::vector<float>*,
     bool* out_tensor_core_enabled,
     std::string* out_backend_name,
-    double* out_scoring_ms) {
+    double* out_scoring_ms,
+    CudaScorePrecision) {
     if (out_tensor_core_enabled != nullptr) {
         *out_tensor_core_enabled = false;
     }
@@ -598,7 +684,8 @@ Status cuda_topm_from_centroids(
     std::vector<float>*,
     bool* out_tensor_core_enabled,
     std::string* out_backend_name,
-    double* out_scoring_ms) {
+    double* out_scoring_ms,
+    CudaScorePrecision) {
     if (out_tensor_core_enabled != nullptr) {
         *out_tensor_core_enabled = false;
     }

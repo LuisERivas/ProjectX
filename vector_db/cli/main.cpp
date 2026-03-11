@@ -556,7 +556,18 @@ int main(int argc, char** argv) {
                   << "  \"elbow_stage_a_approx_enabled\": "
                   << (st.elbow_stage_a_approx_enabled ? "true" : "false") << ",\n"
                   << "  \"elbow_stage_a_approx_dim\": " << st.elbow_stage_a_approx_dim << ",\n"
-                  << "  \"elbow_stage_a_approx_stride\": " << st.elbow_stage_a_approx_stride << "\n"
+                  << "  \"elbow_stage_a_approx_stride\": " << st.elbow_stage_a_approx_stride << ",\n"
+                  << "  \"elbow_stage_b_pruned_candidates\": " << st.elbow_stage_b_pruned_candidates << ",\n"
+                  << "  \"elbow_stage_b_window_k_min\": " << st.elbow_stage_b_window_k_min << ",\n"
+                  << "  \"elbow_stage_b_window_k_max\": " << st.elbow_stage_b_window_k_max << ",\n"
+                  << "  \"elbow_stage_b_prune_reason\": \"" << st.elbow_stage_b_prune_reason << "\",\n"
+                  << "  \"elbow_int8_search_enabled\": "
+                  << (st.elbow_int8_search_enabled ? "true" : "false") << ",\n"
+                  << "  \"elbow_int8_tensor_core_used\": "
+                  << (st.elbow_int8_tensor_core_used ? "true" : "false") << ",\n"
+                  << "  \"elbow_int8_eval_count\": " << st.elbow_int8_eval_count << ",\n"
+                  << "  \"elbow_int8_scale_mode\": \"" << st.elbow_int8_scale_mode << "\",\n"
+                  << "  \"elbow_scoring_precision\": \"" << st.elbow_scoring_precision << "\"\n"
                   << "}\n";
         return 0;
     }
