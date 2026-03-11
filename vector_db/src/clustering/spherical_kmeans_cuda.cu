@@ -16,6 +16,10 @@ namespace vector_db {
 
 namespace {
 
+std::string cuda_error_string(cudaError_t st) {
+    return std::string(cudaGetErrorName(st)) + ": " + cudaGetErrorString(st);
+}
+
 __global__ void assign_top1_kernel(
     const float* scores,
     float* out_scores,
@@ -276,18 +280,19 @@ Status ensure_cache(
     const std::size_t partial_sums_bytes = n_blocks * k_centroids * dim * sizeof(float);
     const std::size_t partial_counts_bytes = n_blocks * k_centroids * sizeof(std::uint32_t);
     const std::size_t centroids_bytes = k_centroids * dim * sizeof(float);
-    if (cudaMalloc(reinterpret_cast<void**>(&c.d_vectors_fp16), vectors_fp16_bytes) != cudaSuccess
-        || cudaMalloc(reinterpret_cast<void**>(&c.d_centroids_fp16), centroids_fp16_bytes) != cudaSuccess
-        || cudaMalloc(reinterpret_cast<void**>(&c.d_scores), scores_bytes) != cudaSuccess
-        || cudaMalloc(reinterpret_cast<void**>(&c.d_vectors_fp32), vectors_fp32_bytes) != cudaSuccess
-        || cudaMalloc(reinterpret_cast<void**>(&c.d_labels), labels_bytes) != cudaSuccess
-        || cudaMalloc(reinterpret_cast<void**>(&c.d_best_scores), best_scores_bytes) != cudaSuccess
-        || cudaMalloc(reinterpret_cast<void**>(&c.d_topm), topm_bytes) != cudaSuccess
-        || cudaMalloc(reinterpret_cast<void**>(&c.d_partial_sums), partial_sums_bytes) != cudaSuccess
-        || cudaMalloc(reinterpret_cast<void**>(&c.d_partial_counts), partial_counts_bytes) != cudaSuccess
-        || cudaMalloc(reinterpret_cast<void**>(&c.d_centroids), centroids_bytes) != cudaSuccess) {
+    cudaError_t alloc_status = cudaSuccess;
+    if ((alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_vectors_fp16), vectors_fp16_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_centroids_fp16), centroids_fp16_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_scores), scores_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_vectors_fp32), vectors_fp32_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_labels), labels_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_best_scores), best_scores_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_topm), topm_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_partial_sums), partial_sums_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_partial_counts), partial_counts_bytes)) != cudaSuccess
+        || (alloc_status = cudaMalloc(reinterpret_cast<void**>(&c.d_centroids), centroids_bytes)) != cudaSuccess) {
         free_cache_buffers(c);
-        return Status::Error("cudaMalloc failed while creating cache");
+        return Status::Error("cudaMalloc failed while creating cache: " + cuda_error_string(alloc_status));
     }
     if (cudaMalloc(&c.workspace, c.workspace_bytes) != cudaSuccess) {
         c.workspace = nullptr;
@@ -451,8 +456,8 @@ Status reduce_centroids_from_device_labels(
         n_vectors,
         k_centroids,
         dim);
-    if (cudaGetLastError() != cudaSuccess) {
-        return Status::Error("reduce_centroids_partial kernel launch failed");
+    if (const cudaError_t st = cudaGetLastError(); st != cudaSuccess) {
+        return Status::Error("reduce_centroids_partial kernel launch failed: " + cuda_error_string(st));
     }
 
     finalize_partial_centroids_kernel<<<static_cast<int>(k_centroids), static_cast<int>(dim)>>>(
@@ -463,8 +468,8 @@ Status reduce_centroids_from_device_labels(
         n_blocks,
         k_centroids,
         dim);
-    if (cudaGetLastError() != cudaSuccess) {
-        return Status::Error("finalize_partial_centroids kernel launch failed");
+    if (const cudaError_t st = cudaGetLastError(); st != cudaSuccess) {
+        return Status::Error("finalize_partial_centroids kernel launch failed: " + cuda_error_string(st));
     }
 
     normalize_centroids_kernel<<<static_cast<int>((k_centroids + static_cast<std::size_t>(threads) - 1U) / static_cast<std::size_t>(threads)), threads>>>(
@@ -472,8 +477,8 @@ Status reduce_centroids_from_device_labels(
         reinterpret_cast<std::uint32_t*>(c.d_best_scores),
         k_centroids,
         dim);
-    if (cudaGetLastError() != cudaSuccess) {
-        return Status::Error("normalize_centroids kernel launch failed");
+    if (const cudaError_t st = cudaGetLastError(); st != cudaSuccess) {
+        return Status::Error("normalize_centroids kernel launch failed: " + cuda_error_string(st));
     }
     return Status::Ok();
 }
@@ -557,8 +562,8 @@ Status cuda_assign_top1_labels(
     const std::size_t l_bytes = n_vectors * sizeof(std::uint32_t);
     cudaMemcpy(cache.d_scores, scores_row_major.data(), s_bytes, cudaMemcpyHostToDevice);
     assign_top1_kernel<<<static_cast<int>(n_blocks), threads>>>(cache.d_scores, cache.d_best_scores, cache.d_labels, n_vectors, k_centroids);
-    if (cudaGetLastError() != cudaSuccess) {
-        return Status::Error("assign_top1 kernel launch failed");
+    if (const cudaError_t st = cudaGetLastError(); st != cudaSuccess) {
+        return Status::Error("assign_top1 kernel launch failed: " + cuda_error_string(st));
     }
     cudaDeviceSynchronize();
     cudaMemcpy(out_best_scores->data(), cache.d_best_scores, v_bytes, cudaMemcpyDeviceToHost);
@@ -641,8 +646,8 @@ Status cuda_kmeans_iteration_top1(
         cache.d_labels,
         n_vectors,
         k_centroids);
-    if (cudaGetLastError() != cudaSuccess) {
-        return Status::Error("assign_top1 kernel launch failed");
+    if (const cudaError_t st = cudaGetLastError(); st != cudaSuccess) {
+        return Status::Error("assign_top1 kernel launch failed: " + cuda_error_string(st));
     }
     if (const Status s = reduce_centroids_from_device_labels(cache, n_vectors, k_centroids, dim, n_blocks); !s.ok) {
         return s;
@@ -704,8 +709,8 @@ Status cuda_topm_from_centroids(
         n_vectors,
         k_centroids,
         std::max<std::size_t>(top_m, 1));
-    if (cudaGetLastError() != cudaSuccess) {
-        return Status::Error("assign_topm kernel launch failed");
+    if (const cudaError_t st = cudaGetLastError(); st != cudaSuccess) {
+        return Status::Error("assign_topm kernel launch failed: " + cuda_error_string(st));
     }
     cudaDeviceSynchronize();
     out_scores_row_major->assign(n_vectors * k_centroids, 0.0f);

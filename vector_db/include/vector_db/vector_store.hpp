@@ -85,6 +85,7 @@ public:
     Status close();
 
     Status insert(std::uint64_t id, const std::vector<float>& vector_fp32_1024, const std::string& metadata_json, bool upsert = false);
+    Status insert_batch(const std::vector<Record>& records);
     Status remove(std::uint64_t id);
     Status update_metadata(std::uint64_t id, const std::string& patch_json);
     std::optional<StoredRecord> get(std::uint64_t id) const;

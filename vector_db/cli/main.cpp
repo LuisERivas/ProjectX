@@ -258,6 +258,9 @@ int main(int argc, char** argv) {
         std::string line;
         std::size_t line_no = 0;
         std::size_t inserted = 0;
+        constexpr std::size_t kBatchRows = 512;
+        std::vector<vector_db::Record> batch;
+        batch.reserve(kBatchRows);
         std::cout << "progress: bulk insert started\n";
         while (std::getline(in, line)) {
             ++line_no;
@@ -276,15 +279,27 @@ int main(int argc, char** argv) {
                 std::cerr << "error: invalid 1024-d vector at line " << line_no << "\n";
                 return 1;
             }
-            const auto s = store.insert(*id, *vec, *meta_json);
-            if (!s.ok) {
-                std::cerr << "error: insert failed at line " << line_no << ": " << s.message << "\n";
-                return 1;
+            batch.push_back(vector_db::Record{*id, std::move(*vec), *meta_json});
+            if (batch.size() >= kBatchRows) {
+                const auto s = store.insert_batch(batch);
+                if (!s.ok) {
+                    std::cerr << "error: insert_batch failed at line " << line_no << ": " << s.message << "\n";
+                    return 1;
+                }
+                inserted += batch.size();
+                batch.clear();
             }
-            ++inserted;
-            if (inserted % 500 == 0) {
+            if (inserted > 0 && inserted % 500 == 0) {
                 std::cout << "progress: inserted " << inserted << " rows\n";
             }
+        }
+        if (!batch.empty()) {
+            const auto s = store.insert_batch(batch);
+            if (!s.ok) {
+                std::cerr << "error: insert_batch failed at final flush: " << s.message << "\n";
+                return 1;
+            }
+            inserted += batch.size();
         }
         std::cout << "ok: bulk inserted rows=" << inserted << "\n";
         return 0;
@@ -342,6 +357,9 @@ int main(int argc, char** argv) {
         }
         std::vector<float> row(vector_db::kVectorDim, 0.0f);
         std::size_t inserted = 0;
+        constexpr std::size_t kBatchRows = 1024;
+        std::vector<vector_db::Record> batch;
+        batch.reserve(kBatchRows);
         std::cout << "progress: binary bulk insert started\n";
         for (std::size_t i = 0; i < ids.size(); ++i) {
             vec_in.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row_bytes));
@@ -349,15 +367,27 @@ int main(int argc, char** argv) {
                 std::cerr << "error: failed reading vector row " << i << "\n";
                 return 1;
             }
-            const auto s = store.insert(ids[i], row, metas[i]);
-            if (!s.ok) {
-                std::cerr << "error: insert failed at row " << i << ": " << s.message << "\n";
-                return 1;
+            batch.push_back(vector_db::Record{ids[i], row, metas[i]});
+            if (batch.size() >= kBatchRows) {
+                const auto s = store.insert_batch(batch);
+                if (!s.ok) {
+                    std::cerr << "error: insert_batch failed at row " << i << ": " << s.message << "\n";
+                    return 1;
+                }
+                inserted += batch.size();
+                batch.clear();
             }
-            ++inserted;
-            if (inserted % 1000 == 0) {
+            if (inserted > 0 && inserted % 1000 == 0) {
                 std::cout << "progress: inserted " << inserted << " rows\n";
             }
+        }
+        if (!batch.empty()) {
+            const auto s = store.insert_batch(batch);
+            if (!s.ok) {
+                std::cerr << "error: insert_batch failed at final flush: " << s.message << "\n";
+                return 1;
+            }
+            inserted += batch.size();
         }
         std::cout << "ok: binary bulk inserted rows=" << inserted << "\n";
         return 0;

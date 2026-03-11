@@ -231,7 +231,8 @@ These commands validate the Vector DB Phase 3 flow (CMake build, CTest, dataset 
 
 ### 12.1 Prerequisites
 
-- Build toolchain installed and available in PATH (`g++`, `cmake`, `ctest`, `nvcc` when CUDA build is desired).
+- Build toolchain installed and available in PATH (`g++`, `cmake`, `ctest`, `nvcc`).
+- CUDA-capable runtime is required for `build-initial-clusters`; clustering now fails fast with an explicit error instead of CPU fallback when CUDA/tensor-core execution is unavailable.
 - Python available for helper scripts.
 - Run from project root unless noted otherwise.
 

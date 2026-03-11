@@ -77,6 +77,13 @@ Status fit_spherical_kmeans(
     const InitialClusteringConfig& cfg,
     std::uint32_t seed,
     KMeansModel* out_model);
+Status fit_spherical_kmeans_packed(
+    const std::vector<std::vector<float>>& vectors,
+    const std::vector<float>& vectors_row_major,
+    std::size_t k,
+    const InitialClusteringConfig& cfg,
+    std::uint32_t seed,
+    KMeansModel* out_model);
 
 Status select_k_binary_elbow(
     const std::vector<std::vector<float>>& vectors,

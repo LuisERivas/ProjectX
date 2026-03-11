@@ -353,6 +353,18 @@ struct VectorStore::Impl {
     }
 
     void record_dirty(std::size_t row, const std::string& reason) {
+        if (!dirty_ranges.empty()) {
+            DirtyRange& last = dirty_ranges.back();
+            if (last.segment_id == active_segment_id
+                && last.reason == reason
+                && row >= last.start_row
+                && row <= (last.end_row + 1)) {
+                if (row > last.end_row) {
+                    last.end_row = row;
+                }
+                return;
+            }
+        }
         dirty_ranges.push_back(DirtyRange{
             active_segment_id,
             row,
@@ -417,6 +429,30 @@ struct VectorStore::Impl {
             << "}\n";
         if (!out.good()) {
             return Status::Error("failed appending wal insert");
+        }
+        return Status::Ok();
+    }
+
+    Status append_wal_insert_batch(const std::vector<Record>& records) {
+        if (records.empty()) {
+            return Status::Ok();
+        }
+        std::ofstream out(wal_path(), std::ios::binary | std::ios::app);
+        if (!out) {
+            return Status::Error("failed opening wal for batch insert");
+        }
+        for (const auto& rec : records) {
+            const std::uint64_t lsn = next_lsn();
+            out << "{\"lsn\":" << lsn
+                << ",\"op\":\"INSERT\""
+                << ",\"id\":" << rec.id
+                << ",\"metadata\":\"" << json_escape(rec.metadata_json) << "\""
+                << ",\"vector\":\"" << json_escape(encode_vector_csv(rec.vector_fp32)) << "\""
+                << ",\"ts_ms\":" << now_ms()
+                << "}\n";
+            if (!out.good()) {
+                return Status::Error("failed appending wal batch insert");
+            }
         }
         return Status::Ok();
     }
@@ -732,15 +768,41 @@ struct VectorStore::Impl {
     std::vector<std::pair<std::uint64_t, std::vector<float>>> collect_live_vectors() const {
         std::vector<std::pair<std::uint64_t, std::vector<float>>> out;
         out.reserve(entries.size());
+        std::vector<std::pair<std::size_t, std::uint64_t>> live_rows;
+        live_rows.reserve(entries.size());
         for (const auto& kv : entries) {
-            if (kv.second.deleted) {
+            if (!kv.second.deleted) {
+                live_rows.push_back({kv.second.row, kv.first});
+            }
+        }
+        if (live_rows.empty()) {
+            return out;
+        }
+        std::sort(live_rows.begin(), live_rows.end(), [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
+
+        std::ifstream vec_in(seg_vec(active_segment_id), std::ios::binary);
+        if (!vec_in) {
+            return out;
+        }
+
+        std::vector<float> buf(kVectorDim, 0.0f);
+        for (const auto& [row, id] : live_rows) {
+            const std::uint64_t byte_off =
+                static_cast<std::uint64_t>(row) * static_cast<std::uint64_t>(kVectorDim) * sizeof(float);
+            vec_in.seekg(static_cast<std::streamoff>(byte_off), std::ios::beg);
+            if (!vec_in.good()) {
                 continue;
             }
-            const auto vec = read_vector_at_row(kv.second.row);
-            if (!vec.has_value()) {
+            vec_in.read(
+                reinterpret_cast<char*>(buf.data()),
+                static_cast<std::streamsize>(kVectorDim * sizeof(float)));
+            if (!vec_in.good()) {
+                vec_in.clear();
                 continue;
             }
-            out.push_back({kv.first, *vec});
+            out.push_back({id, buf});
         }
         std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
             return a.first < b.first;
@@ -1346,6 +1408,50 @@ Status VectorStore::insert(std::uint64_t id, const std::vector<float>& vector_fp
         impl_->replay_mode ? "replay_insert" : (upsert ? "upsert" : "insert"));
     if (!applied.ok) {
         return applied;
+    }
+    return flush();
+}
+
+Status VectorStore::insert_batch(const std::vector<Record>& records) {
+    if (records.empty()) {
+        return Status::Ok();
+    }
+    if (!impl_->opened) {
+        if (const Status s = open(); !s.ok) {
+            return s;
+        }
+    }
+    std::unordered_set<std::uint64_t> seen_ids;
+    seen_ids.reserve(records.size());
+    for (const auto& rec : records) {
+        if (rec.vector_fp32.size() != kVectorDim) {
+            return Status::Error("vector dimension must be exactly 1024");
+        }
+        if (!looks_like_json(rec.metadata_json)) {
+            return Status::Error("metadata_json must be a JSON object/array string");
+        }
+        if (!seen_ids.insert(rec.id).second) {
+            return Status::Error("duplicate id detected within insert_batch payload");
+        }
+        if (impl_->entries.find(rec.id) != impl_->entries.end() && !impl_->replay_mode) {
+            return Status::Error("duplicate id rejected");
+        }
+    }
+    if (!impl_->replay_mode) {
+        if (const Status s = impl_->append_wal_insert_batch(records); !s.ok) {
+            return s;
+        }
+    }
+    for (const auto& rec : records) {
+        const Status applied = impl_->apply_insert_internal(
+            rec.id,
+            rec.vector_fp32,
+            rec.metadata_json,
+            false,
+            impl_->replay_mode ? "replay_insert" : "insert_batch");
+        if (!applied.ok) {
+            return applied;
+        }
     }
     return flush();
 }

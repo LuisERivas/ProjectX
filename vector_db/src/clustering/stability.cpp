@@ -11,6 +11,7 @@
 namespace vector_db {
 
 namespace {
+constexpr std::size_t kDim = 1024;
 
 double entropy(const std::unordered_map<std::uint32_t, std::size_t>& counts, std::size_t n) {
     if (n == 0) {
@@ -124,11 +125,22 @@ Status evaluate_stability(
     if (cfg.stability_runs < 2) {
         return Status::Error("stability requires at least 2 runs");
     }
+    std::vector<float> vectors_row_major;
+    vectors_row_major.reserve(vectors.size() * kDim);
+    for (const auto& v : vectors) {
+        vectors_row_major.insert(vectors_row_major.end(), v.begin(), v.end());
+    }
     std::vector<KMeansModel> models;
     models.reserve(cfg.stability_runs);
     for (std::size_t r = 0; r < cfg.stability_runs; ++r) {
         KMeansModel model;
-        const Status s = fit_spherical_kmeans(vectors, chosen_k, cfg, cfg.seed + 1000U + static_cast<std::uint32_t>(r), &model);
+        const Status s = fit_spherical_kmeans_packed(
+            vectors,
+            vectors_row_major,
+            chosen_k,
+            cfg,
+            cfg.seed + 1000U + static_cast<std::uint32_t>(r),
+            &model);
         if (!s.ok) {
             return s;
         }
