@@ -32,6 +32,15 @@ def count_jsonl_rows(path: Path) -> int:
     return count
 
 
+def require_keys(obj: dict[str, object], required: list[str], context: str) -> None:
+    missing = [k for k in required if k not in obj]
+    if missing:
+        raise RuntimeError(
+            f"{context} is missing expected keys: {missing}. "
+            "This usually means the CLI binary is stale; rebuild vectordb_cli and retry."
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Profile vectordb_cli smoke flow timing.")
     parser.add_argument("--data-dir", default="smoke_data_profile", help="Data directory for this profile run.")
@@ -123,29 +132,35 @@ def main() -> int:
     assert cluster_stats["available"] is True
     assert cluster_stats["chosen_k"] >= cluster_stats["k_min"]
     assert cluster_stats["chosen_k"] <= cluster_stats["k_max"]
-    assert "gpu_backend" in cluster_stats
-    assert "tensor_core_enabled" in cluster_stats
-    assert "scoring_ms_total" in cluster_stats
-    assert "scoring_calls" in cluster_stats
-    assert "elbow_k_evaluated_count" in cluster_stats
-    assert "elbow_stage_a_candidates" in cluster_stats
-    assert "elbow_stage_b_candidates" in cluster_stats
-    assert "elbow_early_stop_reason" in cluster_stats
-    assert "stability_runs_executed" in cluster_stats
-    assert "load_live_vectors_ms" in cluster_stats
-    assert "id_estimation_ms" in cluster_stats
-    assert "elbow_ms" in cluster_stats
-    assert "stability_ms" in cluster_stats
-    assert "write_artifacts_ms" in cluster_stats
-    assert "total_build_ms" in cluster_stats
-    assert "live_vector_bytes_read" in cluster_stats
-    assert "live_vector_contiguous_spans" in cluster_stats
-    assert "live_vector_sparse_reads" in cluster_stats
-    assert "live_vector_sparse_fallback" in cluster_stats
-    assert "live_vector_async_double_buffer" in cluster_stats
-    assert "elbow_stage_a_approx_enabled" in cluster_stats
-    assert "elbow_stage_a_approx_dim" in cluster_stats
-    assert "elbow_stage_a_approx_stride" in cluster_stats
+    require_keys(
+        cluster_stats,
+        [
+            "gpu_backend",
+            "tensor_core_enabled",
+            "scoring_ms_total",
+            "scoring_calls",
+            "elbow_k_evaluated_count",
+            "elbow_stage_a_candidates",
+            "elbow_stage_b_candidates",
+            "elbow_early_stop_reason",
+            "stability_runs_executed",
+            "load_live_vectors_ms",
+            "id_estimation_ms",
+            "elbow_ms",
+            "stability_ms",
+            "write_artifacts_ms",
+            "total_build_ms",
+            "live_vector_bytes_read",
+            "live_vector_contiguous_spans",
+            "live_vector_sparse_reads",
+            "live_vector_sparse_fallback",
+            "live_vector_async_double_buffer",
+            "elbow_stage_a_approx_enabled",
+            "elbow_stage_a_approx_dim",
+            "elbow_stage_a_approx_stride",
+        ],
+        "cluster-stats output",
+    )
     assert cluster_stats["elbow_stage_b_candidates"] >= 2
     assert cluster_stats["elbow_stage_b_candidates"] >= cluster_stats["elbow_stage_a_candidates"]
     assert cluster_stats["elbow_k_evaluated_count"] >= cluster_stats["elbow_stage_b_candidates"]
