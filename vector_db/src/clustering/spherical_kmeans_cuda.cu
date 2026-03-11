@@ -5,6 +5,7 @@
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cfloat>
 
 #include <algorithm>
 #include <chrono>
@@ -51,7 +52,7 @@ __global__ void assign_topm_kernel(
     }
     const float* row = scores + i * k_centroids;
     for (std::size_t m = 0; m < top_m; ++m) {
-        float best_score = -CUDART_INF_F;
+        float best_score = -FLT_MAX;
         std::uint32_t best_idx = 0U;
         for (std::size_t c = 0; c < k_centroids; ++c) {
             const float s = row[c];
