@@ -2267,6 +2267,16 @@ Status VectorStore::build_second_level_clusters(
                 "second-level id estimation failed for centroid "
                 + std::to_string(centroid_id) + ": " + s.message);
         }
+        // Keep elbow k-grid valid for this centroid subset.
+        const std::size_t n_vectors = vectors.size();
+        if (n_vectors < 2) {
+            summary.processed = false;
+            summary.skipped_reason = "too_few_vectors_for_elbow";
+            summaries.push_back(std::move(summary));
+            continue;
+        }
+        idr.k_max = std::max<std::size_t>(2, std::min<std::size_t>(idr.k_max, n_vectors));
+        idr.k_min = std::max<std::size_t>(1, std::min<std::size_t>(idr.k_min, idr.k_max - 1));
         const auto t_id_end = std::chrono::steady_clock::now();
 
         KMeansModel model;

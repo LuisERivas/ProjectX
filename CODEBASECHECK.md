@@ -1,14 +1,14 @@
 # CODEBASE Check Report
 
 - **Root folder:** `ProjectX/`
-- **Last checked:** `2026-03-10 15:59:01 -07:00`
+- **Last checked:** `2026-03-11 20:31:45 -07:00`
 - **Checker:** `codebase-check`
 
 ## Summary
 
-- Files scanned: `93`
-- Findings: `5`
-- High: `2`
+- Files scanned: `96`
+- Findings: `4`
+- High: `1`
 - Medium: `2`
 - Low: `1`
 - Status: `NEEDS_UPDATE`
@@ -16,40 +16,35 @@
 ## Findings (By Severity)
 
 ### HIGH
-- Unbounded retry risk on job timeout can keep messages pending and repeatedly reclaimed.
-  - **Paths:** `worker/worker_main.py`, `worker/communications_worker_main.py`, `contract/worker/contract_client.py`
-  - **Why it matters:** timeout-wrapped execution paths are not consistently terminalized/acked, which can cause replay loops, queue churn, and reliability degradation.
-  - **Recommended fix:** explicitly handle timeout at `_process_one_with_timeout` call sites and force deterministic terminal handling (`finalize_error` plus ACK path, with optional DLQ tagging).
-
-- Malformed queue message poison handling lacks guaranteed quarantine+ack path.
-  - **Paths:** `contract/worker/contract_client.py`, `contract/shared/schema.py`, `worker/worker_main.py`, `worker/communications_worker_main.py`
-  - **Why it matters:** validation failures at envelope conversion can re-enter processing/recovery loops instead of being safely isolated, risking repeated failures.
-  - **Recommended fix:** add a poison-message path at dequeue/envelope boundary that captures raw payload, writes to DLQ, and ACKs safely.
+- Communications worker does not implement cooperative cancellation checks before side effects.
+  - **Paths:** `worker/communications_worker_main.py`, `worker/worker_main.py`, `README.md`
+  - **Why it matters:** canceled jobs can still write `communications:text` during race windows, violating documented cooperative-cancel semantics and causing surprising state changes.
+  - **Recommended fix:** add `is_canceled(job_id)` checks in communications worker before mutating Redis and before finalization, mirroring `worker/worker_main.py`.
 
 ### MEDIUM
-- Worker runtime resilience differs between main and communications workers due to duplicated orchestration.
-  - **Paths:** `worker/worker_main.py`, `worker/communications_worker_main.py`
-  - **Why it matters:** one worker loop includes stronger transient exception containment/backoff behavior, while the other can exit on runtime exceptions, creating operational drift.
-  - **Recommended fix:** extract shared worker loop/recovery orchestration into a common module and apply one exception/retry contract to both workers.
-
-- Testing documentation claims exceed what the remote runner verifies for communications flow.
+- Ops guidance drift: remote testing helper omits checks required by `TESTING.md`.
   - **Paths:** `TESTING.md`, `scripts/run_testing_md_remote.py`
-  - **Why it matters:** mismatch between documented validation scope and actual automation can produce false confidence in communications readiness.
-  - **Recommended fix:** either expand `run_testing_md_remote.py` to include communications checks or narrow `TESTING.md` claims to match current runner coverage.
+  - **Why it matters:** operators can pass the helper while skipping required checks (communications-worker status and CUDA toolchain validation), reducing confidence in readiness.
+  - **Recommended fix:** align `run_testing_md_remote.py` output with `TESTING.md` prerequisites/manual follow-ups or explicitly scope the helper in docs.
+
+- Vector DB smoke validation logic is duplicated across multiple scripts.
+  - **Paths:** `vector_db/tests/smoke_cli.py`, `vector_db/tests/smoke_cli_profile.py`, `scripts/test_vector_db_combined.py`
+  - **Why it matters:** duplicated sequences/assertions can drift, creating conflicting pass/fail behavior between smoke paths.
+  - **Recommended fix:** extract shared smoke/assert helpers and reuse them across scripts.
 
 ### LOW
-- Stale architecture document omits active communications topology.
-  - **Paths:** `docs/treeArchitecture`, `README.md`, `worker/communications_worker_main.py`, `contract/shared/config.py`
-  - **Why it matters:** onboarding and operations decisions may follow outdated system topology and miss communications components.
-  - **Recommended fix:** update `docs/treeArchitecture` to include `redis-communications-worker.service`, `jobs:communications:stream`, and `communications-workers`.
+- Minor setup wording inconsistency around service count.
+  - **Paths:** `SETUP.md`
+  - **Why it matters:** docs state the setup script "starts both services" while it provisions/starts three services, which can confuse first-time operators.
+  - **Recommended fix:** update wording to "starts all three services."
 
 ## Validation Gaps
-- No automated test proving timeout behavior (`JOB_TIMEOUT_S`) always terminalizes and ACKs.
-- No automated poison-message test asserting malformed queue payloads are DLQ'd and ACK'd.
-- No test ensuring communications worker loop survives transient Redis/read exceptions.
-- No automated backpressure test at gateway backlog threshold.
+- No dedicated automated test for communications-worker cancel race semantics (side-effect suppression + terminal consistency).
+- No automated test validating gateway backpressure interactions across both queue streams.
+- No focused integration test for crash/reclaim edge cases in worker `XAUTOCLAIM` recovery loops.
+- No automated guard that setup-generated systemd unit expectations remain synchronized with `SETUP.md` and `TESTING.md`.
 
 ## Recommended Next Steps
-1. Implement deterministic timeout and poison-message handling with guaranteed ACK semantics.
-2. Deduplicate worker orchestration into shared runtime loop logic to remove resilience drift.
-3. Add targeted integration tests (timeout, poison, communications resilience, backpressure), then rerun `codebase-check`.
+1. Add cooperative-cancel checks to `worker/communications_worker_main.py` and cover with tests.
+2. Align test-ops documentation and helper output so gateway readiness checks are consistent.
+3. Run `scripts/run_testing_md_remote.py` and the communications client flow after gateway reachability is restored.
