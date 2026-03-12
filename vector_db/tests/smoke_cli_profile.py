@@ -180,6 +180,21 @@ def main() -> int:
     assert cluster_health["available"] is True
     assert (data_dir / "clusters" / "initial" / "cluster_manifest.json").exists()
 
+    do(
+        "build second-level clusters",
+        [str(cli), "build-second-level-clusters", "--path", str(data_dir), "--seed", str(args.seed)],
+    )
+    second_level_doc = data_dir / "clusters" / "initial" / f"v{cluster_stats['version']}" / "second_level_clustering" / "SECOND_LEVEL_CLUSTERING.json"
+    assert second_level_doc.exists()
+    second_level = json.loads(second_level_doc.read_text(encoding="utf-8"))
+    assert second_level["processed_centroids"] + second_level["skipped_centroids"] == second_level["total_parent_centroids"]
+    if second_level["processed_centroids"] > 0:
+        first_processed = next(c for c in second_level["centroids"] if c["processed"] is True)
+        assert "used_cuda" in first_processed
+        assert "tensor_core_enabled" in first_processed
+        assert "elbow_int8_search_enabled" in first_processed
+        assert "elbow_scoring_precision" in first_processed
+
     get_after_restart = do("restart check get row 100", [str(cli), "get", "--path", str(data_dir), "--id", "100"])
     assert '"deleted": true' in get_after_restart
     stats_after_restart = json.loads(do("restart check stats", [str(cli), "stats", "--path", str(data_dir)]))

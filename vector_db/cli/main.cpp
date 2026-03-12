@@ -180,6 +180,7 @@ void print_usage() {
               << "  bulk-insert --path <data_dir> --input <insert_payloads.jsonl>\n"
               << "  bulk-insert-bin --path <data_dir> --vectors <vectors.fp32bin> --ids <ids.u64bin> --meta <meta.jsonl>\n"
               << "  build-initial-clusters --path <data_dir> [--seed <u32>]\n"
+              << "  build-second-level-clusters --path <data_dir> [--seed <u32>] [--source-version <u64>]\n"
               << "  cluster-stats --path <data_dir>\n"
               << "  cluster-health --path <data_dir>\n";
 }
@@ -513,6 +514,27 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cout << "ok: initial clusters built\n";
+        return 0;
+    }
+
+    if (command == "build-second-level-clusters") {
+        if (!open_or_fail()) {
+            return 1;
+        }
+        const std::string seed_str = get_arg(args, "--seed", "1234");
+        const std::string source_version_str = get_arg(args, "--source-version");
+        std::optional<std::uint64_t> source_version;
+        if (!source_version_str.empty()) {
+            source_version = static_cast<std::uint64_t>(std::stoull(source_version_str));
+        }
+        const auto s = store.build_second_level_clusters(
+            static_cast<std::uint32_t>(std::stoul(seed_str)),
+            source_version);
+        if (!s.ok) {
+            std::cerr << "error: " << s.message << "\n";
+            return 1;
+        }
+        std::cout << "ok: second-level clusters built\n";
         return 0;
     }
 

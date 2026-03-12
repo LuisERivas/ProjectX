@@ -110,6 +110,9 @@ public:
     Status flush();
     Status checkpoint();
     Status build_initial_clusters(std::uint32_t seed = 1234);
+    Status build_second_level_clusters(
+        std::uint32_t seed = 1234,
+        std::optional<std::uint64_t> source_version = std::nullopt);
     Status close();
 
     Status insert(std::uint64_t id, const std::vector<float>& vector_fp32_1024, const std::string& metadata_json, bool upsert = false);

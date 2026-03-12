@@ -300,6 +300,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-normalize", action="store_true", help="Disable L2 normalization in generation.")
     parser.add_argument("--gpu-generate", action="store_true", help="Attempt CuPy-backed generation.")
     parser.add_argument("--dataset-out", default="vector_db/synthetic_dataset_10k_fp16", help="Synthetic dataset output directory.")
+    parser.add_argument(
+        "--run-second-level",
+        action="store_true",
+        help="Run scripts/test_vector_db_second_level.py after combined smoke flow.",
+    )
+    parser.add_argument(
+        "--second-level-report",
+        default="vector_db/second_level_test_report.json",
+        help="JSON report path passed to second-level validation script.",
+    )
     return parser.parse_args()
 
 
@@ -322,6 +332,9 @@ def main() -> int:
     dataset_out = Path(args.dataset_out)
     if not dataset_out.is_absolute():
         dataset_out = root / dataset_out
+    second_level_report = Path(args.second_level_report)
+    if not second_level_report.is_absolute():
+        second_level_report = root / second_level_report
 
     print("Vector DB Combined validation (build + smoke profile + restart checks)")
     print("- Includes dependency preflight and explicit restart dependency artifact checks")
@@ -333,6 +346,7 @@ def main() -> int:
         "CTest": 90,
         "Generate synthetic dataset": 20,
         "Combined CLI smoke/profile": 240,
+        "Second-level validation": 180,
     }
     timing_history = _load_timings(root / TIMINGS_FILE)
     run_actual_s: dict[str, float] = {}
@@ -550,6 +564,26 @@ def main() -> int:
         smoke_elapsed = time.perf_counter() - smoke_started
         run_actual_s["Combined CLI smoke/profile"] = smoke_elapsed
         timing_history.setdefault("Combined CLI smoke/profile", []).append(smoke_elapsed)
+
+        if args.run_second_level:
+            second_level_cmd = [
+                sys.executable,
+                "scripts/test_vector_db_second_level.py",
+                "--seed",
+                str(args.cluster_seed),
+                "--json-out",
+                str(second_level_report),
+            ]
+            if args.keep_data:
+                second_level_cmd.append("--keep-data")
+            elapsed = run_stream_step(
+                "Second-level validation",
+                second_level_cmd,
+                cwd=root,
+                estimate_s=180,
+            )
+            run_actual_s["Second-level validation"] = elapsed
+            timing_history.setdefault("Second-level validation", []).append(elapsed)
     except FileNotFoundError as e:
         print(f"[FAIL] Missing tool: {e}")
         return 1
@@ -586,6 +620,8 @@ def main() -> int:
             "skip_ctest": args.skip_ctest,
             "skip_generate": args.skip_generate,
             "payload_count": count_jsonl_rows(payloads_path),
+            "run_second_level": args.run_second_level,
+            "second_level_report": str(second_level_report),
         },
     }
     json_out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

@@ -328,6 +328,17 @@ struct VectorStore::Impl {
         bool async_double_buffer_used = false;
     };
 
+    struct SecondLevelCentroidSummary {
+        std::uint32_t centroid_id = 0;
+        std::size_t source_vectors = 0;
+        std::size_t vectors_indexed = 0;
+        bool processed = false;
+        std::string skipped_reason;
+        fs::path output_dir;
+        ClusterStats stats;
+        ClusterHealth health;
+    };
+
     OpenSignature last_open_signature;
 
     fs::path root() const { return fs::path(data_dir); }
@@ -337,6 +348,12 @@ struct VectorStore::Impl {
     fs::path wal_path() const { return root() / "wal.log"; }
     fs::path clusters_root() const { return root() / "clusters" / "initial"; }
     fs::path cluster_manifest_path() const { return clusters_root() / "cluster_manifest.json"; }
+    fs::path cluster_version_dir(std::uint64_t version) const {
+        return clusters_root() / ("v" + std::to_string(version));
+    }
+    fs::path second_level_root(std::uint64_t parent_version) const {
+        return cluster_version_dir(parent_version) / "second_level_clustering";
+    }
 
     fs::path seg_base(std::uint64_t seg_id) const {
         return segments_dir() / ("seg_" + std::to_string(seg_id));
@@ -891,6 +908,52 @@ struct VectorStore::Impl {
         return Status::Ok();
     }
 
+    InitialClusteringConfig make_clustering_config(std::uint32_t seed) const {
+        InitialClusteringConfig cfg;
+        cfg.seed = seed;
+        cfg.contiguous_live_vector_load_enabled = env_flag_enabled(
+            "VECTOR_DB_CONTIGUOUS_LOAD",
+            cfg.contiguous_live_vector_load_enabled);
+        cfg.contiguous_min_span_rows = env_size_value(
+            "VECTOR_DB_CONTIGUOUS_MIN_SPAN",
+            cfg.contiguous_min_span_rows);
+        cfg.async_double_buffer_enabled = env_flag_enabled(
+            "VECTOR_DB_ASYNC_DOUBLE_BUFFER",
+            cfg.async_double_buffer_enabled);
+        cfg.async_double_buffer_chunk_rows = env_size_value(
+            "VECTOR_DB_ASYNC_CHUNK_ROWS",
+            cfg.async_double_buffer_chunk_rows);
+        cfg.async_double_buffer_queue_depth = env_size_value(
+            "VECTOR_DB_ASYNC_QUEUE_DEPTH",
+            cfg.async_double_buffer_queue_depth);
+        cfg.elbow_stage_a_approx_enabled = env_flag_enabled(
+            "VECTOR_DB_ELBOW_APPROX_STAGE_A",
+            cfg.elbow_stage_a_approx_enabled);
+        cfg.elbow_stage_a_approx_stride = env_size_value(
+            "VECTOR_DB_ELBOW_APPROX_STRIDE",
+            cfg.elbow_stage_a_approx_stride);
+        cfg.elbow_prune_enabled = env_flag_enabled(
+            "VECTOR_DB_ELBOW_PRUNE",
+            cfg.elbow_prune_enabled);
+        const char* prune_margin_env = std::getenv("VECTOR_DB_ELBOW_PRUNE_MARGIN");
+        if (prune_margin_env != nullptr) {
+            try {
+                cfg.elbow_prune_margin = std::stod(prune_margin_env);
+            } catch (...) {
+            }
+        }
+        cfg.elbow_trace_full_grid = env_flag_enabled(
+            "VECTOR_DB_ELBOW_TRACE_FULL_GRID",
+            cfg.elbow_trace_full_grid);
+        cfg.elbow_int8_search_enabled = true;
+        cfg.elbow_int8_require_hardware = true;
+        const char* int8_scale_mode_env = std::getenv("VECTOR_DB_ELBOW_INT8_SCALE_MODE");
+        if (int8_scale_mode_env != nullptr && std::string(int8_scale_mode_env).size() > 0) {
+            cfg.elbow_int8_scale_mode = int8_scale_mode_env;
+        }
+        return cfg;
+    }
+
     LiveVectorLoadResult collect_live_vectors(const InitialClusteringConfig& cfg) const {
         LiveVectorLoadResult out;
         out.vectors_by_id.reserve(entries.size());
@@ -1150,6 +1213,108 @@ struct VectorStore::Impl {
         return out;
     }
 
+    Status collect_vectors_for_ids(
+        const std::vector<std::uint64_t>& ids,
+        LiveVectorLoadResult* out) const {
+        if (out == nullptr) {
+            return Status::Error("collect_vectors_for_ids output is null");
+        }
+        out->vectors_by_id.clear();
+        out->packed_row_major.clear();
+        out->bytes_read = 0;
+        out->contiguous_spans = 0;
+        out->sparse_reads = 0;
+        out->sparse_fallback_used = false;
+        out->async_double_buffer_used = false;
+        out->vectors_by_id.reserve(ids.size());
+        for (std::uint64_t id : ids) {
+            const auto it = entries.find(id);
+            if (it == entries.end() || it->second.deleted) {
+                continue;
+            }
+            const auto vec = read_vector_at_row(it->second.row);
+            if (!vec.has_value()) {
+                continue;
+            }
+            out->vectors_by_id.push_back({id, *vec});
+            out->bytes_read += kVectorDim * sizeof(float);
+            out->sparse_reads += 1;
+        }
+        std::sort(out->vectors_by_id.begin(), out->vectors_by_id.end(), [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
+        out->packed_row_major.reserve(out->vectors_by_id.size() * kVectorDim);
+        for (const auto& kv : out->vectors_by_id) {
+            out->packed_row_major.insert(
+                out->packed_row_major.end(),
+                kv.second.begin(),
+                kv.second.end());
+        }
+        return Status::Ok();
+    }
+
+    Status load_top1_assignment_groups(
+        std::uint64_t source_version,
+        std::unordered_map<std::uint32_t, std::vector<std::uint64_t>>* out_groups) const {
+        if (out_groups == nullptr) {
+            return Status::Error("load_top1_assignment_groups output is null");
+        }
+        out_groups->clear();
+        const fs::path p = cluster_version_dir(source_version) / "assignments.json";
+        if (!fs::exists(p)) {
+            return Status::Error("missing first-layer assignments file: " + p.string());
+        }
+        std::ifstream in(p, std::ios::binary);
+        if (!in) {
+            return Status::Error("failed opening first-layer assignments file: " + p.string());
+        }
+        std::ostringstream os;
+        os << in.rdbuf();
+        const std::string text = os.str();
+        std::size_t pos = 0;
+        while (true) {
+            const auto id_k = text.find("\"id\"", pos);
+            if (id_k == std::string::npos) {
+                break;
+            }
+            const auto top_k = text.find("\"top\"", id_k);
+            if (top_k == std::string::npos) {
+                break;
+            }
+            const auto id_v = extract_u64_field(text.substr(id_k), "id");
+            if (!id_v.has_value()) {
+                pos = top_k + 1;
+                continue;
+            }
+            const auto lb = text.find('[', top_k);
+            const auto rb = (lb == std::string::npos) ? std::string::npos : text.find(']', lb);
+            if (lb == std::string::npos || rb == std::string::npos) {
+                pos = top_k + 1;
+                continue;
+            }
+            const auto n0 = text.find_first_of("0123456789", lb);
+            if (n0 == std::string::npos || n0 > rb) {
+                pos = rb + 1;
+                continue;
+            }
+            const auto n1 = text.find_first_not_of("0123456789", n0);
+            std::uint32_t centroid = 0;
+            try {
+                centroid = static_cast<std::uint32_t>(
+                    std::stoul(text.substr(n0, n1 - n0)));
+            } catch (...) {
+                pos = rb + 1;
+                continue;
+            }
+            (*out_groups)[centroid].push_back(*id_v);
+            pos = rb + 1;
+        }
+        if (out_groups->empty()) {
+            return Status::Error("first-layer assignments has no parseable top-1 groups");
+        }
+        return Status::Ok();
+    }
+
     std::uint64_t next_cluster_version() const {
         return cluster_stats_cache.available ? (cluster_stats_cache.version + 1) : 1;
     }
@@ -1377,18 +1542,17 @@ struct VectorStore::Impl {
         return write_text_atomic(cluster_manifest_path(), os.str());
     }
 
-    Status write_initial_cluster_artifacts(
-        std::uint64_t version,
+    Status write_cluster_artifacts_to_dir(
+        const fs::path& out_dir,
         const IdEstimateRange& idr,
         const ElbowSelection& elbow,
         const KMeansModel& model,
         const StabilityMetrics& stability,
         const std::vector<std::pair<std::uint64_t, std::vector<float>>>& vectors) const {
         std::error_code ec;
-        const fs::path out_dir = clusters_root() / ("v" + std::to_string(version));
         fs::create_directories(out_dir, ec);
         if (ec) {
-            return Status::Error("failed creating clustering version directory: " + out_dir.string());
+            return Status::Error("failed creating clustering output directory: " + out_dir.string());
         }
 
         {
@@ -1471,6 +1635,125 @@ struct VectorStore::Impl {
             }
         }
         return Status::Ok();
+    }
+
+    Status write_initial_cluster_artifacts(
+        std::uint64_t version,
+        const IdEstimateRange& idr,
+        const ElbowSelection& elbow,
+        const KMeansModel& model,
+        const StabilityMetrics& stability,
+        const std::vector<std::pair<std::uint64_t, std::vector<float>>>& vectors) const {
+        const fs::path out_dir = clusters_root() / ("v" + std::to_string(version));
+        return write_cluster_artifacts_to_dir(out_dir, idr, elbow, model, stability, vectors);
+    }
+
+    Status write_second_level_centroid_manifest(
+        const fs::path& out_dir,
+        std::uint64_t source_version,
+        std::uint32_t centroid_id,
+        std::size_t source_vectors,
+        const ClusterStats& stats,
+        const ClusterHealth& health) const {
+        std::ostringstream os;
+        os << "{\n";
+        os << "  \"source_version\": " << source_version << ",\n";
+        os << "  \"parent_centroid_id\": " << centroid_id << ",\n";
+        os << "  \"source_vectors\": " << source_vectors << ",\n";
+        os << "  \"vectors_indexed\": " << stats.vectors_indexed << ",\n";
+        os << "  \"chosen_k\": " << stats.chosen_k << ",\n";
+        os << "  \"k_min\": " << stats.k_min << ",\n";
+        os << "  \"k_max\": " << stats.k_max << ",\n";
+        os << "  \"objective\": " << stats.objective << ",\n";
+        os << "  \"used_cuda\": " << (stats.used_cuda ? "true" : "false") << ",\n";
+        os << "  \"tensor_core_enabled\": " << (stats.tensor_core_enabled ? "true" : "false") << ",\n";
+        os << "  \"gpu_backend\": \"" << json_escape(stats.gpu_backend) << "\",\n";
+        os << "  \"scoring_ms_total\": " << stats.scoring_ms_total << ",\n";
+        os << "  \"scoring_calls\": " << stats.scoring_calls << ",\n";
+        os << "  \"elbow_int8_search_enabled\": "
+           << (stats.elbow_int8_search_enabled ? "true" : "false") << ",\n";
+        os << "  \"elbow_int8_tensor_core_used\": "
+           << (stats.elbow_int8_tensor_core_used ? "true" : "false") << ",\n";
+        os << "  \"elbow_int8_eval_count\": " << stats.elbow_int8_eval_count << ",\n";
+        os << "  \"elbow_scoring_precision\": \"" << json_escape(stats.elbow_scoring_precision) << "\",\n";
+        os << "  \"stability_passed\": " << (health.passed ? "true" : "false") << ",\n";
+        os << "  \"mean_nmi\": " << health.mean_nmi << ",\n";
+        os << "  \"std_nmi\": " << health.std_nmi << ",\n";
+        os << "  \"mean_jaccard\": " << health.mean_jaccard << ",\n";
+        os << "  \"mean_centroid_drift\": " << health.mean_centroid_drift << "\n";
+        os << "}\n";
+        return write_text_atomic(out_dir / "manifest.json", os.str());
+    }
+
+    Status write_second_level_summary(
+        std::uint64_t source_version,
+        std::uint32_t seed,
+        const std::vector<SecondLevelCentroidSummary>& summaries,
+        double total_elapsed_ms) const {
+        const fs::path out_dir = second_level_root(source_version);
+        std::error_code ec;
+        fs::create_directories(out_dir, ec);
+        if (ec) {
+            return Status::Error("failed creating second-level output directory: " + out_dir.string());
+        }
+        std::size_t processed_count = 0;
+        std::size_t skipped_count = 0;
+        std::size_t total_vectors_processed = 0;
+        for (const auto& s : summaries) {
+            if (s.processed) {
+                ++processed_count;
+                total_vectors_processed += s.vectors_indexed;
+            } else {
+                ++skipped_count;
+            }
+        }
+        const double vectors_per_second =
+            (total_elapsed_ms > 0.0)
+            ? (static_cast<double>(total_vectors_processed) / (total_elapsed_ms / 1000.0))
+            : 0.0;
+        std::ostringstream os;
+        os << "{\n";
+        os << "  \"source_version\": " << source_version << ",\n";
+        os << "  \"seed\": " << seed << ",\n";
+        os << "  \"total_parent_centroids\": " << summaries.size() << ",\n";
+        os << "  \"processed_centroids\": " << processed_count << ",\n";
+        os << "  \"skipped_centroids\": " << skipped_count << ",\n";
+        os << "  \"total_vectors_processed\": " << total_vectors_processed << ",\n";
+        os << "  \"total_elapsed_ms\": " << total_elapsed_ms << ",\n";
+        os << "  \"vectors_per_second\": " << vectors_per_second << ",\n";
+        os << "  \"centroids\": [\n";
+        for (std::size_t i = 0; i < summaries.size(); ++i) {
+            const auto& s = summaries[i];
+            os << "    {\n";
+            os << "      \"centroid_id\": " << s.centroid_id << ",\n";
+            os << "      \"source_vectors\": " << s.source_vectors << ",\n";
+            os << "      \"vectors_indexed\": " << s.vectors_indexed << ",\n";
+            os << "      \"processed\": " << (s.processed ? "true" : "false") << ",\n";
+            os << "      \"skipped_reason\": \"" << json_escape(s.skipped_reason) << "\",\n";
+            os << "      \"output_path\": \"" << json_escape(s.output_dir.string()) << "\",\n";
+            os << "      \"chosen_k\": " << s.stats.chosen_k << ",\n";
+            os << "      \"stability_passed\": " << (s.health.passed ? "true" : "false") << ",\n";
+            os << "      \"used_cuda\": " << (s.stats.used_cuda ? "true" : "false") << ",\n";
+            os << "      \"tensor_core_enabled\": " << (s.stats.tensor_core_enabled ? "true" : "false") << ",\n";
+            os << "      \"gpu_backend\": \"" << json_escape(s.stats.gpu_backend) << "\",\n";
+            os << "      \"scoring_ms_total\": " << s.stats.scoring_ms_total << ",\n";
+            os << "      \"scoring_calls\": " << s.stats.scoring_calls << ",\n";
+            os << "      \"elbow_int8_search_enabled\": "
+               << (s.stats.elbow_int8_search_enabled ? "true" : "false") << ",\n";
+            os << "      \"elbow_int8_tensor_core_used\": "
+               << (s.stats.elbow_int8_tensor_core_used ? "true" : "false") << ",\n";
+            os << "      \"elbow_int8_eval_count\": " << s.stats.elbow_int8_eval_count << ",\n";
+            os << "      \"elbow_scoring_precision\": \""
+               << json_escape(s.stats.elbow_scoring_precision) << "\"\n";
+            os << "    }";
+            if (i + 1 < summaries.size()) {
+                os << ",";
+            }
+            os << "\n";
+        }
+        os << "  ]\n";
+        os << "}\n";
+        return write_text_atomic(out_dir / "SECOND_LEVEL_CLUSTERING.json", os.str());
     }
 
     Status apply_insert_internal(
@@ -1761,49 +2044,7 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
             return s;
         }
     }
-    InitialClusteringConfig cfg;
-    cfg.seed = seed;
-    cfg.contiguous_live_vector_load_enabled = env_flag_enabled(
-        "VECTOR_DB_CONTIGUOUS_LOAD",
-        cfg.contiguous_live_vector_load_enabled);
-    cfg.contiguous_min_span_rows = env_size_value(
-        "VECTOR_DB_CONTIGUOUS_MIN_SPAN",
-        cfg.contiguous_min_span_rows);
-    cfg.async_double_buffer_enabled = env_flag_enabled(
-        "VECTOR_DB_ASYNC_DOUBLE_BUFFER",
-        cfg.async_double_buffer_enabled);
-    cfg.async_double_buffer_chunk_rows = env_size_value(
-        "VECTOR_DB_ASYNC_CHUNK_ROWS",
-        cfg.async_double_buffer_chunk_rows);
-    cfg.async_double_buffer_queue_depth = env_size_value(
-        "VECTOR_DB_ASYNC_QUEUE_DEPTH",
-        cfg.async_double_buffer_queue_depth);
-    cfg.elbow_stage_a_approx_enabled = env_flag_enabled(
-        "VECTOR_DB_ELBOW_APPROX_STAGE_A",
-        cfg.elbow_stage_a_approx_enabled);
-    cfg.elbow_stage_a_approx_stride = env_size_value(
-        "VECTOR_DB_ELBOW_APPROX_STRIDE",
-        cfg.elbow_stage_a_approx_stride);
-    cfg.elbow_prune_enabled = env_flag_enabled(
-        "VECTOR_DB_ELBOW_PRUNE",
-        cfg.elbow_prune_enabled);
-    const char* prune_margin_env = std::getenv("VECTOR_DB_ELBOW_PRUNE_MARGIN");
-    if (prune_margin_env != nullptr) {
-        try {
-            cfg.elbow_prune_margin = std::stod(prune_margin_env);
-        } catch (...) {
-        }
-    }
-    cfg.elbow_trace_full_grid = env_flag_enabled(
-        "VECTOR_DB_ELBOW_TRACE_FULL_GRID",
-        cfg.elbow_trace_full_grid);
-    // INT8 elbow search is mandatory now; keep hard-fail when unavailable.
-    cfg.elbow_int8_search_enabled = true;
-    cfg.elbow_int8_require_hardware = true;
-    const char* int8_scale_mode_env = std::getenv("VECTOR_DB_ELBOW_INT8_SCALE_MODE");
-    if (int8_scale_mode_env != nullptr && std::string(int8_scale_mode_env).size() > 0) {
-        cfg.elbow_int8_scale_mode = int8_scale_mode_env;
-    }
+    InitialClusteringConfig cfg = impl_->make_clustering_config(seed);
 
     const auto t_live_start = std::chrono::steady_clock::now();
     const auto live_result = impl_->collect_live_vectors(cfg);
@@ -1934,6 +2175,231 @@ Status VectorStore::build_initial_clusters(std::uint32_t seed) {
               << " backend=" << st.gpu_backend
               << " tensor_core=" << (st.tensor_core_enabled ? "on" : "off")
               << " stability=" << (health.passed ? "pass" : "fail") << "\n";
+    return Status::Ok();
+}
+
+Status VectorStore::build_second_level_clusters(
+    std::uint32_t seed,
+    std::optional<std::uint64_t> source_version) {
+    const auto t_start = std::chrono::steady_clock::now();
+    if (!impl_->opened) {
+        if (const Status s = open(); !s.ok) {
+            return s;
+        }
+    }
+    const std::uint64_t parent_version = source_version.has_value()
+        ? *source_version
+        : impl_->cluster_stats_cache.version;
+    if (parent_version == 0) {
+        return Status::Error("second-level clustering requires an existing first-layer cluster version");
+    }
+
+    std::unordered_map<std::uint32_t, std::vector<std::uint64_t>> grouped_ids;
+    if (const Status s = impl_->load_top1_assignment_groups(parent_version, &grouped_ids); !s.ok) {
+        return s;
+    }
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint64_t>>> ordered_groups;
+    ordered_groups.reserve(grouped_ids.size());
+    for (auto& kv : grouped_ids) {
+        ordered_groups.push_back({kv.first, std::move(kv.second)});
+    }
+    std::sort(ordered_groups.begin(), ordered_groups.end(), [](const auto& a, const auto& b) {
+        if (a.second.size() != b.second.size()) {
+            return a.second.size() > b.second.size();
+        }
+        return a.first < b.first;
+    });
+
+    const std::size_t min_vectors =
+        std::max<std::size_t>(8, env_size_value("VECTOR_DB_SECOND_LEVEL_MIN_VECTORS", 8));
+    InitialClusteringConfig cfg_base = impl_->make_clustering_config(seed);
+    std::vector<Impl::SecondLevelCentroidSummary> summaries;
+    summaries.reserve(ordered_groups.size());
+
+    std::cout << "progress: second-level clustering parent_version=" << parent_version
+              << " centroids=" << ordered_groups.size() << "\n";
+    for (std::size_t i = 0; i < ordered_groups.size(); ++i) {
+        const std::uint32_t centroid_id = ordered_groups[i].first;
+        const auto& ids = ordered_groups[i].second;
+        Impl::SecondLevelCentroidSummary summary{};
+        summary.centroid_id = centroid_id;
+        summary.source_vectors = ids.size();
+        summary.output_dir = impl_->second_level_root(parent_version)
+            / ("centroid_" + std::to_string(centroid_id));
+
+        std::cout << "progress: second-level centroid " << centroid_id
+                  << " (" << (i + 1) << "/" << ordered_groups.size() << ")"
+                  << " source_vectors=" << ids.size() << "\n";
+
+        if (ids.size() < min_vectors) {
+            summary.processed = false;
+            summary.skipped_reason = "below_min_vectors_threshold";
+            summaries.push_back(std::move(summary));
+            continue;
+        }
+
+        Impl::LiveVectorLoadResult subset;
+        if (const Status s = impl_->collect_vectors_for_ids(ids, &subset); !s.ok) {
+            return s;
+        }
+        if (subset.vectors_by_id.size() < min_vectors) {
+            summary.processed = false;
+            summary.skipped_reason = "insufficient_live_vectors_after_filtering";
+            summaries.push_back(std::move(summary));
+            continue;
+        }
+        std::vector<std::vector<float>> vectors;
+        vectors.reserve(subset.vectors_by_id.size());
+        for (const auto& kv : subset.vectors_by_id) {
+            vectors.push_back(kv.second);
+        }
+
+        InitialClusteringConfig cfg = cfg_base;
+        cfg.seed = seed + centroid_id;
+        cfg.max_sample = std::max<std::size_t>(256, std::min<std::size_t>(4096, vectors.size()));
+
+        IdEstimateRange idr;
+        const auto t_id_start = std::chrono::steady_clock::now();
+        if (const Status s = estimate_intrinsic_dimensionality(
+                vectors, cfg.seed, cfg.min_sample, cfg.max_sample, &idr);
+            !s.ok) {
+            return Status::Error(
+                "second-level id estimation failed for centroid "
+                + std::to_string(centroid_id) + ": " + s.message);
+        }
+        const auto t_id_end = std::chrono::steady_clock::now();
+
+        KMeansModel model;
+        ElbowSelection elbow;
+        const auto t_elbow_start = std::chrono::steady_clock::now();
+        if (const Status s = select_k_binary_elbow_packed(
+                vectors,
+                subset.packed_row_major,
+                idr,
+                cfg,
+                &model,
+                &elbow);
+            !s.ok) {
+            return Status::Error(
+                "second-level elbow selection failed for centroid "
+                + std::to_string(centroid_id) + ": " + s.message);
+        }
+        const auto t_elbow_end = std::chrono::steady_clock::now();
+
+        StabilityMetrics stability;
+        const auto t_stability_start = std::chrono::steady_clock::now();
+        if (const Status s = evaluate_stability_packed(
+                vectors,
+                subset.packed_row_major,
+                model.k,
+                cfg,
+                &stability);
+            !s.ok) {
+            return Status::Error(
+                "second-level stability evaluation failed for centroid "
+                + std::to_string(centroid_id) + ": " + s.message);
+        }
+        const auto t_stability_end = std::chrono::steady_clock::now();
+
+        const auto t_write_start = std::chrono::steady_clock::now();
+        if (const Status s = impl_->write_cluster_artifacts_to_dir(
+                summary.output_dir,
+                idr,
+                elbow,
+                model,
+                stability,
+                subset.vectors_by_id);
+            !s.ok) {
+            return Status::Error(
+                "second-level artifact write failed for centroid "
+                + std::to_string(centroid_id) + ": " + s.message);
+        }
+        const auto t_write_end = std::chrono::steady_clock::now();
+
+        ClusterStats st{};
+        st.available = true;
+        st.version = parent_version;
+        st.build_lsn = impl_->last_lsn;
+        st.vectors_indexed = vectors.size();
+        st.chosen_k = model.k;
+        st.k_min = idr.k_min;
+        st.k_max = idr.k_max;
+        st.objective = model.objective;
+        st.used_cuda = model.used_cuda;
+        st.tensor_core_enabled = model.tensor_core_enabled;
+        st.gpu_backend = model.gpu_backend;
+        st.scoring_ms_total = model.scoring_ms_total;
+        st.scoring_calls = model.scoring_calls;
+        st.elbow_k_evaluated_count = elbow.k_evaluated_count;
+        st.elbow_stage_a_candidates = elbow.stage_a_candidates;
+        st.elbow_stage_b_candidates = elbow.stage_b_candidates;
+        st.elbow_early_stop_reason = elbow.early_stop_reason;
+        st.stability_runs_executed = stability.runs_executed;
+        st.load_live_vectors_ms = 0.0;
+        st.id_estimation_ms = std::chrono::duration<double, std::milli>(t_id_end - t_id_start).count();
+        st.elbow_ms = std::chrono::duration<double, std::milli>(t_elbow_end - t_elbow_start).count();
+        st.stability_ms = std::chrono::duration<double, std::milli>(t_stability_end - t_stability_start).count();
+        st.write_artifacts_ms = std::chrono::duration<double, std::milli>(t_write_end - t_write_start).count();
+        st.total_build_ms = st.id_estimation_ms + st.elbow_ms + st.stability_ms + st.write_artifacts_ms;
+        st.live_vector_bytes_read = subset.bytes_read;
+        st.live_vector_contiguous_spans = subset.contiguous_spans;
+        st.live_vector_sparse_reads = subset.sparse_reads;
+        st.live_vector_sparse_fallback = subset.sparse_fallback_used;
+        st.live_vector_async_double_buffer = subset.async_double_buffer_used;
+        st.elbow_stage_a_approx_enabled = elbow.stage_a_approx_enabled;
+        st.elbow_stage_a_approx_dim = elbow.stage_a_approx_dim;
+        st.elbow_stage_a_approx_stride = elbow.stage_a_approx_stride;
+        st.elbow_stage_b_pruned_candidates = elbow.stage_b_pruned_candidates;
+        st.elbow_stage_b_window_k_min = elbow.stage_b_window_k_min;
+        st.elbow_stage_b_window_k_max = elbow.stage_b_window_k_max;
+        st.elbow_stage_b_prune_reason = elbow.stage_b_prune_reason;
+        st.elbow_int8_search_enabled = elbow.int8_search_enabled;
+        st.elbow_int8_tensor_core_used = elbow.int8_tensor_core_used;
+        st.elbow_int8_eval_count = elbow.int8_eval_count;
+        st.elbow_int8_scale_mode = cfg.elbow_int8_scale_mode;
+        st.elbow_scoring_precision =
+            (model.scoring_precision == CudaScorePrecision::INT8) ? "int8-search/fp16-final" : "fp16";
+
+        ClusterHealth health{};
+        health.available = true;
+        health.passed = stability.passed;
+        health.mean_nmi = stability.mean_nmi;
+        health.std_nmi = stability.std_nmi;
+        health.mean_jaccard = stability.mean_jaccard;
+        health.mean_centroid_drift = stability.mean_centroid_drift;
+        health.status = stability.passed ? "ok" : "failed";
+
+        if (const Status s = impl_->write_second_level_centroid_manifest(
+                summary.output_dir,
+                parent_version,
+                centroid_id,
+                ids.size(),
+                st,
+                health);
+            !s.ok) {
+            return s;
+        }
+
+        summary.processed = true;
+        summary.vectors_indexed = st.vectors_indexed;
+        summary.stats = st;
+        summary.health = health;
+        summaries.push_back(std::move(summary));
+    }
+
+    const auto t_end = std::chrono::steady_clock::now();
+    const double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    if (const Status s = impl_->write_second_level_summary(
+            parent_version,
+            seed,
+            summaries,
+            total_ms);
+        !s.ok) {
+        return s;
+    }
+    std::cout << "progress: second-level clustering done parent_version=" << parent_version
+              << " total_centroids=" << summaries.size() << "\n";
+    impl_->last_open_signature = impl_->capture_open_signature();
     return Status::Ok();
 }
 

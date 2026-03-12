@@ -40,7 +40,7 @@ def require_keys(obj: dict[str, object], required: list[str], context: str) -> N
 
 
 def main() -> int:
-    total_steps = 15
+    total_steps = 16
     step = 0
 
     def do(label: str, cmd: list[str]) -> str:
@@ -140,6 +140,22 @@ def main() -> int:
     assert cluster_stats["elbow_k_evaluated_count"] >= cluster_stats["elbow_stage_b_candidates"]
     assert cluster_health["available"] is True
     assert (data_dir / "clusters" / "initial" / "cluster_manifest.json").exists()
+
+    do(
+        "build second-level clusters",
+        [str(cli), "build-second-level-clusters", "--path", str(data_dir), "--seed", "9001"],
+    )
+    second_level_doc = data_dir / "clusters" / "initial" / f"v{cluster_stats['version']}" / "second_level_clustering" / "SECOND_LEVEL_CLUSTERING.json"
+    assert second_level_doc.exists()
+    second_level = json.loads(second_level_doc.read_text(encoding="utf-8"))
+    assert second_level["processed_centroids"] + second_level["skipped_centroids"] == second_level["total_parent_centroids"]
+    assert second_level["total_parent_centroids"] >= 1
+    if second_level["processed_centroids"] > 0:
+        first_processed = next(c for c in second_level["centroids"] if c["processed"] is True)
+        assert "used_cuda" in first_processed
+        assert "tensor_core_enabled" in first_processed
+        assert "elbow_int8_search_enabled" in first_processed
+        assert "elbow_scoring_precision" in first_processed
 
     # Restart behavior: invoke fresh process again and verify get still works.
     get_after_restart = do("restart check get row 100", [str(cli), "get", "--path", str(data_dir), "--id", "100"])

@@ -1,6 +1,6 @@
-# Initial Clustering Walkthrough
+# Initial + Second-Level Clustering Walkthrough
 
-This document explains the exact execution flow of the **initial clustering** portion of the Vector DB phase test.
+This document explains the exact execution flow of the **initial clustering** and **second-level clustering** portions of the Vector DB phase test.
 
 ## Entry Point Chain
 
@@ -72,7 +72,7 @@ Function: `estimate_intrinsic_dimensionality(...)` in `vector_db/src/clustering/
 
 Function: `select_k_binary_elbow(...)` in `vector_db/src/clustering/elbow_search.cpp`
 
-- Builds a power-of-two `k` grid between `k_min` and `k_max`.
+- Builds an integer `k` grid between `k_min` and `k_max`.
 - Fits spherical k-means models for candidate `k` values.
 - Uses objective gain to decide elbow point (`chosen_k`), with flatness fallback rule.
 - Returns:
@@ -136,4 +136,46 @@ In `vector_db/tests/smoke_cli.py`, after running `build-initial-clusters`:
 - Calls `cluster-health` and asserts `available == true`.
 - Confirms `clusters/initial/cluster_manifest.json` exists.
 - Re-opens in a fresh process and verifies `cluster-stats.version` is stable.
+
+## Second-Level Clustering (All Parent Centroids)
+
+Second-level clustering is triggered from the CLI with:
+
+- `vectordb_cli build-second-level-clusters --path <data_dir> [--seed <u32>] [--source-version <u64>]`
+
+Execution in `VectorStore::build_second_level_clusters(...)`:
+
+1. Loads first-layer assignments from:
+   - `clusters/initial/v<source_version>/assignments.json`
+2. Groups vectors by parent centroid `top[0]`.
+3. Processes centroid groups in descending size order (throughput-oriented).
+4. For each centroid with enough vectors:
+   - loads subset vectors
+   - runs the same GPU-first pipeline used by initial clustering:
+     - ID estimate
+     - INT8 elbow search
+     - FP16 refit for chosen `k`
+     - stability evaluation
+5. Writes per-centroid artifacts and per-centroid manifest.
+6. Writes aggregate second-level summary document.
+
+Second-level output layout:
+
+```text
+<data_dir>/
+  clusters/
+    initial/
+      v<source_version>/
+        second_level_clustering/
+          SECOND_LEVEL_CLUSTERING.json
+          centroid_<id>/
+            id_estimate.json
+            elbow_trace.json
+            stability_report.json
+            centroids.bin
+            assignments.json
+            manifest.json
+```
+
+The aggregate document includes per-centroid CUDA/tensor-core telemetry and total throughput (`vectors_per_second`).
 

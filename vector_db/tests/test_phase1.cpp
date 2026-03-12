@@ -301,6 +301,26 @@ int main() {
     if (!expect(cstats_reopen.available && cstats_reopen.version == cstats.version, "cluster stats stable across reopen")) {
         return 1;
     }
+    if (!expect(cluster_reopen.build_second_level_clusters(888, cstats.version).ok, "build second-level clusters succeeds")) {
+        return 1;
+    }
+    const fs::path second_level_doc =
+        cluster_dir / "clusters" / "initial" / ("v" + std::to_string(cstats.version))
+        / "second_level_clustering" / "SECOND_LEVEL_CLUSTERING.json";
+    if (!expect(fs::exists(second_level_doc), "second-level clustering summary exists")) {
+        return 1;
+    }
+    const auto second_level_text = slurp(second_level_doc);
+    if (!expect(
+            second_level_text.find("\"processed_centroids\"") != std::string::npos,
+            "second-level processed count present")) {
+        return 1;
+    }
+    if (!expect(
+            second_level_text.find("\"total_parent_centroids\"") != std::string::npos,
+            "second-level parent centroid count present")) {
+        return 1;
+    }
 
     std::cout << "[PASS] vectordb phase3 initial clustering tests\n";
     malformed_tail_reopen.close();
