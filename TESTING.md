@@ -259,44 +259,7 @@ What it runs:
 - Synthetic dataset generation
 - CLI smoke integration flow
 
-### 12.3 CLI smoke profiling run (separate script)
-
-From `vector_db/`:
-
-```bash
-python tests/smoke_cli_profile.py
-```
-
-Optional:
-
-```bash
-python tests/smoke_cli_profile.py --keep-data --json-out smoke_cli_profile_report.json
-```
-
-Outputs:
-- Per-command elapsed times printed in terminal
-- Ranked slowest steps
-- JSON report with timing breakdown
-- Cluster stats now include elbow/stability telemetry fields (`elbow_k_evaluated_count`, `elbow_stage_a_candidates`, `elbow_stage_b_candidates`, `stability_runs_executed`, and per-stage ms timings) for latency validation.
-
-### 12.4 Combined orchestration + smoke/profile script
-
-From project root:
-
-```bash
-python scripts/test_vector_db_combined.py
-```
-
-For all available options and examples, see:
-- `scripts/TEST_VECTOR_DB_COMBINED_OPTIONS.md`
-
-Optional second-level validation in combined flow:
-
-```bash
-python scripts/test_vector_db_combined.py --run-second-level
-```
-
-### 12.5 Second-level clustering validation script
+### 12.3 Second-level clustering validation script
 
 From project root:
 
@@ -318,7 +281,7 @@ Outputs:
   - `vector_db/second_level_test_report.json`
 - Per-centroid telemetry includes CUDA/tensor-core usage and INT8/FP16 scoring fields.
 
-### 12.6 Do you need to delete `vector_db/build` each run?
+### 12.4 Do you need to delete `vector_db/build` each run?
 
 No. For normal testing, reuse `vector_db/build`.
 
@@ -342,7 +305,7 @@ cmake -S vector_db -B vector_db/build
 cmake --build vector_db/build --config Release
 ```
 
-### 12.7 Full pipeline test runner (rebuild + layer 1 + layer 2)
+### 12.5 Full pipeline test runner (rebuild + layer 1 + layer 2)
 
 From project root:
 
