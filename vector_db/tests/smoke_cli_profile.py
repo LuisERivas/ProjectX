@@ -194,6 +194,19 @@ def main() -> int:
         assert "tensor_core_enabled" in first_processed
         assert "elbow_int8_search_enabled" in first_processed
         assert "elbow_scoring_precision" in first_processed
+    print(f"cluster-summary: top-layer chosen_k={cluster_stats['chosen_k']}")
+    for centroid in second_level["centroids"]:
+        centroid_id = centroid.get("centroid_id")
+        chosen_k = centroid.get("chosen_k", 0)
+        processed = centroid.get("processed", False)
+        if processed:
+            print(f"cluster-summary: second-layer parent_centroid={centroid_id} chosen_k={chosen_k}")
+        else:
+            reason = centroid.get("skipped_reason", "not_processed")
+            print(
+                f"cluster-summary: second-layer parent_centroid={centroid_id} "
+                f"chosen_k=0 skipped_reason={reason}"
+            )
 
     get_after_restart = do("restart check get row 100", [str(cli), "get", "--path", str(data_dir), "--id", "100"])
     assert '"deleted": true' in get_after_restart
