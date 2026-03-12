@@ -1,48 +1,48 @@
 # CONTEXTCHECK
 
 - **Folder:** `vector_db/tests`
-- **Last run:** `2026-03-10 15:52:42 Pacific Daylight Time`
+- **Last run:** `2026-03-10`
 - **Checker:** `context-folder-audit-batch`
 - **Scope:** `non-recursive immediate files only`
 - **CONTEXT.md dependency:** `disabled`
 
 ## Findings
 - Reviewed `4` immediate files in this folder.
-- No discrepancies detected under the non-recursive folder-only audit criteria.
+- No discrepancies detected under immediate-file audit rules.
 
 ## Status
 - **Result:** `PASS`
 - **Issue count:** `0`
 
 ## File Summaries
-- `CONTEXTCHECK.md`:
-  - Markdown documentation/report file maintained in `vector_db/tests`.
-  - Provides human-readable operational context rather than executable logic.
-  - Captures run metadata, findings, and references for maintainers.
-  - Accuracy depends on synchronization with current code and folder contents.
-  - related files: none identified
-  - Observed size is 765 bytes across 21 lines (17 non-empty lines).
-
 - `benchmark_phase3.py`:
-  - Python module in `vector_db/tests` with 0 classes and 4 functions.
-  - Contains executable logic used by this package and its call sites.
-  - Defines symbols consumed through imports and module-level interfaces.
-  - Edge-case behavior depends on explicit checks and raised exceptions in code paths.
-  - related files: smoke_cli.py
-  - Observed size is 2698 bytes across 87 lines (71 non-empty lines).
+  - Runs a compact benchmark flow against `vectordb_cli` to measure cluster-build throughput and elapsed time.
+  - Generates synthetic sparse vectors, builds temporary payloads, executes insert/build commands, and reports JSON metrics.
+  - Validates binary existence and runtime command success with explicit error propagation from subprocess output.
+  - Prints backend telemetry (`used_cuda`, tensor-core flag, scoring timing) to support quick performance checks.
+  - Cleans benchmark data directory at the end to keep test state deterministic across runs.
+  - related files: `smoke_cli.py`, `smoke_cli_profile.py`, `../cli/main.cpp`
 
 - `smoke_cli.py`:
-  - Python module in `vector_db/tests` with 0 classes and 3 functions.
-  - Contains executable logic used by this package and its call sites.
-  - Defines symbols consumed through imports and module-level interfaces.
-  - Edge-case behavior depends on explicit checks and raised exceptions in code paths.
-  - related files: benchmark_phase3.py
-  - Observed size is 4141 bytes across 98 lines (82 non-empty lines).
+  - Executes the integration smoke sequence for the CLI: init, bulk insert, CRUD, WAL checks, checkpoint, clustering, and restart checks.
+  - Asserts expected schema and invariants for `cluster-stats`/`cluster-health`, including INT8 elbow telemetry keys.
+  - Uses step-indexed logging and helper guards (`require_keys`) to surface stale-binary problems quickly.
+  - Verifies persistence behavior by reopening state and checking manifest/version continuity.
+  - Serves as the primary confidence test used by higher-level phase scripts.
+  - related files: `smoke_cli_profile.py`, `benchmark_phase3.py`, `../cli/main.cpp`, `../src/vector_store.cpp`
+
+- `smoke_cli_profile.py`:
+  - Profiles smoke workflow timing per command and writes a ranked JSON timing report for bottleneck analysis.
+  - Reuses smoke-style validation logic while capturing elapsed seconds for each subprocess call.
+  - Supports runtime options for data directory, payload file, seed, report output, and `--keep-data`.
+  - Validates cluster telemetry completeness and restart behavior before finalizing the profile report.
+  - Produces both console ranking and structured machine-readable output for regression tracking.
+  - related files: `smoke_cli.py`, `benchmark_phase3.py`, `../cli/main.cpp`
 
 - `test_phase1.cpp`:
-  - C/C++ source/header used by `vector_db/tests` with 8 include directives.
-  - Implements compiled logic and type contracts used by neighboring translation units.
-  - Exposes or consumes interfaces through declarations, includes, and function signatures.
-  - Handles edge cases through status checks, guard clauses, and return-path decisions.
-  - related files: none identified
-  - Observed size is 10945 bytes across 312 lines (289 non-empty lines).
+  - C++ end-to-end test executable covering WAL append/replay, checkpoint truncation, malformed-tail tolerance, and clustering build/reopen behavior.
+  - Constructs deterministic vectors and assertions to verify CRUD semantics and persisted state invariants.
+  - Exercises initial clustering artifacts and validates cluster stats consistency after reopening the store.
+  - Checks bounded elbow trace behavior and existence of generated report/centroid/assignment artifacts.
+  - Functions as the CTest-backed compiled regression test for vector DB phase functionality.
+  - related files: `../src/vector_store.cpp`, `../include/vector_db/vector_store.hpp`, `../src/clustering/elbow_search.cpp`

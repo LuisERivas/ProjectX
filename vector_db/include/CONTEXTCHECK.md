@@ -1,24 +1,18 @@
 # CONTEXTCHECK
 
 - **Folder:** `vector_db/include`
-- **Last run:** `2026-03-10 15:52:42 Pacific Daylight Time`
+- **Last run:** `2026-03-10`
 - **Checker:** `context-folder-audit-batch`
 - **Scope:** `non-recursive immediate files only`
 - **CONTEXT.md dependency:** `disabled`
 
 ## Findings
-- Reviewed `1` immediate files in this folder.
-- No discrepancies detected under the non-recursive folder-only audit criteria.
+- Reviewed `0` immediate files in this folder (excluding this report file).
+- No discrepancies detected under immediate-file audit rules.
 
 ## Status
 - **Result:** `PASS`
 - **Issue count:** `0`
 
 ## File Summaries
-- `CONTEXTCHECK.md`:
-  - Markdown documentation/report file maintained in `vector_db/include`.
-  - Provides human-readable operational context rather than executable logic.
-  - Captures run metadata, findings, and references for maintainers.
-  - Accuracy depends on synchronization with current code and folder contents.
-  - related files: none identified
-  - Observed size is 535 bytes across 18 lines (14 non-empty lines).
+- None
