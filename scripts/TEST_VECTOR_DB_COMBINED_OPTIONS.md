@@ -125,3 +125,11 @@ python scripts/test_vector_db_combined.py --run-second-level --second-level-repo
 - On Windows, the script uses `vectordb_cli.exe`; on Unix-like systems it uses `vectordb_cli`.
 - Relative `--payloads` and `--data-dir` paths are resolved from `vector_db/`.
 - Relative `--json-out` and `--dataset-out` paths are resolved from repo root.
+
+## Related script
+
+For a single-script full rebuild + layer-1 + layer-2 clustering pipeline run with ETA and final cluster summaries, use:
+
+```bash
+python scripts/pipeline_test.py
+```

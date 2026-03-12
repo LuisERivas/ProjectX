@@ -342,6 +342,44 @@ cmake -S vector_db -B vector_db/build
 cmake --build vector_db/build --config Release
 ```
 
+### 12.7 Full pipeline test runner (rebuild + layer 1 + layer 2)
+
+From project root:
+
+```bash
+python scripts/pipeline_test.py
+```
+
+What it runs:
+- Dependency preflight
+- CMake configure/build + CTest for `vector_db`
+- Synthetic dataset generation (unless `--skip-generate`)
+- End-to-end CLI flow:
+  - `init`
+  - `bulk-insert`
+  - `checkpoint`
+  - `build-initial-clusters`
+  - `cluster-stats`
+  - `build-second-level-clusters`
+
+What it prints:
+- Live progress + ETA for each stage.
+- Final first-layer cluster summary (`chosen_k`, `k_min/k_max`, vectors, backend, tensor-core).
+- Final second-layer summary (`total parent centroids`, processed/skipped, vectors/sec).
+- Per-centroid second-layer lines (`centroid_id`, `chosen_k` or skip reason, CUDA/tensor-core flags).
+
+Default report output:
+- `vector_db/pipeline_test_report.json`
+
+Useful options:
+- `--skip-configure --skip-build --skip-ctest --skip-generate`
+- `--data-dir <path>`
+- `--payloads <path>`
+- `--seed <u32>`
+- `--source-version <u64>`
+- `--json-out <path>`
+- `--keep-data`
+
 ## 13) Suggested regression checklist
 
 Run this minimum suite after code changes (automated + manual):
