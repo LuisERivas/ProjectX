@@ -775,41 +775,51 @@ struct VectorStore::Impl {
         assignments << "[\n";
         std::size_t row_count = 0;
         std::size_t mid_centroid_count = 0;
+        std::ostringstream per_top;
+        per_top << "[\n";
+        bool first_top = true;
         for (const auto& top_id : ordered_keys) {
             auto ids = top_groups.at(top_id);
             std::sort(ids.begin(), ids.end());
+            const auto k_min = compute_k_min(ids.size());
+            const auto k_max = compute_k_max(ids.size());
+            const auto chosen_k = compute_chosen_k(ids.size(), k_min, k_max);
+            const auto bucket_count = std::max<std::size_t>(1, chosen_k);
 
-            std::vector<std::uint64_t> mid_a;
-            std::vector<std::uint64_t> mid_b;
-            mid_a.reserve((ids.size() + 1) / 2);
-            mid_b.reserve(ids.size() / 2);
-            for (std::size_t i = 0; i < ids.size(); ++i) {
-                if ((i % 2U) == 0U) {
-                    mid_a.push_back(ids[i]);
-                } else {
-                    mid_b.push_back(ids[i]);
+            std::vector<std::vector<std::uint64_t>> buckets(bucket_count);
+            for (const auto id : ids) {
+                const auto idx = static_cast<std::size_t>(id % bucket_count);
+                buckets[idx].push_back(id);
+            }
+
+            std::size_t produced_for_top = 0;
+            for (std::size_t i = 0; i < buckets.size(); ++i) {
+                if (buckets[i].empty()) {
+                    continue;
                 }
-            }
-
-            const std::string mid_a_id = "mid_" + top_id + "_a";
-            const std::string mid_b_id = "mid_" + top_id + "_b";
-
-            for (const auto id : mid_a) {
-                assignments << "  {\"embedding_id\": " << id << ", \"mid_centroid_id\": \"" << mid_a_id
-                            << "\", \"parent_top_centroid_id\": \"" << top_id << "\"},\n";
-                ++row_count;
-            }
-            ++mid_centroid_count;
-
-            if (!mid_b.empty()) {
-                for (const auto id : mid_b) {
-                    assignments << "  {\"embedding_id\": " << id << ", \"mid_centroid_id\": \"" << mid_b_id
+                const std::string mid_id = "mid_" + top_id + "_" + std::to_string(i);
+                for (const auto id : buckets[i]) {
+                    assignments << "  {\"embedding_id\": " << id << ", \"mid_centroid_id\": \"" << mid_id
                                 << "\", \"parent_top_centroid_id\": \"" << top_id << "\"},\n";
                     ++row_count;
                 }
+                ++produced_for_top;
                 ++mid_centroid_count;
             }
+
+            if (!first_top) {
+                per_top << ",\n";
+            }
+            first_top = false;
+            per_top << "    {\"source_top_centroid_id\": \"" << top_id << "\""
+                    << ", \"source_rows\": " << ids.size()
+                    << ", \"k_min\": " << k_min
+                    << ", \"k_max\": " << k_max
+                    << ", \"chosen_k\": " << chosen_k
+                    << ", \"produced_mid_centroids\": " << produced_for_top
+                    << "}";
         }
+        per_top << "\n  ]";
         std::string text = assignments.str();
         if (text.size() >= 2 && text[text.size() - 2] == ',') {
             text.erase(text.size() - 2, 1);
@@ -825,7 +835,8 @@ struct VectorStore::Impl {
                 << "  \"stage\": \"mid\",\n"
                 << "  \"single_global_pass\": true,\n"
                 << "  \"rows_processed\": " << row_count << ",\n"
-                << "  \"centroids\": " << mid_centroid_count << "\n"
+                << "  \"centroids\": " << mid_centroid_count << ",\n"
+                << "  \"per_top_centroid\": " << per_top.str() << "\n"
                 << "}\n";
         if (!write_text_atomic(dir / "MID_LAYER_CLUSTERING.json", summary.str())) {
             return Status::Error("failed writing mid summary");
@@ -837,6 +848,9 @@ struct VectorStore::Impl {
         std::string centroid_id;
         std::vector<std::uint64_t> embedding_ids;
         std::string gate_decision;
+        std::size_t k_min = 0;
+        std::size_t k_max = 0;
+        std::size_t chosen_k = 0;
     };
 
     Status write_lower_artifacts(const std::unordered_map<std::string, std::vector<std::uint64_t>>& mid_groups, std::uint32_t seed) {
@@ -850,44 +864,82 @@ struct VectorStore::Impl {
         }
         std::sort(mids.begin(), mids.end());
 
-        std::vector<GateDecisionRow> gate_rows;
+        struct LowerGateEval {
+            std::string centroid_id;
+            std::string decision;
+            std::size_t dataset_size = 0;
+            std::size_t k_min = 0;
+            std::size_t k_max = 0;
+            std::size_t chosen_k = 0;
+            std::string reason;
+        };
+        std::vector<LowerGateEval> gate_rows;
         std::vector<LowerLeaf> leaves;
 
-        auto append_leaf = [&](const std::string& cid, const std::vector<std::uint64_t>& ids, const std::string& decision) {
-            leaves.push_back(LowerLeaf{cid, ids, decision});
+        auto append_leaf = [&](const std::string& cid,
+                               const std::vector<std::uint64_t>& ids,
+                               const std::string& decision,
+                               std::size_t k_min,
+                               std::size_t k_max,
+                               std::size_t chosen_k) {
+            leaves.push_back(LowerLeaf{cid, ids, decision, k_min, k_max, chosen_k});
             const fs::path cdir = dir / ("centroid_" + cid);
             fs::create_directories(cdir);
             std::ostringstream manifest;
             manifest << "{\n"
                      << "  \"centroid_id\": \"" << cid << "\",\n"
                      << "  \"gate_decision\": \"" << decision << "\",\n"
-                     << "  \"dataset_size\": " << ids.size() << "\n"
+                     << "  \"dataset_size\": " << ids.size() << ",\n"
+                     << "  \"k_min\": " << k_min << ",\n"
+                     << "  \"k_max\": " << k_max << ",\n"
+                     << "  \"chosen_k\": " << chosen_k << "\n"
                      << "}\n";
             write_text_atomic(cdir / "manifest.json", manifest.str());
         };
 
         for (const auto& mid : mids) {
-            const auto& ids = mid_groups.at(mid);
+            auto ids = mid_groups.at(mid);
+            std::sort(ids.begin(), ids.end());
+            const auto k_min = compute_k_min(ids.size());
+            const auto k_max = compute_k_max(ids.size());
+            const auto chosen_k = compute_chosen_k(ids.size(), k_min, k_max);
             const bool cont = ids.size() >= 64;
-            gate_rows.push_back(GateDecisionRow{mid, cont ? "continue" : "stop", ids.size(),
-                                                cont ? "size_above_split_threshold" : "size_below_split_threshold"});
+            gate_rows.push_back(LowerGateEval{
+                mid,
+                cont ? "continue" : "stop",
+                ids.size(),
+                k_min,
+                k_max,
+                chosen_k,
+                cont ? "size_above_split_threshold" : "size_below_split_threshold",
+            });
             if (!cont) {
-                append_leaf(mid, ids, "stop");
+                append_leaf(mid, ids, "stop", k_min, k_max, chosen_k);
                 continue;
             }
-            std::vector<std::uint64_t> a;
-            std::vector<std::uint64_t> b;
+
+            const auto bucket_count = std::max<std::size_t>(1, chosen_k);
+            std::vector<std::vector<std::uint64_t>> buckets(bucket_count);
             for (const auto id : ids) {
-                if ((id % 2) == 0) {
-                    a.push_back(id);
-                } else {
-                    b.push_back(id);
-                }
+                const auto idx = static_cast<std::size_t>(id % bucket_count);
+                buckets[idx].push_back(id);
             }
-            gate_rows.push_back(GateDecisionRow{mid + "_a", "stop", a.size(), "depth_cap_reached"});
-            gate_rows.push_back(GateDecisionRow{mid + "_b", "stop", b.size(), "depth_cap_reached"});
-            append_leaf(mid + "_a", a, "stop");
-            append_leaf(mid + "_b", b, "stop");
+            for (std::size_t i = 0; i < buckets.size(); ++i) {
+                if (buckets[i].empty()) {
+                    continue;
+                }
+                const std::string leaf_id = mid + "_" + std::to_string(i);
+                gate_rows.push_back(LowerGateEval{
+                    leaf_id,
+                    "stop",
+                    buckets[i].size(),
+                    k_min,
+                    k_max,
+                    chosen_k,
+                    "depth_cap_reached",
+                });
+                append_leaf(leaf_id, buckets[i], "stop", k_min, k_max, chosen_k);
+            }
         }
 
         std::ostringstream out;
@@ -897,7 +949,11 @@ struct VectorStore::Impl {
         for (std::size_t i = 0; i < gate_rows.size(); ++i) {
             const auto& g = gate_rows[i];
             out << "    {\"centroid_id\": \"" << g.centroid_id << "\", \"decision\": \"" << g.decision
-                << "\", \"dataset_size\": " << g.dataset_size << ", \"reason\": \"" << g.reason << "\"}";
+                << "\", \"dataset_size\": " << g.dataset_size
+                << ", \"k_min\": " << g.k_min
+                << ", \"k_max\": " << g.k_max
+                << ", \"chosen_k\": " << g.chosen_k
+                << ", \"reason\": \"" << g.reason << "\"}";
             if (i + 1 < gate_rows.size()) {
                 out << ",";
             }
@@ -908,7 +964,10 @@ struct VectorStore::Impl {
         for (std::size_t i = 0; i < leaves.size(); ++i) {
             const auto& lf = leaves[i];
             out << "    {\"centroid_id\": \"" << lf.centroid_id << "\", \"gate_decision\": \"" << lf.gate_decision
-                << "\", \"embedding_ids\": [";
+                << "\", \"k_min\": " << lf.k_min
+                << ", \"k_max\": " << lf.k_max
+                << ", \"chosen_k\": " << lf.chosen_k
+                << ", \"embedding_ids\": [";
             for (std::size_t j = 0; j < lf.embedding_ids.size(); ++j) {
                 if (j > 0) {
                     out << ",";
