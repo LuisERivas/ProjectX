@@ -649,9 +649,156 @@ struct VectorStore::Impl {
     static std::size_t compute_k_max(std::size_t n) {
         return std::max<std::size_t>(2, std::min<std::size_t>(256, n));
     }
-    static std::size_t compute_chosen_k(std::size_t n, std::size_t k_min, std::size_t k_max) {
-        const std::size_t base = std::max<std::size_t>(2, static_cast<std::size_t>(std::sqrt(static_cast<double>(n))));
-        return std::max(k_min, std::min(k_max, base));
+    struct KSelectionResult {
+        std::size_t chosen_k = 2;
+        double objective = 0.0;
+    };
+
+    static double l2_sq(const std::vector<float>& a, const std::vector<float>& b) {
+        double s = 0.0;
+        const std::size_t n = std::min(a.size(), b.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            s += d * d;
+        }
+        return s;
+    }
+
+    static std::vector<const std::vector<float>*> sample_vectors(const std::vector<const std::vector<float>*>& all) {
+        constexpr std::size_t kSampleCap = 512;
+        if (all.size() <= kSampleCap) {
+            return all;
+        }
+        std::vector<const std::vector<float>*> out;
+        out.reserve(kSampleCap);
+        const std::size_t stride = std::max<std::size_t>(1, all.size() / kSampleCap);
+        for (std::size_t i = 0; i < all.size() && out.size() < kSampleCap; i += stride) {
+            out.push_back(all[i]);
+        }
+        while (out.size() < kSampleCap) {
+            out.push_back(all[out.size() % all.size()]);
+        }
+        return out;
+    }
+
+    static double k_objective(const std::vector<const std::vector<float>*>& vectors, std::size_t k) {
+        if (vectors.empty()) {
+            return 0.0;
+        }
+        k = std::max<std::size_t>(1, std::min(k, vectors.size()));
+        std::vector<std::vector<float>> centroids;
+        centroids.reserve(k);
+        for (std::size_t i = 0; i < k; ++i) {
+            const std::size_t idx = (i * vectors.size()) / k;
+            centroids.push_back(*vectors[idx]);
+        }
+
+        std::vector<std::size_t> counts(k, 0);
+        std::vector<std::vector<float>> sums(k, std::vector<float>(kVectorDim, 0.0f));
+        double total = 0.0;
+        for (const auto* v : vectors) {
+            std::size_t best_j = 0;
+            double best_d = std::numeric_limits<double>::max();
+            for (std::size_t j = 0; j < k; ++j) {
+                const double d = l2_sq(*v, centroids[j]);
+                if (d < best_d) {
+                    best_d = d;
+                    best_j = j;
+                }
+            }
+            total += best_d;
+            ++counts[best_j];
+            for (std::size_t d = 0; d < kVectorDim; ++d) {
+                sums[best_j][d] += (*v)[d];
+            }
+        }
+
+        // One refinement keeps this objective embedding-aware while staying cheap.
+        for (std::size_t j = 0; j < k; ++j) {
+            if (counts[j] == 0) {
+                continue;
+            }
+            const float inv = 1.0f / static_cast<float>(counts[j]);
+            for (std::size_t d = 0; d < kVectorDim; ++d) {
+                centroids[j][d] = sums[j][d] * inv;
+            }
+        }
+
+        total = 0.0;
+        for (const auto* v : vectors) {
+            double best_d = std::numeric_limits<double>::max();
+            for (std::size_t j = 0; j < k; ++j) {
+                const double d = l2_sq(*v, centroids[j]);
+                if (d < best_d) {
+                    best_d = d;
+                }
+            }
+            total += best_d;
+        }
+        return total / static_cast<double>(vectors.size());
+    }
+
+    static KSelectionResult select_elbow_k_binary(const std::vector<const std::vector<float>*>& vectors,
+                                                  std::size_t k_min,
+                                                  std::size_t k_max) {
+        KSelectionResult out{};
+        if (vectors.empty()) {
+            out.chosen_k = std::max<std::size_t>(2, k_min);
+            out.objective = 0.0;
+            return out;
+        }
+        k_min = std::max<std::size_t>(2, k_min);
+        k_max = std::max(k_min, std::min(k_max, vectors.size()));
+        const auto sampled = sample_vectors(vectors);
+
+        std::unordered_map<std::size_t, double> cache;
+        auto eval = [&](std::size_t k) -> double {
+            const auto it = cache.find(k);
+            if (it != cache.end()) {
+                return it->second;
+            }
+            const double v = k_objective(sampled, k);
+            cache[k] = v;
+            return v;
+        };
+        auto knee_score = [&](std::size_t k) -> double {
+            if (k <= k_min || k >= k_max) {
+                return -std::numeric_limits<double>::infinity();
+            }
+            const double left = eval(k - 1);
+            const double mid = eval(k);
+            const double right = eval(k + 1);
+            return left - (2.0 * mid) + right;
+        };
+
+        std::size_t lo = k_min;
+        std::size_t hi = k_max;
+        while ((hi - lo) > 6) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            const double s_mid = knee_score(mid);
+            const double s_next = knee_score(std::min(mid + 1, k_max - 1));
+            if (s_mid <= s_next) {
+                lo = std::min(mid + 1, k_max);
+            } else {
+                hi = mid;
+            }
+        }
+
+        std::size_t best_k = k_min;
+        double best_score = -std::numeric_limits<double>::infinity();
+        for (std::size_t k = lo; k <= hi; ++k) {
+            const double s = knee_score(k);
+            if (s > best_score || (std::abs(s - best_score) < 1e-12 && k < best_k)) {
+                best_score = s;
+                best_k = k;
+            }
+        }
+        if (!std::isfinite(best_score)) {
+            best_k = k_min;
+        }
+        out.chosen_k = best_k;
+        out.objective = eval(best_k);
+        return out;
     }
 
     static std::vector<float> compute_centroid(const std::vector<const std::vector<float>*>& rows_ptr) {
@@ -671,7 +818,24 @@ struct VectorStore::Impl {
         return c;
     }
 
-    Status write_top_artifacts(const std::vector<Record>& recs, std::size_t k_min, std::size_t k_max, std::size_t chosen_k) {
+    std::vector<const std::vector<float>*> vectors_from_ids(const std::vector<std::uint64_t>& ids) const {
+        std::vector<const std::vector<float>*> out;
+        out.reserve(ids.size());
+        for (const auto id : ids) {
+            const auto it = rows.find(id);
+            if (it == rows.end() || it->second.deleted || it->second.vec.size() != kVectorDim) {
+                continue;
+            }
+            out.push_back(&it->second.vec);
+        }
+        return out;
+    }
+
+    Status write_top_artifacts(const std::vector<Record>& recs,
+                               std::size_t k_min,
+                               std::size_t k_max,
+                               std::size_t chosen_k,
+                               double objective) {
         fs::create_directories(clusters_current());
 
         std::vector<std::vector<const std::vector<float>*>> groups(chosen_k);
@@ -703,7 +867,7 @@ struct VectorStore::Impl {
         std::ostringstream elbow;
         elbow << "{\n"
               << "  \"chosen_k\": " << chosen_k << ",\n"
-              << "  \"objective\": " << std::fixed << std::setprecision(6) << 1.0 + (recs.empty() ? 0.0 : static_cast<double>(chosen_k) / static_cast<double>(recs.size())) << "\n"
+              << "  \"objective\": " << std::fixed << std::setprecision(6) << objective << "\n"
               << "}\n";
         const std::string stability = "{\n  \"status\": \"placeholder_m1\"\n}\n";
 
@@ -734,7 +898,7 @@ struct VectorStore::Impl {
         cstats.chosen_k = chosen_k;
         cstats.k_min = k_min;
         cstats.k_max = k_max;
-        cstats.objective = 1.0 + (recs.empty() ? 0.0 : static_cast<double>(chosen_k) / static_cast<double>(recs.size()));
+        cstats.objective = objective;
         chealth.available = true;
         chealth.passed = true;
         chealth.status = "ok";
@@ -783,7 +947,9 @@ struct VectorStore::Impl {
             std::sort(ids.begin(), ids.end());
             const auto k_min = compute_k_min(ids.size());
             const auto k_max = compute_k_max(ids.size());
-            const auto chosen_k = compute_chosen_k(ids.size(), k_min, k_max);
+            const auto vecs = vectors_from_ids(ids);
+            const auto selected = select_elbow_k_binary(vecs, k_min, k_max);
+            const auto chosen_k = selected.chosen_k;
             const auto bucket_count = std::max<std::size_t>(1, chosen_k);
 
             std::vector<std::vector<std::uint64_t>> buckets(bucket_count);
@@ -902,7 +1068,9 @@ struct VectorStore::Impl {
             std::sort(ids.begin(), ids.end());
             const auto k_min = compute_k_min(ids.size());
             const auto k_max = compute_k_max(ids.size());
-            const auto chosen_k = compute_chosen_k(ids.size(), k_min, k_max);
+            const auto vecs = vectors_from_ids(ids);
+            const auto selected = select_elbow_k_binary(vecs, k_min, k_max);
+            const auto chosen_k = selected.chosen_k;
             const bool cont = ids.size() >= 64;
             gate_rows.push_back(LowerGateEval{
                 mid,
@@ -1402,8 +1570,14 @@ Status VectorStore::build_top_clusters(std::uint32_t seed) {
     }
     const auto k_min = Impl::compute_k_min(recs.size());
     const auto k_max = Impl::compute_k_max(recs.size());
-    const auto chosen_k = Impl::compute_chosen_k(recs.size(), k_min, k_max);
-    const auto s = impl_->write_top_artifacts(recs, k_min, k_max, chosen_k);
+    std::vector<const std::vector<float>*> vecs;
+    vecs.reserve(recs.size());
+    for (const auto& r : recs) {
+        vecs.push_back(&r.vector);
+    }
+    const auto selected = Impl::select_elbow_k_binary(vecs, k_min, k_max);
+    const auto chosen_k = selected.chosen_k;
+    const auto s = impl_->write_top_artifacts(recs, k_min, k_max, chosen_k, selected.objective);
     if (!s.ok) {
         (void)impl_->write_cluster_runtime_state();
         impl_->emit_event("stage_fail", stage_id, "Top Layer", "failed", 0.0, pipeline.elapsed_ms(),
