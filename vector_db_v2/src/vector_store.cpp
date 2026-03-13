@@ -1,4 +1,5 @@
 #include "vector_db/vector_store.hpp"
+#include "vector_db/clustering.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -87,6 +88,24 @@ std::optional<std::uint64_t> extract_u64(const std::string& line, const std::str
     const auto end_pos = line.find_first_not_of("0123456789", num_pos);
     try {
         return static_cast<std::uint64_t>(std::stoull(line.substr(num_pos, end_pos - num_pos)));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<double> extract_double(const std::string& line, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    const auto key_pos = line.find(needle);
+    if (key_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto num_pos = line.find_first_of("-0123456789.", key_pos + needle.size());
+    if (num_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto end_pos = line.find_first_not_of("-0123456789.eE+", num_pos);
+    try {
+        return std::stod(line.substr(num_pos, end_pos - num_pos));
     } catch (...) {
         return std::nullopt;
     }
@@ -279,6 +298,8 @@ struct VectorStore::Impl {
     fs::path records_path() const { return root() / "records.jsonl"; }
     fs::path wal_path() const { return root() / "wal.log"; }
     fs::path clusters_current() const { return root() / "clusters" / "current"; }
+    fs::path cluster_stats_path() const { return clusters_current() / "cluster_stats.json"; }
+    fs::path cluster_health_path() const { return clusters_current() / "cluster_health.json"; }
     fs::path top_assignments_path() const { return clusters_current() / "assignments.json"; }
     fs::path mid_assignments_path() const { return clusters_current() / "mid_layer_clustering" / "assignments.json"; }
     fs::path lower_summary_path() const { return clusters_current() / "lower_layer_clustering" / "LOWER_LAYER_CLUSTERING.json"; }
@@ -350,6 +371,94 @@ struct VectorStore::Impl {
             return Status::Error("failed writing manifest");
         }
         return Status::Ok();
+    }
+
+    Status write_cluster_runtime_state() const {
+        std::ostringstream cs;
+        cs << "{\n"
+           << "  \"available\": " << (cstats.available ? "true" : "false") << ",\n"
+           << "  \"build_lsn\": " << cstats.build_lsn << ",\n"
+           << "  \"vectors_indexed\": " << cstats.vectors_indexed << ",\n"
+           << "  \"chosen_k\": " << cstats.chosen_k << ",\n"
+           << "  \"k_min\": " << cstats.k_min << ",\n"
+           << "  \"k_max\": " << cstats.k_max << ",\n"
+           << "  \"objective\": " << cstats.objective << ",\n"
+           << "  \"cuda_required\": " << (cstats.cuda_required ? "true" : "false") << ",\n"
+           << "  \"cuda_enabled\": " << (cstats.cuda_enabled ? "true" : "false") << ",\n"
+           << "  \"tensor_core_required\": " << (cstats.tensor_core_required ? "true" : "false") << ",\n"
+           << "  \"tensor_core_active\": " << (cstats.tensor_core_active ? "true" : "false") << ",\n"
+           << "  \"gpu_arch_class\": \"" << json_escape(cstats.gpu_arch_class) << "\",\n"
+           << "  \"kernel_backend_path\": \"" << json_escape(cstats.kernel_backend_path) << "\",\n"
+           << "  \"hot_path_language\": \"" << json_escape(cstats.hot_path_language) << "\",\n"
+           << "  \"compliance_status\": \"" << json_escape(cstats.compliance_status) << "\",\n"
+           << "  \"fallback_reason\": \"" << json_escape(cstats.fallback_reason) << "\",\n"
+           << "  \"non_compliance_stage\": \"" << json_escape(cstats.non_compliance_stage) << "\"\n"
+           << "}\n";
+        if (!write_text_atomic(cluster_stats_path(), cs.str())) {
+            return Status::Error("failed writing cluster_stats.json");
+        }
+
+        std::ostringstream ch;
+        ch << "{\n"
+           << "  \"available\": " << (chealth.available ? "true" : "false") << ",\n"
+           << "  \"passed\": " << (chealth.passed ? "true" : "false") << ",\n"
+           << "  \"mean_nmi\": " << chealth.mean_nmi << ",\n"
+           << "  \"std_nmi\": " << chealth.std_nmi << ",\n"
+           << "  \"mean_jaccard\": " << chealth.mean_jaccard << ",\n"
+           << "  \"mean_centroid_drift\": " << chealth.mean_centroid_drift << ",\n"
+           << "  \"status\": \"" << json_escape(chealth.status) << "\"\n"
+           << "}\n";
+        if (!write_text_atomic(cluster_health_path(), ch.str())) {
+            return Status::Error("failed writing cluster_health.json");
+        }
+        return Status::Ok();
+    }
+
+    void load_cluster_runtime_state() {
+        cstats = ClusterStats{};
+        chealth = ClusterHealth{};
+
+        {
+            std::ifstream in(cluster_stats_path(), std::ios::binary);
+            if (in) {
+                std::ostringstream os;
+                os << in.rdbuf();
+                const std::string body = os.str();
+                if (const auto v = extract_bool(body, "available")) cstats.available = *v;
+                if (const auto v = extract_u64(body, "build_lsn")) cstats.build_lsn = *v;
+                if (const auto v = extract_u64(body, "vectors_indexed")) cstats.vectors_indexed = static_cast<std::size_t>(*v);
+                if (const auto v = extract_u64(body, "chosen_k")) cstats.chosen_k = static_cast<std::size_t>(*v);
+                if (const auto v = extract_u64(body, "k_min")) cstats.k_min = static_cast<std::size_t>(*v);
+                if (const auto v = extract_u64(body, "k_max")) cstats.k_max = static_cast<std::size_t>(*v);
+                if (const auto v = extract_double(body, "objective")) cstats.objective = *v;
+                if (const auto v = extract_bool(body, "cuda_required")) cstats.cuda_required = *v;
+                if (const auto v = extract_bool(body, "cuda_enabled")) cstats.cuda_enabled = *v;
+                if (const auto v = extract_bool(body, "tensor_core_required")) cstats.tensor_core_required = *v;
+                if (const auto v = extract_bool(body, "tensor_core_active")) cstats.tensor_core_active = *v;
+                if (const auto v = extract_string(body, "gpu_arch_class")) cstats.gpu_arch_class = *v;
+                if (const auto v = extract_string(body, "kernel_backend_path")) cstats.kernel_backend_path = *v;
+                if (const auto v = extract_string(body, "hot_path_language")) cstats.hot_path_language = *v;
+                if (const auto v = extract_string(body, "compliance_status")) cstats.compliance_status = *v;
+                if (const auto v = extract_string(body, "fallback_reason")) cstats.fallback_reason = *v;
+                if (const auto v = extract_string(body, "non_compliance_stage")) cstats.non_compliance_stage = *v;
+            }
+        }
+
+        {
+            std::ifstream in(cluster_health_path(), std::ios::binary);
+            if (in) {
+                std::ostringstream os;
+                os << in.rdbuf();
+                const std::string body = os.str();
+                if (const auto v = extract_bool(body, "available")) chealth.available = *v;
+                if (const auto v = extract_bool(body, "passed")) chealth.passed = *v;
+                if (const auto v = extract_double(body, "mean_nmi")) chealth.mean_nmi = *v;
+                if (const auto v = extract_double(body, "std_nmi")) chealth.std_nmi = *v;
+                if (const auto v = extract_double(body, "mean_jaccard")) chealth.mean_jaccard = *v;
+                if (const auto v = extract_double(body, "mean_centroid_drift")) chealth.mean_centroid_drift = *v;
+                if (const auto v = extract_string(body, "status")) chealth.status = *v;
+            }
+        }
     }
 
     Status write_records() const {
@@ -951,6 +1060,7 @@ Status VectorStore::open() {
     impl_->load_manifest_from_disk();
     impl_->load_records_from_disk();
     impl_->load_wal_count();
+    impl_->load_cluster_runtime_state();
     impl_->opened = true;
     return Status::Ok();
 }
@@ -1088,7 +1198,11 @@ Status VectorStore::build_top_clusters(std::uint32_t seed) {
     const std::string stage_id = "top";
     impl_->emit_event("stage_start", stage_id, "Top Layer", "running", 0.0, pipeline.elapsed_ms());
     impl_->apply_compliance(stage_id);
+    impl_->chealth.available = true;
+    impl_->chealth.passed = (impl_->cstats.compliance_status == "pass");
+    impl_->chealth.status = impl_->chealth.passed ? "ok" : "hardware_non_compliance";
     if (impl_->cstats.compliance_status != "pass") {
+        (void)impl_->write_cluster_runtime_state();
         impl_->emit_event("stage_fail", stage_id, "Top Layer", "failed", 0.0, pipeline.elapsed_ms(),
                           {{"error_code", "hardware_non_compliance"}, {"error_message", impl_->cstats.fallback_reason},
                            {"non_compliance_stage", impl_->cstats.non_compliance_stage}});
@@ -1103,10 +1217,12 @@ Status VectorStore::build_top_clusters(std::uint32_t seed) {
     const auto chosen_k = Impl::compute_chosen_k(recs.size(), k_min, k_max);
     const auto s = impl_->write_top_artifacts(recs, k_min, k_max, chosen_k);
     if (!s.ok) {
+        (void)impl_->write_cluster_runtime_state();
         impl_->emit_event("stage_fail", stage_id, "Top Layer", "failed", 0.0, pipeline.elapsed_ms(),
                           {{"error_code", "top_write_failed"}, {"error_message", s.message}});
         return s;
     }
+    (void)impl_->write_cluster_runtime_state();
     impl_->emit_event("stage_end", stage_id, "Top Layer", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms(),
                       {{"records_processed", std::to_string(recs.size())}});
     impl_->emit_event("pipeline_summary", "pipeline", "Pipeline Summary", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
@@ -1121,7 +1237,11 @@ Status VectorStore::build_mid_layer_clusters(std::uint32_t seed) {
     const std::string stage_id = "mid";
     impl_->emit_event("stage_start", stage_id, "Mid Layer", "running", 0.0, pipeline.elapsed_ms());
     impl_->apply_compliance(stage_id);
+    impl_->chealth.available = true;
+    impl_->chealth.passed = (impl_->cstats.compliance_status == "pass");
+    impl_->chealth.status = impl_->chealth.passed ? "ok" : "hardware_non_compliance";
     if (impl_->cstats.compliance_status != "pass") {
+        (void)impl_->write_cluster_runtime_state();
         impl_->emit_event("stage_fail", stage_id, "Mid Layer", "failed", 0.0, pipeline.elapsed_ms(),
                           {{"error_code", "hardware_non_compliance"}, {"error_message", impl_->cstats.fallback_reason},
                            {"non_compliance_stage", impl_->cstats.non_compliance_stage}});
@@ -1133,10 +1253,12 @@ Status VectorStore::build_mid_layer_clusters(std::uint32_t seed) {
     }
     const auto s = impl_->write_mid_artifacts(top_groups, seed);
     if (!s.ok) {
+        (void)impl_->write_cluster_runtime_state();
         impl_->emit_event("stage_fail", stage_id, "Mid Layer", "failed", 0.0, pipeline.elapsed_ms(),
                           {{"error_code", "mid_write_failed"}, {"error_message", s.message}});
         return s;
     }
+    (void)impl_->write_cluster_runtime_state();
     impl_->emit_event("stage_end", stage_id, "Mid Layer", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
     impl_->emit_event("pipeline_summary", "pipeline", "Pipeline Summary", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
     return Status::Ok();
@@ -1150,7 +1272,11 @@ Status VectorStore::build_lower_layer_clusters(std::uint32_t seed) {
     const std::string stage_id = "lower";
     impl_->emit_event("stage_start", stage_id, "Lower Layer", "running", 0.0, pipeline.elapsed_ms());
     impl_->apply_compliance(stage_id);
+    impl_->chealth.available = true;
+    impl_->chealth.passed = (impl_->cstats.compliance_status == "pass");
+    impl_->chealth.status = impl_->chealth.passed ? "ok" : "hardware_non_compliance";
     if (impl_->cstats.compliance_status != "pass") {
+        (void)impl_->write_cluster_runtime_state();
         impl_->emit_event("stage_fail", stage_id, "Lower Layer", "failed", 0.0, pipeline.elapsed_ms(),
                           {{"error_code", "hardware_non_compliance"}, {"error_message", impl_->cstats.fallback_reason},
                            {"non_compliance_stage", impl_->cstats.non_compliance_stage}});
@@ -1162,10 +1288,12 @@ Status VectorStore::build_lower_layer_clusters(std::uint32_t seed) {
     }
     const auto s = impl_->write_lower_artifacts(mid_groups, seed);
     if (!s.ok) {
+        (void)impl_->write_cluster_runtime_state();
         impl_->emit_event("stage_fail", stage_id, "Lower Layer", "failed", 0.0, pipeline.elapsed_ms(),
                           {{"error_code", "lower_write_failed"}, {"error_message", s.message}});
         return s;
     }
+    (void)impl_->write_cluster_runtime_state();
     impl_->emit_event("stage_end", stage_id, "Lower Layer", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
     impl_->emit_event("pipeline_summary", "pipeline", "Pipeline Summary", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
     return Status::Ok();
@@ -1180,7 +1308,11 @@ Status VectorStore::build_final_layer_clusters(std::uint32_t seed) {
     const std::string stage_id = "final";
     impl_->emit_event("stage_start", stage_id, "Final Layer", "running", 0.0, pipeline.elapsed_ms());
     impl_->apply_compliance(stage_id);
+    impl_->chealth.available = true;
+    impl_->chealth.passed = (impl_->cstats.compliance_status == "pass");
+    impl_->chealth.status = impl_->chealth.passed ? "ok" : "hardware_non_compliance";
     if (impl_->cstats.compliance_status != "pass") {
+        (void)impl_->write_cluster_runtime_state();
         impl_->emit_event("stage_fail", stage_id, "Final Layer", "failed", 0.0, pipeline.elapsed_ms(),
                           {{"error_code", "hardware_non_compliance"}, {"error_message", impl_->cstats.fallback_reason},
                            {"non_compliance_stage", impl_->cstats.non_compliance_stage}});
@@ -1188,10 +1320,12 @@ Status VectorStore::build_final_layer_clusters(std::uint32_t seed) {
     }
     const auto s = impl_->write_final_artifacts();
     if (!s.ok) {
+        (void)impl_->write_cluster_runtime_state();
         impl_->emit_event("stage_fail", stage_id, "Final Layer", "failed", 0.0, pipeline.elapsed_ms(),
                           {{"error_code", "final_write_failed"}, {"error_message", s.message}});
         return s;
     }
+    (void)impl_->write_cluster_runtime_state();
     impl_->emit_event("stage_end", stage_id, "Final Layer", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
     impl_->emit_event("pipeline_summary", "pipeline", "Pipeline Summary", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
     return Status::Ok();
