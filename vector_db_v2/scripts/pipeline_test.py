@@ -50,7 +50,7 @@ def count_unique_key_rows(path: Path, key: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=200)
+    parser.add_argument("--rows", type=int, default=10000)
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
 

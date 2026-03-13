@@ -703,18 +703,43 @@ struct VectorStore::Impl {
         }
         std::sort(ordered_keys.begin(), ordered_keys.end());
 
-        const std::size_t mid_k = std::max<std::size_t>(1, std::min<std::size_t>(ordered_keys.size(), 64));
-
         std::ostringstream assignments;
         assignments << "[\n";
         std::size_t row_count = 0;
+        std::size_t mid_centroid_count = 0;
         for (const auto& top_id : ordered_keys) {
-            const auto& ids = top_groups.at(top_id);
-            for (const auto id : ids) {
-                const std::string mid_id = "mid_" + std::to_string(static_cast<std::size_t>(id % mid_k));
-                assignments << "  {\"embedding_id\": " << id << ", \"mid_centroid_id\": \"" << mid_id
+            auto ids = top_groups.at(top_id);
+            std::sort(ids.begin(), ids.end());
+
+            std::vector<std::uint64_t> mid_a;
+            std::vector<std::uint64_t> mid_b;
+            mid_a.reserve((ids.size() + 1) / 2);
+            mid_b.reserve(ids.size() / 2);
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                if ((i % 2U) == 0U) {
+                    mid_a.push_back(ids[i]);
+                } else {
+                    mid_b.push_back(ids[i]);
+                }
+            }
+
+            const std::string mid_a_id = "mid_" + top_id + "_a";
+            const std::string mid_b_id = "mid_" + top_id + "_b";
+
+            for (const auto id : mid_a) {
+                assignments << "  {\"embedding_id\": " << id << ", \"mid_centroid_id\": \"" << mid_a_id
                             << "\", \"parent_top_centroid_id\": \"" << top_id << "\"},\n";
                 ++row_count;
+            }
+            ++mid_centroid_count;
+
+            if (!mid_b.empty()) {
+                for (const auto id : mid_b) {
+                    assignments << "  {\"embedding_id\": " << id << ", \"mid_centroid_id\": \"" << mid_b_id
+                                << "\", \"parent_top_centroid_id\": \"" << top_id << "\"},\n";
+                    ++row_count;
+                }
+                ++mid_centroid_count;
             }
         }
         std::string text = assignments.str();
@@ -732,7 +757,7 @@ struct VectorStore::Impl {
                 << "  \"stage\": \"mid\",\n"
                 << "  \"single_global_pass\": true,\n"
                 << "  \"rows_processed\": " << row_count << ",\n"
-                << "  \"centroids\": " << mid_k << "\n"
+                << "  \"centroids\": " << mid_centroid_count << "\n"
                 << "}\n";
         if (!write_text_atomic(dir / "MID_LAYER_CLUSTERING.json", summary.str())) {
             return Status::Error("failed writing mid summary");
