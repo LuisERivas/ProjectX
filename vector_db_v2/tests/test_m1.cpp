@@ -72,12 +72,48 @@ int main() {
         return 1;
     }
 
+    std::vector<vector_db_v2::Record> batch;
+    batch.reserve(200);
     for (std::uint64_t id = 1; id <= 200; ++id) {
-        s = store.insert(id, make_vec(id));
-        if (!s.ok) {
-            std::cerr << "insert failed at id " << id << ": " << s.message << "\n";
-            return 1;
-        }
+        batch.push_back(vector_db_v2::Record{id, make_vec(id)});
+    }
+    s = store.insert_batch(batch);
+    if (!s.ok) {
+        std::cerr << "insert_batch failed: " << s.message << "\n";
+        return 1;
+    }
+
+    const auto wal_before_ckpt = store.wal_stats();
+    if (wal_before_ckpt.wal_entries != 200 || wal_before_ckpt.last_lsn != 200) {
+        std::cerr << "unexpected wal stats before checkpoint\n";
+        return 1;
+    }
+
+    s = store.checkpoint();
+    if (!s.ok) {
+        std::cerr << "checkpoint failed: " << s.message << "\n";
+        return 1;
+    }
+    const auto wal_after_ckpt = store.wal_stats();
+    if (wal_after_ckpt.wal_entries != 0 || wal_after_ckpt.checkpoint_lsn != wal_before_ckpt.last_lsn) {
+        std::cerr << "unexpected wal stats after checkpoint\n";
+        return 1;
+    }
+
+    s = store.close();
+    if (!s.ok) {
+        std::cerr << "close failed: " << s.message << "\n";
+        return 1;
+    }
+    s = store.open();
+    if (!s.ok) {
+        std::cerr << "re-open failed: " << s.message << "\n";
+        return 1;
+    }
+    const auto st_after_reopen = store.stats();
+    if (st_after_reopen.live_rows != 200) {
+        std::cerr << "live_rows mismatch after reopen\n";
+        return 1;
     }
 
     s = store.build_top_clusters(1234);

@@ -290,12 +290,14 @@ struct VectorStore::Impl {
     std::uint64_t checkpoint_lsn = 0;
     std::uint64_t last_lsn = 0;
     std::size_t wal_entries = 0;
+    BulkInsertMetrics last_bulk_metrics{};
     ClusterStats cstats{};
     ClusterHealth chealth{};
 
     fs::path root() const { return fs::path(data_dir); }
     fs::path manifest_path() const { return root() / "manifest.json"; }
     fs::path records_path() const { return root() / "records.jsonl"; }
+    fs::path records_delta_path() const { return root() / "records_delta.jsonl"; }
     fs::path wal_path() const { return root() / "wal.log"; }
     fs::path clusters_current() const { return root() / "clusters" / "current"; }
     fs::path cluster_stats_path() const { return clusters_current() / "cluster_stats.json"; }
@@ -488,6 +490,40 @@ struct VectorStore::Impl {
         return Status::Ok();
     }
 
+    Status append_records_delta(const std::vector<Record>& records) const {
+        if (records.empty()) {
+            return Status::Ok();
+        }
+        fs::create_directories(root());
+        std::ofstream out(records_delta_path(), std::ios::binary | std::ios::app);
+        if (!out) {
+            return Status::Error("failed opening records delta");
+        }
+        for (const auto& r : records) {
+            out << "{\"embedding_id\": " << r.embedding_id
+                << ", \"deleted\": false"
+                << ", \"vector\": " << vec_to_json_array(r.vector) << "}\n";
+        }
+        return Status::Ok();
+    }
+
+    Status append_delete_delta(std::uint64_t embedding_id) const {
+        fs::create_directories(root());
+        std::ofstream out(records_delta_path(), std::ios::binary | std::ios::app);
+        if (!out) {
+            return Status::Error("failed opening records delta");
+        }
+        out << "{\"embedding_id\": " << embedding_id << ", \"deleted\": true, \"vector\": []}\n";
+        return Status::Ok();
+    }
+
+    Status truncate_records_delta() const {
+        if (!write_text_atomic(records_delta_path(), "")) {
+            return Status::Error("failed truncating records delta");
+        }
+        return Status::Ok();
+    }
+
     Status append_wal(const std::string& op, std::uint64_t id) {
         fs::create_directories(root());
         std::ofstream out(wal_path(), std::ios::binary | std::ios::app);
@@ -500,27 +536,54 @@ struct VectorStore::Impl {
         return Status::Ok();
     }
 
+    Status append_wal_batch(const std::string& op, const std::vector<std::uint64_t>& ids) {
+        if (ids.empty()) {
+            return Status::Ok();
+        }
+        fs::create_directories(root());
+        std::ofstream out(wal_path(), std::ios::binary | std::ios::app);
+        if (!out) {
+            return Status::Error("failed opening wal");
+        }
+        for (const auto id : ids) {
+            ++last_lsn;
+            ++wal_entries;
+            out << "{\"lsn\": " << last_lsn << ", \"op\": \"" << op << "\", \"embedding_id\": " << id << "}\n";
+        }
+        return Status::Ok();
+    }
+
+    void apply_record_line(const std::string& line) {
+        const auto id = extract_u64(line, "embedding_id");
+        const auto del = extract_bool(line, "deleted");
+        const auto vec = extract_vector_array(line);
+        if (!id.has_value() || !del.has_value()) {
+            return;
+        }
+        if (*del) {
+            rows[*id] = Row{*id, {}, true};
+            return;
+        }
+        if (!vec.has_value() || vec->size() != kVectorDim) {
+            return;
+        }
+        rows[*id] = Row{*id, *vec, false};
+    }
+
     void load_records_from_disk() {
         rows.clear();
         std::ifstream in(records_path(), std::ios::binary);
-        if (!in) {
-            return;
-        }
         std::string line;
-        while (std::getline(in, line)) {
-            if (line.empty()) {
-                continue;
+        while (in && std::getline(in, line)) {
+            if (!line.empty()) {
+                apply_record_line(line);
             }
-            const auto id = extract_u64(line, "embedding_id");
-            const auto del = extract_bool(line, "deleted");
-            const auto vec = extract_vector_array(line);
-            if (!id.has_value() || !del.has_value() || !vec.has_value()) {
-                continue;
+        }
+        std::ifstream delta(records_delta_path(), std::ios::binary);
+        while (delta && std::getline(delta, line)) {
+            if (!line.empty()) {
+                apply_record_line(line);
             }
-            if (vec->size() != kVectorDim) {
-                continue;
-            }
-            rows[*id] = Row{*id, *vec, *del};
         }
     }
 
@@ -551,6 +614,11 @@ struct VectorStore::Impl {
         while (std::getline(in, line)) {
             if (!line.empty()) {
                 ++wal_entries;
+                if (const auto lsn = extract_u64(line, "lsn")) {
+                    if (*lsn > last_lsn) {
+                        last_lsn = *lsn;
+                    }
+                }
             }
         }
     }
@@ -1069,6 +1137,10 @@ Status VectorStore::init() {
     if (!s2.ok) {
         return s2;
     }
+    const auto s3 = impl_->truncate_records_delta();
+    if (!s3.ok) {
+        return s3;
+    }
     if (!write_text_atomic(impl_->wal_path(), "")) {
         return Status::Error("failed creating wal");
     }
@@ -1104,6 +1176,14 @@ Status VectorStore::checkpoint() {
     if (!s.ok) {
         return s;
     }
+    const auto s2 = impl_->write_records();
+    if (!s2.ok) {
+        return s2;
+    }
+    const auto s3 = impl_->truncate_records_delta();
+    if (!s3.ok) {
+        return s3;
+    }
     impl_->wal_entries = 0;
     if (!write_text_atomic(impl_->wal_path(), "")) {
         return Status::Error("failed truncating wal");
@@ -1123,24 +1203,43 @@ Status VectorStore::insert(std::uint64_t embedding_id, const std::vector<float>&
         return s;
     }
     impl_->rows[embedding_id] = Impl::Row{embedding_id, vector_fp32_1024, false};
-    return impl_->write_records();
+    const std::vector<Record> delta = {{embedding_id, vector_fp32_1024}};
+    return impl_->append_records_delta(delta);
 }
 
 Status VectorStore::insert_batch(const std::vector<Record>& records) {
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
+    Timer total;
+    std::vector<std::uint64_t> ids;
+    ids.reserve(records.size());
     for (const auto& r : records) {
         if (r.vector.size() != kVectorDim) {
             return Status::Error("vector dimension mismatch in batch");
         }
-        const auto s = impl_->append_wal("insert", r.embedding_id);
-        if (!s.ok) {
-            return s;
-        }
+        ids.push_back(r.embedding_id);
+    }
+    Timer wal_timer;
+    const auto s = impl_->append_wal_batch("insert", ids);
+    const double wal_ms = wal_timer.elapsed_ms();
+    if (!s.ok) {
+        return s;
+    }
+    for (const auto& r : records) {
         impl_->rows[r.embedding_id] = Impl::Row{r.embedding_id, r.vector, false};
     }
-    return impl_->write_records();
+    Timer persist_timer;
+    const auto s2 = impl_->append_records_delta(records);
+    const double persist_ms = persist_timer.elapsed_ms();
+    if (!s2.ok) {
+        return s2;
+    }
+    impl_->last_bulk_metrics.rows = records.size();
+    impl_->last_bulk_metrics.wal_ms = wal_ms;
+    impl_->last_bulk_metrics.persist_ms = persist_ms;
+    impl_->last_bulk_metrics.total_ms = total.elapsed_ms();
+    return Status::Ok();
 }
 
 Status VectorStore::remove(std::uint64_t embedding_id) {
@@ -1156,7 +1255,11 @@ Status VectorStore::remove(std::uint64_t embedding_id) {
         return s;
     }
     it->second.deleted = true;
-    return impl_->write_records();
+    const auto s2 = impl_->append_delete_delta(embedding_id);
+    if (!s2.ok) {
+        return s2;
+    }
+    return Status::Ok();
 }
 
 std::optional<Record> VectorStore::get(std::uint64_t embedding_id) const {
@@ -1213,6 +1316,7 @@ WalStats VectorStore::wal_stats() const {
 
 ClusterStats VectorStore::cluster_stats() const { return impl_->cstats; }
 ClusterHealth VectorStore::cluster_health() const { return impl_->chealth; }
+BulkInsertMetrics VectorStore::last_bulk_insert_metrics() const { return impl_->last_bulk_metrics; }
 
 Status VectorStore::build_top_clusters(std::uint32_t seed) {
     (void)seed;

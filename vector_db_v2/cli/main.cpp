@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -72,6 +73,24 @@ std::optional<std::vector<float>> parse_vector_1024(const std::string& file_or_c
     return values;
 }
 
+bool parse_vector_csv_1024(const std::string& csv, std::vector<float>& out) {
+    out.clear();
+    out.reserve(vector_db_v2::kVectorDim);
+    std::stringstream ss(csv);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        if (token.empty()) {
+            continue;
+        }
+        try {
+            out.push_back(std::stof(token));
+        } catch (...) {
+            return false;
+        }
+    }
+    return out.size() == vector_db_v2::kVectorDim;
+}
+
 std::optional<std::uint64_t> extract_u64(const std::string& line, const std::string& key) {
     const std::string needle = "\"" + key + "\"";
     const auto key_pos = line.find(needle);
@@ -127,7 +146,7 @@ void print_usage() {
               << "Commands:\n"
               << "  init --path <data_dir>\n"
               << "  insert --path <data_dir> --id <u64> --vec <file_or_csv>\n"
-              << "  bulk-insert --path <data_dir> --input <jsonl>\n"
+              << "  bulk-insert --path <data_dir> --input <jsonl> [--batch-size <u32>]\n"
               << "  delete --path <data_dir> --id <u64>\n"
               << "  get --path <data_dir> --id <u64>\n"
               << "  search --path <data_dir> --vec <file_or_csv> [--topk <u32>]\n"
@@ -213,9 +232,23 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::vector<vector_db_v2::Record> batch;
-        batch.reserve(256);
+        std::size_t batch_size = 4096;
+        const std::string batch_size_arg = get_arg(args, "--batch-size");
+        if (!batch_size_arg.empty()) {
+            batch_size = static_cast<std::size_t>(std::stoul(batch_size_arg));
+            if (batch_size == 0) {
+                std::cerr << "error: --batch-size must be >= 1\n";
+                return 1;
+            }
+        }
+        batch.reserve(batch_size);
+        std::vector<float> parsed_vec;
         std::string line;
         std::size_t inserted = 0;
+        double parse_ms = 0.0;
+        double wal_ms = 0.0;
+        double persist_ms = 0.0;
+        const auto total_start = std::chrono::steady_clock::now();
         while (std::getline(in, line)) {
             if (line.empty()) {
                 continue;
@@ -226,18 +259,22 @@ int main(int argc, char** argv) {
                 std::cerr << "error: invalid jsonl row\n";
                 return 1;
             }
-            const auto vec = parse_vector_1024(*vec_csv);
-            if (!vec.has_value()) {
+            const auto parse_start = std::chrono::steady_clock::now();
+            if (!parse_vector_csv_1024(*vec_csv, parsed_vec)) {
                 std::cerr << "error: invalid vector row\n";
                 return 1;
             }
-            batch.push_back(vector_db_v2::Record{*id, *vec});
-            if (batch.size() >= 256) {
+            parse_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - parse_start).count();
+            batch.push_back(vector_db_v2::Record{*id, parsed_vec});
+            if (batch.size() >= batch_size) {
                 const auto s = store.insert_batch(batch);
                 if (!s.ok) {
                     std::cerr << "error: " << s.message << "\n";
                     return 1;
                 }
+                const auto m = store.last_bulk_insert_metrics();
+                wal_ms += m.wal_ms;
+                persist_ms += m.persist_ms;
                 inserted += batch.size();
                 batch.clear();
             }
@@ -248,8 +285,16 @@ int main(int argc, char** argv) {
                 std::cerr << "error: " << s.message << "\n";
                 return 1;
             }
+            const auto m = store.last_bulk_insert_metrics();
+            wal_ms += m.wal_ms;
+            persist_ms += m.persist_ms;
             inserted += batch.size();
         }
+        const auto total_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - total_start).count();
+        std::cout << std::fixed << std::setprecision(3)
+                  << "bulk-insert summary: parse_ms=" << parse_ms << " wal_ms=" << wal_ms
+                  << " persist_ms=" << persist_ms << " total_ms=" << total_ms << "\n";
         std::cout << "ok: bulk inserted " << inserted << "\n";
         return 0;
     }

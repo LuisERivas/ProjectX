@@ -66,6 +66,13 @@ struct ClusterHealth {
     std::string status = "ok";
 };
 
+struct BulkInsertMetrics {
+    std::size_t rows = 0;
+    double wal_ms = 0.0;
+    double persist_ms = 0.0;
+    double total_ms = 0.0;
+};
+
 class VectorStore {
 public:
     explicit VectorStore(std::string data_dir);
@@ -86,6 +93,7 @@ public:
     WalStats wal_stats() const;
     ClusterStats cluster_stats() const;
     ClusterHealth cluster_health() const;
+    BulkInsertMetrics last_bulk_insert_metrics() const;
 
     Status build_top_clusters(std::uint32_t seed = 1234);
     Status build_mid_layer_clusters(std::uint32_t seed = 1234);

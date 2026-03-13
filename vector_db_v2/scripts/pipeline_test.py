@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -102,6 +103,7 @@ def main() -> int:
     parser.add_argument("--noise-std", type=float, default=0.08)
     parser.add_argument("--outlier-ratio", type=float, default=0.03)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=4096)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -136,7 +138,16 @@ def main() -> int:
     print_generation_summary(args.rows, args.seed, args.synthetic_clusters, args.noise_std, args.outlier_ratio)
 
     run_stage("init", [str(cli), "init", "--path", str(data_dir)], root)
-    run_stage("bulk-insert", [str(cli), "bulk-insert", "--path", str(data_dir), "--input", str(payload)], root)
+    bulk_text = run_stage(
+        "bulk-insert",
+        [str(cli), "bulk-insert", "--path", str(data_dir), "--input", str(payload), "--batch-size", str(args.batch_size)],
+        root,
+    )
+    if not re.search(
+        r"bulk-insert summary:\s+parse_ms=\d+(\.\d+)?\s+wal_ms=\d+(\.\d+)?\s+persist_ms=\d+(\.\d+)?\s+total_ms=\d+(\.\d+)?",
+        bulk_text,
+    ):
+        raise RuntimeError("bulk-insert summary line missing or malformed")
     run_stage("checkpoint", [str(cli), "checkpoint", "--path", str(data_dir)], root)
     run_stage("build-top-clusters", [str(cli), "build-top-clusters", "--path", str(data_dir)], root)
     run_stage("build-mid-layer-clusters", [str(cli), "build-mid-layer-clusters", "--path", str(data_dir)], root)
