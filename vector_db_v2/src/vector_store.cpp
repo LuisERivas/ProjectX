@@ -305,6 +305,7 @@ struct VectorStore::Impl {
     fs::path top_assignments_path() const { return clusters_current() / "assignments.json"; }
     fs::path mid_assignments_path() const { return clusters_current() / "mid_layer_clustering" / "assignments.json"; }
     fs::path lower_summary_path() const { return clusters_current() / "lower_layer_clustering" / "LOWER_LAYER_CLUSTERING.json"; }
+    fs::path cluster_counts_by_level_path() const { return clusters_current() / "CLUSTER_COUNTS_BY_LEVEL.json"; }
 
     bool mock_cuda_enabled() const {
         const char* env_non = std::getenv("VECTOR_DB_V2_FORCE_NON_COMPLIANT");
@@ -1233,8 +1234,14 @@ struct VectorStore::Impl {
             leaf_sets.push_back({*cid, ids});
         }
         std::sort(leaf_sets.begin(), leaf_sets.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        const auto top_groups = read_assignment_groups(top_assignments_path(), "top_centroid_id");
+        const auto mid_groups = read_assignment_groups(mid_assignments_path(), "mid_centroid_id");
 
-        const std::size_t min_points_policy = 4;
+        const std::size_t total_embeddings =
+            (cstats.vectors_indexed > 0) ? cstats.vectors_indexed : live_ids_sorted().size();
+        const std::size_t raw_min_points =
+            static_cast<std::size_t>(std::ceil(static_cast<double>(total_embeddings) * 1e-5));
+        const std::size_t min_points_policy = std::clamp<std::size_t>(raw_min_points, 4, 10000);
         std::ostringstream aggregate;
         aggregate << "{\n"
                   << "  \"stage\": \"final\",\n"
@@ -1242,6 +1249,13 @@ struct VectorStore::Impl {
                   << "  \"per_centroid\": [\n";
 
         std::size_t written = 0;
+        struct FinalCountRow {
+            std::string centroid_id;
+            std::size_t embedding_count = 0;
+            std::string output_status;
+        };
+        std::vector<FinalCountRow> final_counts;
+        final_counts.reserve(leaf_sets.size());
         for (std::size_t i = 0; i < leaf_sets.size(); ++i) {
             const auto& cid = leaf_sets[i].first;
             const auto& ids = leaf_sets[i].second;
@@ -1255,6 +1269,7 @@ struct VectorStore::Impl {
                         {"final_layer_eligibility_reason", pre.reason_code}});
 
             if (!pre.valid) {
+                final_counts.push_back(FinalCountRow{cid, ids.size(), "skipped_preflight_failed"});
                 aggregate << "    {\"centroid_id\": \"" << cid << "\", \"final_layer_preflight_valid\": false, "
                           << "\"preflight_reason_code\": \"" << pre.reason_code
                           << "\", \"final_layer_output_status\": \"skipped_preflight_failed\"}";
@@ -1329,6 +1344,7 @@ struct VectorStore::Impl {
                        {{"centroid_id", cid}, {"final_layer_preflight_valid", "true"},
                         {"preflight_reason_code", pre.reason_code}, {"labels_file_present", "true"},
                         {"labels_schema_valid", "true"}, {"final_layer_output_status", "written"}});
+            final_counts.push_back(FinalCountRow{cid, labels.size(), "written"});
             ++written;
         }
 
@@ -1337,6 +1353,71 @@ struct VectorStore::Impl {
                   << "}\n";
         if (!write_text_atomic(final_dir / "FINAL_LAYER_DBSCAN.json", aggregate.str())) {
             return Status::Error("failed writing FINAL_LAYER_DBSCAN.json");
+        }
+
+        std::vector<std::string> top_ids;
+        top_ids.reserve(top_groups.size());
+        for (const auto& kv : top_groups) {
+            top_ids.push_back(kv.first);
+        }
+        std::sort(top_ids.begin(), top_ids.end());
+
+        std::vector<std::string> mid_ids;
+        mid_ids.reserve(mid_groups.size());
+        for (const auto& kv : mid_groups) {
+            mid_ids.push_back(kv.first);
+        }
+        std::sort(mid_ids.begin(), mid_ids.end());
+
+        std::ostringstream counts;
+        counts << "{\n"
+               << "  \"total_embeddings\": " << total_embeddings << ",\n"
+               << "  \"top\": [\n";
+        for (std::size_t i = 0; i < top_ids.size(); ++i) {
+            const auto& cid = top_ids[i];
+            counts << "    {\"centroid_id\": \"" << cid << "\", \"embedding_count\": " << top_groups.at(cid).size() << "}";
+            if (i + 1 < top_ids.size()) {
+                counts << ",";
+            }
+            counts << "\n";
+        }
+        counts << "  ],\n"
+               << "  \"mid\": [\n";
+        for (std::size_t i = 0; i < mid_ids.size(); ++i) {
+            const auto& cid = mid_ids[i];
+            counts << "    {\"centroid_id\": \"" << cid << "\", \"embedding_count\": " << mid_groups.at(cid).size() << "}";
+            if (i + 1 < mid_ids.size()) {
+                counts << ",";
+            }
+            counts << "\n";
+        }
+        counts << "  ],\n"
+               << "  \"lower\": [\n";
+        for (std::size_t i = 0; i < leaf_sets.size(); ++i) {
+            const auto& cid = leaf_sets[i].first;
+            const auto& ids = leaf_sets[i].second;
+            counts << "    {\"centroid_id\": \"" << cid << "\", \"embedding_count\": " << ids.size() << "}";
+            if (i + 1 < leaf_sets.size()) {
+                counts << ",";
+            }
+            counts << "\n";
+        }
+        counts << "  ],\n"
+               << "  \"final\": [\n";
+        for (std::size_t i = 0; i < final_counts.size(); ++i) {
+            const auto& row = final_counts[i];
+            counts << "    {\"centroid_id\": \"" << row.centroid_id
+                   << "\", \"embedding_count\": " << row.embedding_count
+                   << ", \"output_status\": \"" << row.output_status << "\"}";
+            if (i + 1 < final_counts.size()) {
+                counts << ",";
+            }
+            counts << "\n";
+        }
+        counts << "  ]\n"
+               << "}\n";
+        if (!write_text_atomic(cluster_counts_by_level_path(), counts.str())) {
+            return Status::Error("failed writing CLUSTER_COUNTS_BY_LEVEL.json");
         }
         return Status::Ok();
     }
