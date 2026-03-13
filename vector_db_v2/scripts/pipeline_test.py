@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import shutil
 import subprocess
 import sys
@@ -24,12 +25,57 @@ def run_stage(name: str, cmd: list[str], cwd: Path) -> str:
     return proc.stdout
 
 
-def generate_payload(path: Path, rows: int) -> None:
+def generate_payload(
+    path: Path,
+    rows: int,
+    seed: int,
+    synthetic_clusters: int,
+    noise_std: float,
+    outlier_ratio: float,
+) -> None:
+    rnd = random.Random(seed)
+    dim = 1024
+    clusters = max(1, min(synthetic_clusters, rows))
+    outlier_count = int(rows * max(0.0, min(outlier_ratio, 0.95)))
+    inlier_count = rows - outlier_count
+
+    # Precompute random cluster centers for reproducible, diverse synthetic groups.
+    centers: list[list[float]] = []
+    for _ in range(clusters):
+        center = [rnd.uniform(-1.0, 1.0) for _ in range(dim)]
+        centers.append(center)
+
     with path.open("w", encoding="utf-8") as f:
-        for i in range(1, rows + 1):
-            vals = [f"{((i % 97) * 0.001) + ((j % 13) * 0.01):.6f}" for j in range(1024)]
-            row = {"embedding_id": i, "vec_csv": ",".join(vals)}
+        embedding_id = 1
+        for i in range(inlier_count):
+            cidx = i % clusters
+            center = centers[cidx]
+            vec = [center[j] + rnd.gauss(0.0, noise_std) for j in range(dim)]
+            vals = [f"{v:.6f}" for v in vec]
+            row = {"embedding_id": embedding_id, "vec_csv": ",".join(vals)}
             f.write(json.dumps(row) + "\n")
+            embedding_id += 1
+
+        # Add some outliers so clustering has harder edge-cases.
+        for _ in range(outlier_count):
+            vec = [rnd.uniform(-4.0, 4.0) for _ in range(dim)]
+            vals = [f"{v:.6f}" for v in vec]
+            row = {"embedding_id": embedding_id, "vec_csv": ",".join(vals)}
+            f.write(json.dumps(row) + "\n")
+            embedding_id += 1
+
+
+def print_generation_summary(rows: int, seed: int, synthetic_clusters: int, noise_std: float, outlier_ratio: float) -> None:
+    outlier_count = int(rows * max(0.0, min(outlier_ratio, 0.95)))
+    inlier_count = rows - outlier_count
+    print("\n=== Embedding Generation Summary ===")
+    print(f"Seed: {seed}")
+    print(f"Total embeddings: {rows}")
+    print(f"Synthetic cluster centers: {max(1, min(synthetic_clusters, rows))}")
+    print(f"Inlier embeddings: {inlier_count}")
+    print(f"Outlier embeddings: {outlier_count}")
+    print(f"Inlier noise stddev: {noise_std}")
+    print("====================================\n")
 
 
 def read_json(path: Path):
@@ -51,6 +97,10 @@ def count_unique_key_rows(path: Path, key: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=10000)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--synthetic-clusters", type=int, default=128)
+    parser.add_argument("--noise-std", type=float, default=0.08)
+    parser.add_argument("--outlier-ratio", type=float, default=0.03)
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
 
@@ -75,7 +125,15 @@ def main() -> int:
     if not cli.exists():
         raise RuntimeError("missing vectordb_v2_cli after build")
 
-    generate_payload(payload, args.rows)
+    generate_payload(
+        payload,
+        args.rows,
+        args.seed,
+        args.synthetic_clusters,
+        args.noise_std,
+        args.outlier_ratio,
+    )
+    print_generation_summary(args.rows, args.seed, args.synthetic_clusters, args.noise_std, args.outlier_ratio)
 
     run_stage("init", [str(cli), "init", "--path", str(data_dir)], root)
     run_stage("bulk-insert", [str(cli), "bulk-insert", "--path", str(data_dir), "--input", str(payload)], root)
