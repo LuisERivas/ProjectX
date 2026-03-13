@@ -32,6 +32,22 @@ def generate_payload(path: Path, rows: int) -> None:
             f.write(json.dumps(row) + "\n")
 
 
+def read_json(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def count_unique_key_rows(path: Path, key: str) -> int:
+    rows = read_json(path)
+    if not isinstance(rows, list):
+        return 0
+    uniq = set()
+    for row in rows:
+        if isinstance(row, dict) and key in row:
+            uniq.add(str(row[key]))
+    return len(uniq)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=200)
@@ -68,13 +84,57 @@ def main() -> int:
     run_stage("build-mid-layer-clusters", [str(cli), "build-mid-layer-clusters", "--path", str(data_dir)], root)
     run_stage("build-lower-layer-clusters", [str(cli), "build-lower-layer-clusters", "--path", str(data_dir)], root)
     run_stage("build-final-layer-clusters", [str(cli), "build-final-layer-clusters", "--path", str(data_dir)], root)
+    stats_text = run_stage("stats", [str(cli), "stats", "--path", str(data_dir)], root)
     cstats = run_stage("cluster-stats", [str(cli), "cluster-stats", "--path", str(data_dir)], root)
     chealth = run_stage("cluster-health", [str(cli), "cluster-health", "--path", str(data_dir)], root)
 
+    top_assignments = data_dir / "clusters" / "current" / "assignments.json"
+    mid_assignments = data_dir / "clusters" / "current" / "mid_layer_clustering" / "assignments.json"
+    lower_summary_path = data_dir / "clusters" / "current" / "lower_layer_clustering" / "LOWER_LAYER_CLUSTERING.json"
+    final_summary_path = data_dir / "clusters" / "current" / "final_layer_clustering" / "FINAL_LAYER_DBSCAN.json"
+
+    store_stats = json.loads(stats_text)
+    lower_summary = read_json(lower_summary_path)
+    final_summary = read_json(final_summary_path)
+
+    embedding_total = int(store_stats.get("live_rows", 0))
+    top_cluster_count = count_unique_key_rows(top_assignments, "top_centroid_id")
+    mid_cluster_count = count_unique_key_rows(mid_assignments, "mid_centroid_id")
+    lower_cluster_count = len(lower_summary.get("leaf_datasets", [])) if isinstance(lower_summary, dict) else 0
+
+    final_cluster_count = 0
+    if isinstance(final_summary, dict):
+        per_centroid = final_summary.get("per_centroid", [])
+        if isinstance(per_centroid, list):
+            final_cluster_count = sum(
+                1
+                for row in per_centroid
+                if isinstance(row, dict) and row.get("final_layer_output_status") == "written"
+            )
+    total_clusters_all_levels = top_cluster_count + mid_cluster_count + lower_cluster_count + final_cluster_count
+
+    print("\n=== Cluster Count Summary ===")
+    print(f"Total embeddings: {embedding_total}")
+    print(f"Top layer clusters: {top_cluster_count}")
+    print(f"Mid layer clusters: {mid_cluster_count}")
+    print(f"Lower layer clusters: {lower_cluster_count}")
+    print(f"Final layer clusters: {final_cluster_count}")
+    print(f"Total clusters (all levels): {total_clusters_all_levels}")
+    print("=============================\n")
+
     out = {
         "data_dir": str(data_dir),
+        "stats": store_stats,
         "cluster_stats": json.loads(cstats),
         "cluster_health": json.loads(chealth),
+        "cluster_counts": {
+            "total_embeddings": embedding_total,
+            "top_layer_clusters": top_cluster_count,
+            "mid_layer_clusters": mid_cluster_count,
+            "lower_layer_clusters": lower_cluster_count,
+            "final_layer_clusters": final_cluster_count,
+            "total_clusters_all_levels": total_clusters_all_levels,
+        },
         "artifacts": {
             "mid": str(data_dir / "clusters" / "current" / "mid_layer_clustering" / "MID_LAYER_CLUSTERING.json"),
             "lower": str(data_dir / "clusters" / "current" / "lower_layer_clustering" / "LOWER_LAYER_CLUSTERING.json"),
