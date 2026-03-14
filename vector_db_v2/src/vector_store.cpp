@@ -691,7 +691,7 @@ struct VectorStore::Impl {
         return std::max<std::size_t>(2, std::min<std::size_t>(256, n));
     }
     static constexpr double kCoarseSpanRatio = 0.15;
-    static constexpr std::size_t kFineHalfWindow = 8;
+    static constexpr double kFineSpanRatio = 0.02;
     struct KSelectionResult {
         std::size_t chosen_k = 2;
         double objective = 0.0;
@@ -853,9 +853,17 @@ struct VectorStore::Impl {
             best_coarse_k = std::clamp<std::size_t>(k_min + (k_max - k_min) / 2, k_min + 1, k_max - 1);
         }
 
-        const std::size_t lo =
-            (best_coarse_k > kFineHalfWindow) ? std::max<std::size_t>(k_min, best_coarse_k - kFineHalfWindow) : k_min;
-        const std::size_t hi = std::min<std::size_t>(k_max, best_coarse_k + kFineHalfWindow);
+        const std::size_t fine_count =
+            std::max<std::size_t>(1, static_cast<std::size_t>(std::llround(static_cast<double>(span) * kFineSpanRatio)));
+        const std::size_t half = fine_count / 2;
+        std::size_t lo = (best_coarse_k > half) ? (best_coarse_k - half) : k_min;
+        if (lo < k_min) {
+            lo = k_min;
+        }
+        std::size_t hi = std::min<std::size_t>(k_max, lo + fine_count - 1);
+        if ((hi - lo + 1) < fine_count && hi == k_max && k_max >= fine_count - 1) {
+            lo = std::max<std::size_t>(k_min, k_max - fine_count + 1);
+        }
 
         std::size_t best_k = best_coarse_k;
         double best_score = -std::numeric_limits<double>::infinity();
