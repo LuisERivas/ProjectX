@@ -690,8 +690,8 @@ struct VectorStore::Impl {
     static std::size_t compute_k_max(std::size_t n) {
         return std::max<std::size_t>(2, std::min<std::size_t>(256, n));
     }
-    constexpr double kCoarseSpanRatio = 0.15;
-    constexpr std::size_t kFineHalfWindow = 8;
+    static constexpr double kCoarseSpanRatio = 0.15;
+    static constexpr std::size_t kFineHalfWindow = 8;
     struct KSelectionResult {
         std::size_t chosen_k = 2;
         double objective = 0.0;
