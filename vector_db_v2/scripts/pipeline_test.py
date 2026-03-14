@@ -29,12 +29,11 @@ def run_stage(name: str, cmd: list[str], cwd: Path) -> str:
 def generate_payload(
     path: Path,
     rows: int,
-    seed: int,
     synthetic_clusters: int,
     noise_std: float,
     outlier_ratio: float,
 ) -> None:
-    rnd = random.Random(seed)
+    rnd = random.Random()
     dim = 1024
     clusters = max(1, min(synthetic_clusters, rows))
     outlier_count = int(rows * max(0.0, min(outlier_ratio, 0.95)))
@@ -66,11 +65,11 @@ def generate_payload(
             embedding_id += 1
 
 
-def print_generation_summary(rows: int, seed: int, synthetic_clusters: int, noise_std: float, outlier_ratio: float) -> None:
+def print_generation_summary(rows: int, synthetic_clusters: int, noise_std: float, outlier_ratio: float) -> None:
     outlier_count = int(rows * max(0.0, min(outlier_ratio, 0.95)))
     inlier_count = rows - outlier_count
     print("\n=== Embedding Generation Summary ===")
-    print(f"Seed: {seed}")
+    print("Seed mode: system entropy (non-deterministic)")
     print(f"Total embeddings: {rows}")
     print(f"Synthetic cluster centers: {max(1, min(synthetic_clusters, rows))}")
     print(f"Inlier embeddings: {inlier_count}")
@@ -157,7 +156,6 @@ def assert_no_empty_lower(lower_summary: object) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=10000)
-    parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--synthetic-clusters", type=int, default=128)
     parser.add_argument("--noise-std", type=float, default=0.08)
     parser.add_argument("--outlier-ratio", type=float, default=0.03)
@@ -189,12 +187,11 @@ def main() -> int:
     generate_payload(
         payload,
         args.rows,
-        args.seed,
         args.synthetic_clusters,
         args.noise_std,
         args.outlier_ratio,
     )
-    print_generation_summary(args.rows, args.seed, args.synthetic_clusters, args.noise_std, args.outlier_ratio)
+    print_generation_summary(args.rows, args.synthetic_clusters, args.noise_std, args.outlier_ratio)
 
     run_stage("init", [str(cli), "init", "--path", str(data_dir)], root)
     bulk_text = run_stage(

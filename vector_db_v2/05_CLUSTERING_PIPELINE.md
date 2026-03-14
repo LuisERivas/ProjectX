@@ -14,7 +14,10 @@ Define v2 clustering design for a 4-layer hierarchy (Top, Mid, Lower, Final), in
 
 1. Load live vectors and packed row-major buffer.
 2. Estimate intrinsic dimensionality and derive `k_min`/`k_max`.
-3. Run binary elbow selection over integer k-range.
+3. Run coarse-to-fine elbow selection over integer k-range.
+   - Coarse step default is `round(15% of candidate span)`.
+   - Fine scan default is `best_coarse_k +/- 8`.
+   - Coarse ratio and fine window are implementation-tunable parameters.
 4. Realize `chosen_k` with true Lloyd k-means initialized by k-means++ (effective `k = min(chosen_k, dataset_size)`).
 5. Enforce deterministic no-empty-cluster repair before stage completion.
 6. Run optional validation stage (stability/quality policy for current state).

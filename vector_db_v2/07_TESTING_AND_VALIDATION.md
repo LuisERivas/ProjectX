@@ -43,6 +43,7 @@ Define test strategy and release gates for v2 to ensure correctness, durability,
 
 - Build + test (`cmake`, `ctest`) must pass.
 - Run `scripts/pipeline_test.py` equivalent for v2.
+- `scripts/pipeline_test.py` synthetic embedding generation is non-seeded by default (system-entropy random), so exact cluster-count reproducibility between runs is not expected unless a deterministic generator is introduced.
 - Validate generated report JSON and required artifacts:
   - Top-layer artifacts under `clusters/current/`
   - Mid-layer summary under `mid_layer_clustering/MID_LAYER_CLUSTERING.json`
@@ -115,6 +116,10 @@ Define test strategy and release gates for v2 to ensure correctness, durability,
 - **Decision D-TEST-002:** Treat artifact schema checks as first-class tests.
   - Why: scripts and operators depend on these outputs.
   - Rejected alternative: file-existence-only checks. Rejected due to silent schema drift risk.
+
+- **Decision D-TEST-003:** Keep Option-2 k-selection observability checks for coarse-to-fine probes.
+  - Why: telemetry (`tested_ks`) must remain machine-parseable and reflect both coarse candidates and fine local scan candidates.
+  - Rejected alternative: hiding intermediate probe ks. Rejected due to reduced diagnosability when `chosen_k` drifts.
 
 ## Open Questions
 

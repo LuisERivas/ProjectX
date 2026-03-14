@@ -690,6 +690,8 @@ struct VectorStore::Impl {
     static std::size_t compute_k_max(std::size_t n) {
         return std::max<std::size_t>(2, std::min<std::size_t>(256, n));
     }
+    constexpr double kCoarseSpanRatio = 0.15;
+    constexpr std::size_t kFineHalfWindow = 8;
     struct KSelectionResult {
         std::size_t chosen_k = 2;
         double objective = 0.0;
@@ -822,20 +824,40 @@ struct VectorStore::Impl {
             return left - (2.0 * mid) + right;
         };
 
-        std::size_t lo = k_min;
-        std::size_t hi = k_max;
-        while ((hi - lo) > 6) {
-            const std::size_t mid = lo + (hi - lo) / 2;
-            const double s_mid = knee_score(mid);
-            const double s_next = knee_score(std::min(mid + 1, k_max - 1));
-            if (s_mid <= s_next) {
-                lo = std::min(mid + 1, k_max);
-            } else {
-                hi = mid;
+        // Option 2: coarse-to-fine scan with tunable coarse span ratio and fine window.
+        const std::size_t span = k_max - k_min + 1;
+        const std::size_t coarse_step =
+            std::max<std::size_t>(1, static_cast<std::size_t>(std::llround(static_cast<double>(span) * kCoarseSpanRatio)));
+        std::vector<std::size_t> coarse_candidates;
+        for (std::size_t k = k_min; k <= k_max;) {
+            coarse_candidates.push_back(k);
+            if (k_max - k < coarse_step) {
+                break;
             }
+            k += coarse_step;
+        }
+        if (coarse_candidates.empty() || coarse_candidates.back() != k_max) {
+            coarse_candidates.push_back(k_max);
         }
 
-        std::size_t best_k = k_min;
+        std::size_t best_coarse_k = coarse_candidates.front();
+        double best_coarse_score = -std::numeric_limits<double>::infinity();
+        for (const auto k : coarse_candidates) {
+            const double s = knee_score(k);
+            if (s > best_coarse_score || (std::abs(s - best_coarse_score) < 1e-12 && k < best_coarse_k)) {
+                best_coarse_score = s;
+                best_coarse_k = k;
+            }
+        }
+        if (!std::isfinite(best_coarse_score) && k_max > k_min + 1) {
+            best_coarse_k = std::clamp<std::size_t>(k_min + (k_max - k_min) / 2, k_min + 1, k_max - 1);
+        }
+
+        const std::size_t lo =
+            (best_coarse_k > kFineHalfWindow) ? std::max<std::size_t>(k_min, best_coarse_k - kFineHalfWindow) : k_min;
+        const std::size_t hi = std::min<std::size_t>(k_max, best_coarse_k + kFineHalfWindow);
+
+        std::size_t best_k = best_coarse_k;
         double best_score = -std::numeric_limits<double>::infinity();
         for (std::size_t k = lo; k <= hi; ++k) {
             const double s = knee_score(k);
@@ -845,7 +867,7 @@ struct VectorStore::Impl {
             }
         }
         if (!std::isfinite(best_score)) {
-            best_k = k_min;
+            best_k = best_coarse_k;
         }
         out.chosen_k = best_k;
         out.objective = eval(best_k);
