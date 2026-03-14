@@ -1202,6 +1202,7 @@ struct VectorStore::Impl {
                   << "  \"finalization_mode\": \"passthrough_one_cluster_per_stop_leaf\",\n"
                   << "  \"eligible_stop_leaf_datasets\": " << leaf_sets.size() << ",\n"
                   << "  \"per_cluster\": [\n";
+        bool first_per_cluster_row = true;
 
         std::size_t written = 0;
         struct FinalCountRow {
@@ -1262,15 +1263,15 @@ struct VectorStore::Impl {
                 return Status::Error("failed writing final manifest");
             }
 
+            if (!first_per_cluster_row) {
+                aggregate << ",\n";
+            }
+            first_per_cluster_row = false;
             aggregate << "    {\"final_cluster_id\": \"" << final_cluster_id << "\", "
                       << "\"source_lower_centroid_id\": \"" << cid
                       << "\", \"records_processed\": " << sorted_ids.size()
                       << "\", \"final_layer_output_status\": \"written\", "
                       << "\"assignments_file_present\": true}";
-            if (i + 1 < leaf_sets.size()) {
-                aggregate << ",";
-            }
-            aggregate << "\n";
 
             emit_event("stage_end", "final_per_cluster", "Final Per-Leaf Finalization", "completed", 0.0, 0.0,
                        {{"final_cluster_id", final_cluster_id}, {"source_lower_centroid_id", cid},
@@ -1280,7 +1281,7 @@ struct VectorStore::Impl {
             ++written;
         }
 
-        aggregate << "  ],\n"
+        aggregate << "\n  ],\n"
                   << "  \"written_final_clusters\": " << written << "\n"
                   << "}\n";
         if (!write_text_atomic(final_dir / "FINAL_LAYER_CLUSTERS.json", aggregate.str())) {
