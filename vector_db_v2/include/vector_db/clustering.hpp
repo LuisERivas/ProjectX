@@ -19,9 +19,4 @@ struct GateDecisionRow {
     std::string reason;
 };
 
-struct DbscanLabelRow {
-    std::uint64_t embedding_id = 0;
-    int label = -1;
-};
-
 }  // namespace vector_db_v2

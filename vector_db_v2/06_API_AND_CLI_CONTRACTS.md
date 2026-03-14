@@ -24,6 +24,7 @@ Define stable command/response contracts so scripts and tools can evolve without
 - `build-mid-layer-clusters --path ... [--seed <u32>]`
 - `build-lower-layer-clusters --path ... [--seed <u32>]`
 - `build-final-layer-clusters --path ... [--seed <u32>]`
+- `build-final-layer-finalization --path ... [--seed <u32>]`
 - `cluster-stats --path ...`
 - `cluster-health --path ...`
 
@@ -45,41 +46,38 @@ Deferred post-M1:
 - Mid starts only after Top succeeds.
 - Lower starts only after Mid outputs are available.
 - Final starts only after all required Lower-layer gate evaluations and eligible per-centroid jobs complete.
-- Final-layer eligibility follows `05` canonical rule: gate decision must be `stop`, and centroid dataset must pass required DBSCAN preflight validity checks.
+- Final-layer eligibility follows `05` canonical rule: gate decision must be `stop`.
 - Gate decision `continue` is not Final-layer eligible and remains in Lower-layer processing.
-- Final layer runs DBSCAN per eligible gate-fail Lower-layer centroid dataset.
+- Final layer runs passthrough finalization per eligible gate-fail Lower-layer centroid dataset.
 - Final layer must not mix embeddings across centroid datasets.
-- Final layer produces both per-centroid outputs and an aggregate summary.
+- Final layer produces both per-cluster outputs and an aggregate summary.
 
-## Final-Layer Per-Centroid Artifact Contract (M1 Minimal Normative)
+## Final-Layer Per-Cluster Artifact Contract (M1 Minimal Normative)
 
-For each eligible centroid dataset under `final_layer_clustering/centroid_<id>/`, required files are:
+For each eligible final cluster under `final_layer_clustering/final_cluster_<id>/`, required files are:
 
 - `manifest.json`
-- `labels.json`
+- `assignments.json`
 - `cluster_summary.json`
 
-`labels.json` required schema constraints:
+`assignments.json` required schema constraints:
 
 - Top-level JSON value is an array of objects.
-- Each object contains required fields: `embedding_id` and `label`.
-- `label` is an integer; `-1` is required DBSCAN noise convention.
+- Each object contains required fields: `embedding_id` and `final_cluster_id`.
 - Entries are sorted by `embedding_id` ascending.
 - `embedding_id` values are unique (exactly one entry per embedding).
-- Entry count equals embeddings processed for that centroid dataset.
+- Entry count equals embeddings processed for that final cluster.
 
 Optional files may be added without breaking M1 contracts.
-Aggregate summary remains required at `final_layer_clustering/FINAL_LAYER_DBSCAN.json`.
+Aggregate summary remains required at `final_layer_clustering/FINAL_LAYER_CLUSTERS.json`.
 
-## Final-Layer Per-Centroid Result Reporting (M1)
+## Final-Layer Per-Cluster Result Reporting (M1)
 
-Per-centroid Final-layer result reporting must expose:
+Per-cluster Final-layer result reporting must expose:
 
-- preflight validity outcome (`pass` or `fail`)
-- preflight failure/skip reason code (when outcome is `fail`)
-- `labels.json` presence status
-- `labels.json` schema validity status
-- per-centroid output status (`written`, `skipped_preflight_failed`, `failed`)
+- `assignments.json` presence status
+- `cluster_summary.json` presence status
+- per-cluster output status (`written`, `failed`)
 
 ## Contract Rules
 
@@ -133,14 +131,11 @@ Required event fields:
 - `elapsed_ms`
 - `pipeline_elapsed_ms`
 - `records_processed` (when applicable)
-- `centroid_id` and/or `job_id` (required for per-centroid Lower-layer and per-centroid Final-layer events when applicable)
+- `centroid_id` and/or `job_id` (required for per-centroid Lower-layer and per-cluster Final-layer events when applicable)
 - `gate_decision` (`continue` or `stop`) for Lower-layer gate evaluation events
-- `final_layer_eligibility_reason` (for example: `gate_stop_and_preflight_pass`, or explicit ineligible reason)
-- `final_layer_preflight_valid` (`true` or `false`) for Final-layer per-centroid preflight events
-- `preflight_reason_code` (required when `final_layer_preflight_valid=false`)
-- `labels_file_present` (`true` or `false`) when per-centroid output status is reported
-- `labels_schema_valid` (`true` or `false`) when `labels.json` is present
-- `final_layer_output_status` (for example: `written`, `skipped_preflight_failed`, `failed`)
+- `final_cluster_id` and `source_lower_centroid_id` for Final-layer events when applicable
+- `assignments_file_present` (`true` or `false`) when per-cluster output status is reported
+- `final_layer_output_status` (for example: `written`, `failed`)
 - `error_code` and `error_message` (required for failure events)
 - `non_compliance_stage` (required for hardware non-compliance failures)
 
@@ -156,7 +151,7 @@ Stdout/stderr responsibilities:
 - Stage lifecycle and summary events are emitted to stdout as machine-parseable JSON lines.
 - Human-readable diagnostics may be emitted in parallel.
 - Fatal errors must include `stage_fail` with timing-until-failure and explicit error fields; no silent failure.
-- Final-layer DBSCAN preflight failures must emit machine-readable skip/failure reason codes; silent preflight skips are disallowed.
+- Final-layer failures must emit machine-readable reason codes; silent failures are disallowed.
 
 ## Required `cluster-health` Keys (M1 Baseline)
 

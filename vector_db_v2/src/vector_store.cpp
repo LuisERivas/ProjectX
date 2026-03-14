@@ -1158,49 +1158,6 @@ struct VectorStore::Impl {
         return Status::Ok();
     }
 
-    struct PreflightOutcome {
-        bool valid = false;
-        std::string reason_code;
-    };
-
-    PreflightOutcome check_preflight(const std::vector<std::uint64_t>& ids, std::size_t min_points_policy) const {
-        if (ids.empty()) {
-            return {false, "empty_dataset"};
-        }
-        if (ids.size() < min_points_policy) {
-            return {false, "below_min_points_policy"};
-        }
-        for (const auto id : ids) {
-            const auto it = rows.find(id);
-            if (it == rows.end() || it->second.deleted) {
-                return {false, "id_vector_alignment_failed"};
-            }
-            if (it->second.vec.size() != kVectorDim) {
-                return {false, "dimension_mismatch"};
-            }
-            for (const auto v : it->second.vec) {
-                if (!std::isfinite(v)) {
-                    return {false, "non_finite_values"};
-                }
-            }
-        }
-        return {true, "gate_stop_and_preflight_pass"};
-    }
-
-    std::vector<DbscanLabelRow> run_fake_dbscan_labels(const std::vector<std::uint64_t>& ids) const {
-        std::vector<DbscanLabelRow> out;
-        out.reserve(ids.size());
-        for (std::size_t i = 0; i < ids.size(); ++i) {
-            int label = static_cast<int>(ids[i] % 3);
-            if (i % 11 == 0) {
-                label = -1;
-            }
-            out.push_back(DbscanLabelRow{ids[i], label});
-        }
-        std::sort(out.begin(), out.end(), [](const DbscanLabelRow& a, const DbscanLabelRow& b) { return a.embedding_id < b.embedding_id; });
-        return out;
-    }
-
     Status write_final_artifacts() {
         const fs::path final_dir = clusters_current() / "final_layer_clustering";
         fs::create_directories(final_dir);
@@ -1239,120 +1196,95 @@ struct VectorStore::Impl {
 
         const std::size_t total_embeddings =
             (cstats.vectors_indexed > 0) ? cstats.vectors_indexed : live_ids_sorted().size();
-        const std::size_t raw_min_points =
-            static_cast<std::size_t>(std::ceil(static_cast<double>(total_embeddings) * 1e-5));
-        const std::size_t min_points_policy = std::clamp<std::size_t>(raw_min_points, 4, 10000);
         std::ostringstream aggregate;
         aggregate << "{\n"
                   << "  \"stage\": \"final\",\n"
-                  << "  \"eligible_leaf_datasets\": " << leaf_sets.size() << ",\n"
-                  << "  \"per_centroid\": [\n";
+                  << "  \"finalization_mode\": \"passthrough_one_cluster_per_stop_leaf\",\n"
+                  << "  \"eligible_stop_leaf_datasets\": " << leaf_sets.size() << ",\n"
+                  << "  \"per_cluster\": [\n";
 
         std::size_t written = 0;
         struct FinalCountRow {
-            std::string centroid_id;
+            std::string final_cluster_id;
             std::size_t embedding_count = 0;
-            std::string output_status;
         };
         std::vector<FinalCountRow> final_counts;
         final_counts.reserve(leaf_sets.size());
         for (std::size_t i = 0; i < leaf_sets.size(); ++i) {
             const auto& cid = leaf_sets[i].first;
             const auto& ids = leaf_sets[i].second;
-            const auto pre = check_preflight(ids, min_points_policy);
-            const std::string cdir_name = "centroid_" + cid;
-            const fs::path cdir = final_dir / cdir_name;
-
-            emit_event("stage_start", "final_per_centroid", "Final Per-Centroid DBSCAN", "running", 0.0, 0.0,
-                       {{"centroid_id", cid}, {"final_layer_preflight_valid", pre.valid ? "true" : "false"},
-                        {"preflight_reason_code", pre.reason_code},
-                        {"final_layer_eligibility_reason", pre.reason_code}});
-
-            if (!pre.valid) {
-                final_counts.push_back(FinalCountRow{cid, ids.size(), "skipped_preflight_failed"});
-                aggregate << "    {\"centroid_id\": \"" << cid << "\", \"final_layer_preflight_valid\": false, "
-                          << "\"preflight_reason_code\": \"" << pre.reason_code
-                          << "\", \"final_layer_output_status\": \"skipped_preflight_failed\"}";
-                if (i + 1 < leaf_sets.size()) {
-                    aggregate << ",";
-                }
-                aggregate << "\n";
-                emit_event("stage_end", "final_per_centroid", "Final Per-Centroid DBSCAN", "skipped", 0.0, 0.0,
-                           {{"centroid_id", cid}, {"final_layer_preflight_valid", "false"},
-                            {"preflight_reason_code", pre.reason_code}, {"labels_file_present", "false"},
-                            {"labels_schema_valid", "false"}, {"final_layer_output_status", "skipped_preflight_failed"}});
+            if (ids.empty()) {
                 continue;
             }
+            const std::string final_cluster_id = "final_" + cid;
+            const fs::path cdir = final_dir / ("final_cluster_" + cid);
+            emit_event("stage_start", "final_per_cluster", "Final Per-Leaf Finalization", "running", 0.0, 0.0,
+                       {{"final_cluster_id", final_cluster_id}, {"source_lower_centroid_id", cid}});
 
             fs::create_directories(cdir);
-            const auto labels = run_fake_dbscan_labels(ids);
-            std::ostringstream labels_json;
-            labels_json << "[\n";
-            for (std::size_t j = 0; j < labels.size(); ++j) {
-                labels_json << "  {\"embedding_id\": " << labels[j].embedding_id << ", \"label\": " << labels[j].label << "}";
-                if (j + 1 < labels.size()) {
-                    labels_json << ",";
+            std::vector<std::uint64_t> sorted_ids = ids;
+            std::sort(sorted_ids.begin(), sorted_ids.end());
+            std::ostringstream assignments;
+            assignments << "[\n";
+            for (std::size_t j = 0; j < sorted_ids.size(); ++j) {
+                assignments << "  {\"embedding_id\": " << sorted_ids[j]
+                            << ", \"final_cluster_id\": \"" << final_cluster_id << "\"}";
+                if (j + 1 < sorted_ids.size()) {
+                    assignments << ",";
                 }
-                labels_json << "\n";
+                assignments << "\n";
             }
-            labels_json << "]\n";
-            if (!write_text_atomic(cdir / "labels.json", labels_json.str())) {
-                return Status::Error("failed writing labels.json");
+            assignments << "]\n";
+            if (!write_text_atomic(cdir / "assignments.json", assignments.str())) {
+                return Status::Error("failed writing final assignments");
             }
 
-            std::size_t noise_count = 0;
-            for (const auto& l : labels) {
-                if (l.label == -1) {
-                    ++noise_count;
-                }
-            }
             std::ostringstream csum;
             csum << "{\n"
-                 << "  \"centroid_id\": \"" << cid << "\",\n"
-                 << "  \"records_processed\": " << labels.size() << ",\n"
-                 << "  \"noise_label\": -1,\n"
-                 << "  \"noise_count\": " << noise_count << ",\n"
-                 << "  \"final_layer_preflight_valid\": true,\n"
-                 << "  \"preflight_reason_code\": \"" << pre.reason_code << "\"\n"
+                 << "  \"final_cluster_id\": \"" << final_cluster_id << "\",\n"
+                 << "  \"source_lower_centroid_id\": \"" << cid << "\",\n"
+                 << "  \"records_processed\": " << sorted_ids.size() << ",\n"
+                 << "  \"finalization_mode\": \"passthrough\"\n"
                  << "}\n";
             if (!write_text_atomic(cdir / "cluster_summary.json", csum.str())) {
                 return Status::Error("failed writing cluster_summary.json");
             }
             std::ostringstream manifest;
             manifest << "{\n"
-                     << "  \"centroid_id\": \"" << cid << "\",\n"
-                     << "  \"final_layer_preflight_valid\": true,\n"
-                     << "  \"preflight_reason_code\": \"" << pre.reason_code << "\",\n"
-                     << "  \"labels_file_present\": true,\n"
-                     << "  \"labels_schema_valid\": true,\n"
+                     << "  \"final_cluster_id\": \"" << final_cluster_id << "\",\n"
+                     << "  \"source_lower_centroid_id\": \"" << cid << "\",\n"
+                     << "  \"assignments_file_present\": true,\n"
+                     << "  \"cluster_summary_present\": true,\n"
+                     << "  \"finalization_mode\": \"passthrough\",\n"
                      << "  \"final_layer_output_status\": \"written\"\n"
                      << "}\n";
             if (!write_text_atomic(cdir / "manifest.json", manifest.str())) {
                 return Status::Error("failed writing final manifest");
             }
 
-            aggregate << "    {\"centroid_id\": \"" << cid << "\", \"final_layer_preflight_valid\": true, "
-                      << "\"preflight_reason_code\": \"" << pre.reason_code
+            aggregate << "    {\"final_cluster_id\": \"" << final_cluster_id << "\", "
+                      << "\"source_lower_centroid_id\": \"" << cid
+                      << "\", \"records_processed\": " << sorted_ids.size()
                       << "\", \"final_layer_output_status\": \"written\", "
-                      << "\"labels_file_present\": true, \"labels_schema_valid\": true}";
+                      << "\"assignments_file_present\": true}";
             if (i + 1 < leaf_sets.size()) {
                 aggregate << ",";
             }
             aggregate << "\n";
 
-            emit_event("stage_end", "final_per_centroid", "Final Per-Centroid DBSCAN", "completed", 0.0, 0.0,
-                       {{"centroid_id", cid}, {"final_layer_preflight_valid", "true"},
-                        {"preflight_reason_code", pre.reason_code}, {"labels_file_present", "true"},
-                        {"labels_schema_valid", "true"}, {"final_layer_output_status", "written"}});
-            final_counts.push_back(FinalCountRow{cid, labels.size(), "written"});
+            emit_event("stage_end", "final_per_cluster", "Final Per-Leaf Finalization", "completed", 0.0, 0.0,
+                       {{"final_cluster_id", final_cluster_id}, {"source_lower_centroid_id", cid},
+                        {"records_processed", std::to_string(sorted_ids.size())},
+                        {"final_layer_output_status", "written"}});
+            final_counts.push_back(FinalCountRow{final_cluster_id, sorted_ids.size()});
             ++written;
         }
 
         aggregate << "  ],\n"
-                  << "  \"written_centroids\": " << written << "\n"
+                  << "  \"written_final_clusters\": " << written << "\n"
                   << "}\n";
-        if (!write_text_atomic(final_dir / "FINAL_LAYER_DBSCAN.json", aggregate.str())) {
-            return Status::Error("failed writing FINAL_LAYER_DBSCAN.json");
+        if (!write_text_atomic(final_dir / "FINAL_LAYER_CLUSTERS.json", aggregate.str())) {
+            return Status::Error("failed writing FINAL_LAYER_CLUSTERS.json");
         }
 
         std::vector<std::string> top_ids;
@@ -1406,9 +1338,8 @@ struct VectorStore::Impl {
                << "  \"final\": [\n";
         for (std::size_t i = 0; i < final_counts.size(); ++i) {
             const auto& row = final_counts[i];
-            counts << "    {\"centroid_id\": \"" << row.centroid_id
-                   << "\", \"embedding_count\": " << row.embedding_count
-                   << ", \"output_status\": \"" << row.output_status << "\"}";
+            counts << "    {\"final_cluster_id\": \"" << row.final_cluster_id
+                   << "\", \"embedding_count\": " << row.embedding_count << "}";
             if (i + 1 < final_counts.size()) {
                 counts << ",";
             }

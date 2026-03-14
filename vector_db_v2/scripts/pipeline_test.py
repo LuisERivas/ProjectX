@@ -160,7 +160,7 @@ def main() -> int:
     top_assignments = data_dir / "clusters" / "current" / "assignments.json"
     mid_assignments = data_dir / "clusters" / "current" / "mid_layer_clustering" / "assignments.json"
     lower_summary_path = data_dir / "clusters" / "current" / "lower_layer_clustering" / "LOWER_LAYER_CLUSTERING.json"
-    final_summary_path = data_dir / "clusters" / "current" / "final_layer_clustering" / "FINAL_LAYER_DBSCAN.json"
+    final_summary_path = data_dir / "clusters" / "current" / "final_layer_clustering" / "FINAL_LAYER_CLUSTERS.json"
 
     store_stats = json.loads(stats_text)
     lower_summary = read_json(lower_summary_path)
@@ -173,12 +173,14 @@ def main() -> int:
 
     final_cluster_count = 0
     if isinstance(final_summary, dict):
-        per_centroid = final_summary.get("per_centroid", [])
-        if isinstance(per_centroid, list):
-            final_cluster_count = sum(
-                1
-                for row in per_centroid
-                if isinstance(row, dict) and row.get("final_layer_output_status") == "written"
+        per_cluster = final_summary.get("per_cluster", [])
+        if isinstance(per_cluster, list):
+            final_cluster_count = len(
+                {
+                    str(row.get("final_cluster_id"))
+                    for row in per_cluster
+                    if isinstance(row, dict) and row.get("final_layer_output_status") == "written"
+                }
             )
     total_clusters_all_levels = top_cluster_count + mid_cluster_count + lower_cluster_count + final_cluster_count
 
@@ -207,7 +209,7 @@ def main() -> int:
         "artifacts": {
             "mid": str(data_dir / "clusters" / "current" / "mid_layer_clustering" / "MID_LAYER_CLUSTERING.json"),
             "lower": str(data_dir / "clusters" / "current" / "lower_layer_clustering" / "LOWER_LAYER_CLUSTERING.json"),
-            "final": str(data_dir / "clusters" / "current" / "final_layer_clustering" / "FINAL_LAYER_DBSCAN.json"),
+            "final": str(data_dir / "clusters" / "current" / "final_layer_clustering" / "FINAL_LAYER_CLUSTERS.json"),
         },
     }
     print(json.dumps(out, indent=2))

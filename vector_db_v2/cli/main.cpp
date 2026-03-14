@@ -157,6 +157,7 @@ void print_usage() {
               << "  build-mid-layer-clusters --path <data_dir> [--seed <u32>]\n"
               << "  build-lower-layer-clusters --path <data_dir> [--seed <u32>]\n"
               << "  build-final-layer-clusters --path <data_dir> [--seed <u32>]\n"
+              << "  build-final-layer-finalization --path <data_dir> [--seed <u32>]\n"
               << "  cluster-stats --path <data_dir>\n"
               << "  cluster-health --path <data_dir>\n";
 }
@@ -434,6 +435,9 @@ int main(int argc, char** argv) {
         return run_cluster("lower");
     }
     if (command == "build-final-layer-clusters") {
+        return run_cluster("final");
+    }
+    if (command == "build-final-layer-finalization") {
         return run_cluster("final");
     }
 

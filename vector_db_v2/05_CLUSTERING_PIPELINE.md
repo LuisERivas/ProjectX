@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define v2 clustering design for a 4-layer hierarchy (Top, Mid, Lower, Final/DBSCAN), including artifact contracts and runtime policy.
+Define v2 clustering design for a 4-layer hierarchy (Top, Mid, Lower, Final), including artifact contracts and runtime policy.
 
 ## Inputs/Dependencies
 
@@ -98,46 +98,30 @@ Required telemetry for each evaluated Lower-layer centroid:
 
 ## Final-Layer Eligibility (Canonical, M1)
 
-This section is the canonical source of Final-layer DBSCAN eligibility semantics for M1.
+This section is the canonical source of Final-layer eligibility semantics for M1.
 
-A Lower-layer centroid dataset is eligible for Final-layer DBSCAN only when all conditions below are true:
+A Lower-layer centroid dataset is eligible for Final-layer processing only when all conditions below are true:
 
 1. The centroid branch reached a Lower-layer continued-processing split gate evaluation.
 2. The final gate decision for that branch is `stop` (gate check failed).
-3. The centroid dataset passes Final-layer DBSCAN preflight validity checks.
+3. The centroid dataset is non-empty.
 
 Interpretation rules:
 
-- Gate decision `continue` means the branch keeps splitting in Lower layer and is not yet eligible for Final layer.
-- Gate decision `stop` means the branch is a gate-fail leaf candidate and becomes eligible for Final-layer DBSCAN only if DBSCAN preflight checks pass.
+- Gate decision `continue` means the branch keeps splitting in Lower layer and is not eligible for Final layer.
+- Gate decision `stop` means the branch is a gate-fail leaf candidate and is eligible for Final-layer passthrough finalization.
 
-## Final-Layer DBSCAN Preflight Validity Rules (M1 Required)
-
-A centroid dataset is DBSCAN-valid in M1 only if all checks below pass:
-
-1. Dataset is non-empty.
-2. Point count meets minimum policy threshold (`n_points >= min_points_policy`).
-3. Vectors have consistent dimensionality and match configured dimension.
-4. All numeric values are finite (no `NaN`, no `Inf`).
-5. ID/vector alignment integrity checks pass.
-
-Failure behavior (required):
-
-- DBSCAN must not run for centroid datasets that fail preflight checks.
-- A machine-readable preflight failure/skip reason code must be emitted in terminal event output.
-- The same reason code must be persisted in per-centroid manifest/summary telemetry.
-
-## Final Layer Pipeline (DBSCAN)
+## Final Layer Pipeline (Passthrough Finalization)
 
 1. Start only after all required Lower-layer gate evaluations and eligible per-centroid jobs are complete.
 2. Iterate only over eligible gate-fail leaf centroid datasets defined in `Final-Layer Eligibility (Canonical, M1)`.
-3. For each eligible centroid dataset, run required DBSCAN preflight validity checks.
-4. Run DBSCAN independently only for datasets that pass preflight checks.
-5. Enforce no cross-centroid mixing during Final-layer DBSCAN.
-6. Write required per-centroid Final-layer artifacts (`manifest.json`, `labels.json`, `cluster_summary.json`) for datasets that pass preflight checks.
+3. For each eligible centroid dataset, create exactly one final cluster ID (`final_<source_lower_centroid_id>`).
+4. Assign all embeddings from the source Lower-layer centroid dataset to that final cluster ID.
+5. Enforce no cross-centroid mixing during Final-layer processing.
+6. Write required per-cluster Final-layer artifacts (`manifest.json`, `assignments.json`, `cluster_summary.json`) for each processed dataset.
 7. Write aggregate Final-layer summary.
 8. Emit terminal stage lifecycle events for start and completion/failure, including stage elapsed and cumulative pipeline elapsed.
-9. Emit per-centroid Final-layer timing events (centroid/job timing and status), including explicit preflight outcome and reason code.
+9. Emit per-cluster Final-layer timing events (job timing and status).
 
 ## Terminal Stage Trace Requirement (M1)
 
@@ -149,9 +133,9 @@ Required trace coverage:
 - Top Layer stage lifecycle events
 - Mid Layer stage lifecycle events
 - Lower Layer stage lifecycle events
-- Final Layer (DBSCAN) stage lifecycle events
+- Final Layer stage lifecycle events
 - Required per-centroid Lower-layer gate/job timing events
-- Required per-centroid Final-layer DBSCAN timing events
+- Required per-cluster Final-layer timing events
 - Pipeline summary event with cumulative elapsed timing
 
 ## Artifact Contract (Required)
@@ -164,21 +148,20 @@ Required trace coverage:
 - `cluster_manifest.json`
 - `mid_layer_clustering/MID_LAYER_CLUSTERING.json`
 - `lower_layer_clustering/LOWER_LAYER_CLUSTERING.json`
-- `final_layer_clustering/FINAL_LAYER_DBSCAN.json`
-- `final_layer_clustering/centroid_<id>/manifest.json`
-- `final_layer_clustering/centroid_<id>/labels.json`
-- `final_layer_clustering/centroid_<id>/cluster_summary.json`
+- `final_layer_clustering/FINAL_LAYER_CLUSTERS.json`
+- `final_layer_clustering/final_cluster_<id>/manifest.json`
+- `final_layer_clustering/final_cluster_<id>/assignments.json`
+- `final_layer_clustering/final_cluster_<id>/cluster_summary.json`
 
-### `labels.json` Contract (Final-Layer Per-Centroid, M1 Required)
+### `assignments.json` Contract (Final-Layer Per-Cluster, M1 Required)
 
 - Top-level structure must be an array of objects.
 - Each object must include:
   - `embedding_id` (same ID type used by system contracts)
-  - `label` (integer DBSCAN cluster label)
-- Noise label convention is required: `label = -1` means DBSCAN noise.
+  - `final_cluster_id` (string final cluster identifier)
 - Entries must be sorted by `embedding_id` ascending.
 - Each `embedding_id` must appear exactly once.
-- Row count must equal the number of embeddings processed for that centroid dataset.
+- Row count must equal the number of embeddings processed for that final cluster.
 
 ## Runtime and Precision Policy
 
@@ -187,9 +170,9 @@ Required trace coverage:
 - M1 optimization target is Ampere-class GPU runtime behavior for eligible kernels and stage orchestration.
 - M1 numeric policy: embeddings are received/stored as FP32; optimal cluster-count estimation (k-selection) is computed in INT8; final clustering and assignment after k is selected are computed in FP16.
 - INT8 applies only to k-selection stages (ID estimate / elbow / k-search logic).
-- FP16 applies to non-DBSCAN clustering and assignment stages after `k` is selected.
+- FP16 applies to clustering and assignment stages after `k` is selected.
 - Implementation policy: performance-critical hot paths are C++-first (C++/CUDA); higher-level scripting does not replace core compute kernels.
-- Final-layer DBSCAN stage follows the same C++/CUDA implementation target for performance-critical execution; any exception must be explicit and telemetry-visible.
+- Final-layer passthrough stage follows the same C++/CUDA implementation target for performance-critical execution; any exception must be explicit and telemetry-visible.
 - Fail-fast policy: if required CUDA/Ampere/Tensor Core compliance is not met in performance-critical stage execution, the stage fails with explicit machine-readable non-compliance reason.
 
 ## Decisions and Rationale

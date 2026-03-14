@@ -23,13 +23,13 @@ Provide implementation sequencing, delivery scope, and risk controls for Vector 
   - Keep query record/response model minimal (`embedding_id`, `vector` in storage; ID + score ranking outputs).
   - Exclude ANN, metadata-based filtering/ranking, and artifact/version history from M1.
   - Implement Top -> Mid -> Lower -> Final clustering using one active artifact/state set.
-  - Ensure Mid runs once globally, Lower uses per-centroid continued-processing gate, and Final runs DBSCAN only for gate-fail (`stop`) Lower-layer leaf centroid datasets that are non-empty and DBSCAN-valid (no cross-centroid mixing).
-  - Enforce minimal Final-layer per-centroid artifact contract in M1 (`manifest.json`, `labels.json`, `cluster_summary.json`) plus aggregate `FINAL_LAYER_DBSCAN.json`.
+  - Ensure Mid runs once globally, Lower uses per-centroid continued-processing gate, and Final runs passthrough finalization only for gate-fail (`stop`) Lower-layer leaf centroid datasets (no cross-centroid mixing).
+  - Enforce minimal Final-layer per-cluster artifact contract in M1 (`manifest.json`, `assignments.json`, `cluster_summary.json`) plus aggregate `FINAL_LAYER_CLUSTERS.json`.
   - Enforce CUDA-required execution on Ampere-class GPUs for performance-critical stages.
   - Enforce Tensor Core utilization for eligible INT8/FP16 kernels as a compliance target.
   - Enforce C++-first (C++/CUDA) implementation for hot-path compute kernels and orchestration.
   - Enforce fail-fast non-compliance handling for required hardware/runtime path violations.
-  - Enforce terminal stage-trace + timing contract (start/end/fail events, per-stage elapsed, cumulative pipeline elapsed) across Top/Mid/Lower/Final, required per-centroid Lower-layer jobs, and required per-centroid Final-layer DBSCAN jobs.
+  - Enforce terminal stage-trace + timing contract (start/end/fail events, per-stage elapsed, cumulative pipeline elapsed) across Top/Mid/Lower/Final, required per-centroid Lower-layer jobs, and required per-cluster Final-layer jobs.
   - Pass replay and contract tests.
 
 

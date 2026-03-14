@@ -43,25 +43,24 @@
 - Remaining risks/ambiguities:
   - Lower gate scoring heuristic is deterministic placeholder in this implementation cut.
 
-## Phase 3 Checkpoint (Final Eligibility + DBSCAN + Artifacts)
+## Phase 3 Checkpoint (Final Eligibility + Finalization + Artifacts)
 
 - Files changed:
   - `vector_db_v2/src/vector_store.cpp`
   - `vector_db_v2/tests/test_m1.cpp`
 - Doc clauses satisfied:
-  - Final eligibility tied to gate `stop` + preflight pass.
-  - Preflight checks implemented with reason codes.
-  - Final per-centroid artifacts:
+  - Final eligibility tied to gate `stop` with no cross-centroid mixing.
+  - Final per-cluster artifacts:
     - `manifest.json`
-    - `labels.json`
+    - `assignments.json`
     - `cluster_summary.json`
   - Aggregate summary:
-    - `final_layer_clustering/FINAL_LAYER_DBSCAN.json`
-  - `labels.json` contract implemented (`embedding_id`, integer `label`, `-1` noise, sorted ascending, unique IDs, cardinality match).
+    - `final_layer_clustering/FINAL_LAYER_CLUSTERS.json`
+  - `assignments.json` contract implemented (`embedding_id`, `final_cluster_id`, sorted ascending, unique IDs, cardinality match).
 - Tests run/results:
   - `python -m py_compile vector_db_v2/scripts/pipeline_test.py`: pass.
 - Remaining risks/ambiguities:
-  - DBSCAN implementation is deterministic functional approximation for M1 contract validation.
+  - Final stage currently uses passthrough one-cluster-per-stop-leaf behavior.
 
 ## Phase 4 Checkpoint (Terminal Events + Compliance Telemetry)
 
@@ -73,7 +72,7 @@
     - `stage_end`
     - `stage_fail`
     - `pipeline_summary`
-  - Required Final preflight and output-status fields included in events.
+  - Required Final per-cluster output-status fields included in events.
   - Hardware compliance telemetry fields populated in `cluster-stats`.
 - Tests run/results:
   - `ReadLints` clean.
@@ -86,7 +85,7 @@
   - `vector_db_v2/tests/test_m1.cpp`
   - `vector_db_v2/scripts/pipeline_test.py`
 - Doc clauses satisfied:
-  - Added test coverage for final artifact presence and `labels.json` constraints.
+  - Added test coverage for final artifact presence and `assignments.json` constraints.
   - Added pipeline runner with strict v2 command flow.
 - Tests run/results:
   - Attempted `cmake -S vector_db_v2 -B vector_db_v2/build`: failed (`cmake` not found in shell PATH).

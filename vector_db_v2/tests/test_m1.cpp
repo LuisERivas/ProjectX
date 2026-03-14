@@ -55,6 +55,38 @@ static std::optional<int> extract_i32(const std::string& line, const std::string
     }
 }
 
+static std::optional<std::string> extract_string(const std::string& line, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    const auto key_pos = line.find(needle);
+    if (key_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto colon = line.find(':', key_pos + needle.size());
+    if (colon == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto q1 = line.find('"', colon);
+    if (q1 == std::string::npos) {
+        return std::nullopt;
+    }
+    bool escaped = false;
+    for (std::size_t i = q1 + 1; i < line.size(); ++i) {
+        const char c = line[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '"') {
+            return line.substr(q1 + 1, i - q1 - 1);
+        }
+    }
+    return std::nullopt;
+}
+
 int main() {
     const fs::path data_dir = fs::temp_directory_path() / "vectordb_v2_m1_test_data";
     std::error_code ec;
@@ -138,7 +170,7 @@ int main() {
     }
 
     const fs::path root = data_dir / "clusters" / "current";
-    const fs::path final_agg = root / "final_layer_clustering" / "FINAL_LAYER_DBSCAN.json";
+    const fs::path final_agg = root / "final_layer_clustering" / "FINAL_LAYER_CLUSTERS.json";
     const fs::path lower = root / "lower_layer_clustering" / "LOWER_LAYER_CLUSTERING.json";
     const fs::path mid = root / "mid_layer_clustering" / "MID_LAYER_CLUSTERING.json";
     if (!fs::exists(final_agg) || !fs::exists(lower) || !fs::exists(mid)) {
@@ -152,10 +184,10 @@ int main() {
             continue;
         }
         const auto dirname = entry.path().filename().string();
-        if (dirname.rfind("centroid_", 0) != 0) {
+        if (dirname.rfind("final_cluster_", 0) != 0) {
             continue;
         }
-        const fs::path labels = entry.path() / "labels.json";
+        const fs::path labels = entry.path() / "assignments.json";
         const fs::path summary = entry.path() / "cluster_summary.json";
         const fs::path manifest = entry.path() / "manifest.json";
         if (!fs::exists(labels) || !fs::exists(summary) || !fs::exists(manifest)) {
@@ -166,31 +198,34 @@ int main() {
 
         std::ifstream in(labels, std::ios::binary);
         if (!in) {
-            std::cerr << "failed opening labels.json\n";
+            std::cerr << "failed opening assignments.json\n";
             return 1;
         }
         std::unordered_set<std::uint64_t> seen;
         std::uint64_t prev_id = 0;
         bool first = true;
         std::size_t row_count = 0;
-        bool saw_noise = false;
+        std::optional<std::string> final_cluster_id;
         std::string line;
         while (std::getline(in, line)) {
             const auto id = extract_u64(line, "embedding_id");
-            const auto label = extract_i32(line, "label");
-            if (!id.has_value() || !label.has_value()) {
+            const auto cid = extract_string(line, "final_cluster_id");
+            if (!id.has_value() || !cid.has_value()) {
                 continue;
             }
             if (!first && *id < prev_id) {
-                std::cerr << "labels not sorted by embedding_id\n";
+                std::cerr << "assignments not sorted by embedding_id\n";
                 return 1;
             }
             if (seen.find(*id) != seen.end()) {
                 std::cerr << "duplicate embedding_id in labels\n";
                 return 1;
             }
-            if (*label == -1) {
-                saw_noise = true;
+            if (!final_cluster_id.has_value()) {
+                final_cluster_id = *cid;
+            } else if (*final_cluster_id != *cid) {
+                std::cerr << "multiple final_cluster_id values in assignment artifact\n";
+                return 1;
             }
             seen.insert(*id);
             prev_id = *id;
@@ -198,11 +233,7 @@ int main() {
             ++row_count;
         }
         if (row_count == 0) {
-            std::cerr << "labels row_count must be non-zero for written centroid output\n";
-            return 1;
-        }
-        if (!saw_noise) {
-            std::cerr << "noise label -1 not found in labels output\n";
+            std::cerr << "assignment row_count must be non-zero for written final output\n";
             return 1;
         }
 
@@ -211,7 +242,7 @@ int main() {
         sos << sin.rdbuf();
         const auto records_processed = extract_u64(sos.str(), "records_processed");
         if (!records_processed.has_value() || static_cast<std::size_t>(*records_processed) != row_count) {
-            std::cerr << "labels cardinality mismatch with cluster_summary\n";
+            std::cerr << "assignments cardinality mismatch with cluster_summary\n";
             return 1;
         }
     }

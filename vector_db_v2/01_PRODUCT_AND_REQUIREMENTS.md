@@ -36,8 +36,8 @@ Define what Vector DB v2 must do, what it explicitly will not do, and how succes
 - Cluster membership is pipeline output only, not a user-facing query filter in M1.
 - Layer sequencing is strict: Top layer completes before Mid layer, Mid before Lower, and Final layer starts only after required Lower-layer gate evaluations and eligible per-centroid jobs are complete.
 - Lower-layer continuation is governed by a per-centroid continued-processing split gate; outlier subgroup structure is used as evidence only, and approved continuation re-splits the full parent centroid dataset.
-- Final layer executes DBSCAN per eligible Lower-layer centroid dataset using that centroid's corresponding embeddings only; no cross-centroid mixing is allowed.
-- Final-layer eligibility is gate-fail only: a centroid branch is eligible only when its Lower-layer continued-processing split gate decision is `stop` and the centroid dataset passes required DBSCAN preflight validity checks (`05` canonical rule).
+- Final layer executes passthrough finalization per eligible Lower-layer centroid dataset using that centroid's corresponding embeddings only; no cross-centroid mixing is allowed.
+- Final-layer eligibility is gate-fail only: a centroid branch is eligible only when its Lower-layer continued-processing split gate decision is `stop` (`05` canonical rule).
 - System maintains one active embedding corpus and one active clustering state.
 - M1 numeric policy: embeddings are received/stored as FP32; optimal cluster-count estimation (k-selection) is computed in INT8; final clustering and assignment after k is selected are computed in FP16.
 - M1 hardware/runtime policy: performance-critical stages are CUDA-required, Ampere-targeted, and Tensor Core-first where kernel eligibility permits.
@@ -92,7 +92,7 @@ Define what Vector DB v2 must do, what it explicitly will not do, and how succes
 - `cluster-stats` and `cluster-health` parse as valid JSON and contain required contract fields.
 - Reopen/replay tests validate WAL consistency and cluster manifest reloading.
 - Terminal stage trace is complete and ordered for Top/Mid/Lower/Final stages with start/end/fail events, non-negative durations, and cumulative pipeline elapsed duration.
-- Final-layer per-centroid outputs include canonical `labels.json` contract compliance and required preflight pass/fail reason reporting.
+- Final-layer per-cluster outputs include canonical `assignments.json` contract compliance and required finalization status reporting.
 
 ## Decisions and Rationale
 

@@ -37,10 +37,10 @@ Define the on-disk data model, WAL/checkpoint behavior, and crash-recovery guara
           manifest.json
           ...
       final_layer_clustering/
-        FINAL_LAYER_DBSCAN.json
-        centroid_<id>/
+        FINAL_LAYER_CLUSTERS.json
+        final_cluster_<id>/
           manifest.json
-          labels.json
+          assignments.json
           cluster_summary.json
           ...
 ```
@@ -65,7 +65,7 @@ Define the on-disk data model, WAL/checkpoint behavior, and crash-recovery guara
   - `.ids` index aligns with vector rows in `.vec`
   - tombstone state resolves final live/deleted visibility
 - Cluster manifest and clustering artifacts represent one active state in M1 and are atomically replaced on rebuild.
-- Final-layer per-centroid artifact directories are created only for eligible gate-fail (`stop`) leaf centroid datasets that pass required DBSCAN preflight checks (non-empty, minimum points policy, dimensional consistency, finite numeric values, and ID/vector alignment integrity; canonical rule in `05`).
+- Final-layer per-cluster artifact directories are created only for eligible gate-fail (`stop`) leaf centroid datasets; gate `continue` branches are excluded by contract (canonical rule in `05`).
 
 ## Decisions and Rationale
 

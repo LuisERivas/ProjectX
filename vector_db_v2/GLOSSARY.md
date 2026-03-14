@@ -34,28 +34,26 @@ Define shared terms used across the v2 context documents to avoid ambiguity duri
 - **Outlier Subgroup Evidence:** Internal parent-centroid tail structure used only to justify or deny continued splitting, not as the direct split dataset.
 - **Local Sibling Baseline:** Same-depth neighborhood reference used to judge whether subgroup separation is unusually large in context.
 - **Per-Centroid Reclustering:** Independent Lower-layer clustering run over one child dataset, without using embeddings from other centroids.
-- **Final-Layer Per-Centroid DBSCAN:** Final stage behavior where DBSCAN is run independently for each eligible Lower-layer centroid dataset.
-- **Final-Layer Centroid Dataset:** The embedding subset corresponding to one Lower-layer centroid branch, used as isolated DBSCAN input when eligible.
-- **DBSCAN-Valid Preflight:** Required M1 preflight check set for Final-layer centroid datasets: non-empty, `n_points >= min_points_policy`, configured-dimension consistency, finite numeric values, and ID/vector alignment integrity.
-- **Eligible Lower-Layer Centroid Dataset (Final-Layer Eligibility):** A centroid dataset that reached Lower-layer gate evaluation, has gate decision `stop`, and passes DBSCAN-valid preflight checks (canonical rule in `05`).
+- **Final-Layer Per-Cluster Finalization:** Final stage behavior where one final cluster is produced independently for each eligible Lower-layer centroid dataset.
+- **Final-Layer Centroid Dataset:** The embedding subset corresponding to one Lower-layer centroid branch, used as isolated finalization input when eligible.
+- **Eligible Lower-Layer Centroid Dataset (Final-Layer Eligibility):** A centroid dataset that reached Lower-layer gate evaluation and has gate decision `stop` (canonical rule in `05`).
 - **Gate-Fail Leaf Centroid Dataset:** Alias of **Eligible Lower-Layer Centroid Dataset (Final-Layer Eligibility)**.
-- **No Cross-Centroid Mixing (Final Layer):** Final-layer rule that embeddings from different Lower-layer centroid datasets must not be combined in the same DBSCAN run.
-- **Final Layer DBSCAN Stage:** Alias of **Final-Layer Per-Centroid DBSCAN**.
-- **Final-Layer Per-Centroid Artifact Set:** Required M1 files per eligible centroid under `final_layer_clustering/centroid_<id>/`: `manifest.json`, `labels.json`, `cluster_summary.json`.
-- **`labels.json` (Final-Layer Contract):** Required per-centroid output file containing an array of `{embedding_id, label}` rows sorted by `embedding_id` ascending, with unique IDs and cardinality matching processed embeddings.
-- **Noise Label (`-1`):** Required DBSCAN convention indicating a point classified as noise.
-- **Preflight Failure Reason Code:** Machine-readable code emitted and persisted when Final-layer preflight fails for a centroid dataset.
+- **No Cross-Centroid Mixing (Final Layer):** Final-layer rule that embeddings from different Lower-layer centroid datasets must not be combined in the same finalization job.
+- **Final Layer Stage:** Alias of **Final-Layer Per-Cluster Finalization**.
+- **Final-Layer Per-Cluster Artifact Set:** Required M1 files per eligible cluster under `final_layer_clustering/final_cluster_<id>/`: `manifest.json`, `assignments.json`, `cluster_summary.json`.
+- **`assignments.json` (Final-Layer Contract):** Required per-cluster output file containing an array of `{embedding_id, final_cluster_id}` rows sorted by `embedding_id` ascending, with unique IDs and cardinality matching processed embeddings.
+- **Finalization Failure Reason Code:** Machine-readable code emitted and persisted when Final-layer finalization fails for a cluster dataset.
 - **Top-Layer Clustering:** First clustering pass over all eligible live vectors.
 - **Mid Layer Cluster:** Alias of **Mid-Layer Clustering**.
 - **Lower Layer Continued Processing Gate:** Alias of **Lower-Layer Continued-Processing Split Gate**.
 - **Lower-Layer Clustering:** Continued per-centroid clustering pass over Mid-layer outputs, controlled by the continued-processing gate.
-- **Final-Layer Clustering:** Alias of **Final-Layer Per-Centroid DBSCAN**.
+- **Final-Layer Clustering:** Alias of **Final-Layer Per-Cluster Finalization**.
 - **C++-First Hot Path:** Requirement that performance-critical execution (kernels and hot-path orchestration) is implemented in C++/CUDA rather than replaced by higher-level scripting.
 - **Hardware Compliance Telemetry:** Machine-verifiable runtime fields proving CUDA path validity, Tensor Core activity, architecture class, backend path, and pass/fail compliance status.
 - **Terminal Stage Trace:** Ordered machine-parseable terminal event stream that records lifecycle state for each pipeline stage.
 - **Stage Timing Event:** A terminal event containing stage lifecycle status with required start/end timestamps and elapsed duration fields.
 - **Pipeline Elapsed Time:** Monotonic cumulative elapsed duration from pipeline start to current event.
-- **Per-Centroid Job Timing:** Timing event coverage for required Lower-layer centroid gate evaluations/reclustering jobs and required Final-layer per-centroid DBSCAN jobs.
+- **Per-Centroid Job Timing:** Timing event coverage for required Lower-layer centroid gate evaluations/reclustering jobs and required Final-layer per-cluster jobs.
 - **Live Vector:** Non-deleted vector record currently eligible for query/clustering.
 - **Manifest:** Durable JSON metadata contract that references persistent state.
 - **Packed Row-Major:** Flattened contiguous vector buffer used for efficient scoring kernels.

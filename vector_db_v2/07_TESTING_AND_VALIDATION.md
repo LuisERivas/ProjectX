@@ -30,10 +30,10 @@ Define test strategy and release gates for v2 to ensure correctness, durability,
 - Clustering correctness (artifact existence, schema validity, deterministic fields).
 - Hierarchical sequencing correctness (Top -> Mid -> Lower -> Final ordering constraints).
 - Lower-layer continued-processing gate behavior (eligible vs skipped centroid jobs).
-- Final-layer DBSCAN trigger correctness (runs only after Lower-layer completion).
-- Final-layer isolation correctness (fail if Final-layer DBSCAN mixes embeddings across centroid datasets).
-- Final-layer per-centroid execution coverage (eligible gate-fail Lower-layer centroid datasets each receive Final-layer DBSCAN execution).
-- Final-layer eligibility correctness (gate `continue` branches are excluded; gate `stop` branches are included only when DBSCAN preflight checks pass).
+- Final-layer trigger correctness (runs only after Lower-layer completion).
+- Final-layer isolation correctness (fail if Final-layer processing mixes embeddings across centroid datasets).
+- Final-layer per-cluster execution coverage (eligible gate-fail Lower-layer centroid datasets each receive Final-layer processing).
+- Final-layer eligibility correctness (gate `continue` branches are excluded; gate `stop` branches are included).
 - Contract compatibility (`cluster-stats`, `cluster-health`, command exit semantics).
 - GPU telemetry consistency and fail-fast behavior.
 - Exact-only query behavior (no ANN path, no metadata filter/ranking path in M1).
@@ -47,8 +47,8 @@ Define test strategy and release gates for v2 to ensure correctness, durability,
   - Top-layer artifacts under `clusters/current/`
   - Mid-layer summary under `mid_layer_clustering/MID_LAYER_CLUSTERING.json`
   - Lower-layer summary under `lower_layer_clustering/LOWER_LAYER_CLUSTERING.json`
-  - Per-centroid Final-layer artifacts under `final_layer_clustering/centroid_<id>/` including `manifest.json`, `labels.json`, and `cluster_summary.json`
-  - Final-layer DBSCAN summary under `final_layer_clustering/FINAL_LAYER_DBSCAN.json`
+  - Per-cluster Final-layer artifacts under `final_layer_clustering/final_cluster_<id>/` including `manifest.json`, `assignments.json`, and `cluster_summary.json`
+  - Final-layer summary under `final_layer_clustering/FINAL_LAYER_CLUSTERS.json`
 
 ## Release Gates
 
@@ -77,30 +77,26 @@ Define test strategy and release gates for v2 to ensure correctness, durability,
 - Fail if `pipeline_elapsed_ms` is non-monotonic.
 - Fail if event ordering is inconsistent with strict stage dependencies.
 - Fail if Lower-layer per-centroid gate/job timing coverage is missing for required centroid jobs.
-- Fail if required per-centroid Final-layer DBSCAN timing events are missing for eligible centroid jobs.
+- Fail if required per-cluster Final-layer timing events are missing for eligible centroid jobs.
 - Fail if `stage_fail` omits error fields (`error_code`, `error_message`) or timing-until-failure.
 
-## Final-Layer Per-Centroid DBSCAN Test Expectations
+## Final-Layer Per-Cluster Test Expectations
 
 - Verify Final layer starts only after all required Lower-layer gate evaluations and eligible per-centroid jobs are complete.
-- Verify DBSCAN executes independently per eligible gate-fail Lower-layer centroid dataset.
+- Verify Final-layer processing executes independently per eligible gate-fail Lower-layer centroid dataset.
 - Fail if Final layer runs for centroid branches with Lower-layer gate decision `continue`.
-- Fail if Final layer skips centroid branches with Lower-layer gate decision `stop` when required preflight checks pass.
-- Fail if Final layer runs for centroid branches that fail required DBSCAN preflight checks.
+- Fail if Final layer skips centroid branches with Lower-layer gate decision `stop`.
 - Fail if Final-layer processing contains cross-centroid embedding mixing.
-- Verify per-centroid Final-layer output artifacts (`manifest.json`, `labels.json`, `cluster_summary.json`) exist for each eligible centroid dataset.
-- Verify aggregate Final-layer summary exists and reconciles with per-centroid outputs.
-- Fail if preflight failure/skip reason code is missing from terminal events or per-centroid manifest/summary telemetry.
+- Verify per-cluster Final-layer output artifacts (`manifest.json`, `assignments.json`, `cluster_summary.json`) exist for each eligible centroid dataset.
+- Verify aggregate Final-layer summary exists and reconciles with per-cluster outputs.
 
-## Final-Layer `labels.json` Contract Test Expectations
+## Final-Layer `assignments.json` Contract Test Expectations
 
-- Fail if `labels.json` top-level structure is not an array of objects.
-- Fail if any row is missing required fields (`embedding_id`, `label`).
-- Fail if `label` is not an integer.
-- Fail if DBSCAN noise label convention is violated (`label=-1` for noise points).
+- Fail if `assignments.json` top-level structure is not an array of objects.
+- Fail if any row is missing required fields (`embedding_id`, `final_cluster_id`).
 - Fail if rows are not sorted by `embedding_id` ascending.
 - Fail if duplicate `embedding_id` rows are present, or expected IDs are missing.
-- Fail if `labels.json` row count does not match embeddings processed for the centroid dataset.
+- Fail if `assignments.json` row count does not match embeddings processed for the final cluster.
 
 ## Lower-Layer Split-Gate Test Expectations
 
