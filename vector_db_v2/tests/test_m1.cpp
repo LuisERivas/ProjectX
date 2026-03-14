@@ -4,6 +4,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -85,6 +86,22 @@ static std::optional<std::string> extract_string(const std::string& line, const 
         }
     }
     return std::nullopt;
+}
+
+static std::unordered_map<std::string, std::size_t> count_rows_by_key(const fs::path& p, const std::string& key) {
+    std::unordered_map<std::string, std::size_t> out;
+    std::ifstream in(p, std::ios::binary);
+    if (!in) {
+        return out;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto v = extract_string(line, key);
+        if (v.has_value()) {
+            ++out[*v];
+        }
+    }
+    return out;
 }
 
 int main() {
@@ -173,6 +190,8 @@ int main() {
     const fs::path final_agg = root / "final_layer_clustering" / "FINAL_LAYER_CLUSTERS.json";
     const fs::path lower = root / "lower_layer_clustering" / "LOWER_LAYER_CLUSTERING.json";
     const fs::path mid = root / "mid_layer_clustering" / "MID_LAYER_CLUSTERING.json";
+    const fs::path top_assignments = root / "assignments.json";
+    const fs::path mid_assignments = root / "mid_layer_clustering" / "assignments.json";
     if (!fs::exists(final_agg) || !fs::exists(lower) || !fs::exists(mid)) {
         std::cerr << "required artifacts missing\n";
         return 1;
@@ -256,6 +275,74 @@ int main() {
         std::cerr << "cluster_stats unavailable\n";
         return 1;
     }
+    const auto top_counts = count_rows_by_key(top_assignments, "top_centroid_id");
+    if (top_counts.empty() || top_counts.size() != cstats.chosen_k) {
+        std::cerr << "top clustering no-empty invariant failed\n";
+        return 1;
+    }
+    for (const auto& kv : top_counts) {
+        if (kv.second == 0) {
+            std::cerr << "empty top centroid detected\n";
+            return 1;
+        }
+    }
+
+    std::ifstream min(mid, std::ios::binary);
+    std::string line;
+    while (std::getline(min, line)) {
+        const auto chosen = extract_u64(line, "chosen_k");
+        const auto produced = extract_u64(line, "produced_mid_centroids");
+        if (!chosen.has_value() || !produced.has_value()) {
+            continue;
+        }
+        if (*chosen == 0 || *produced != *chosen) {
+            std::cerr << "mid clustering no-empty invariant failed\n";
+            return 1;
+        }
+    }
+
+    const auto mid_counts = count_rows_by_key(mid_assignments, "mid_centroid_id");
+    if (mid_counts.empty()) {
+        std::cerr << "mid assignments missing\n";
+        return 1;
+    }
+    for (const auto& kv : mid_counts) {
+        if (kv.second == 0) {
+            std::cerr << "empty mid centroid detected\n";
+            return 1;
+        }
+    }
+
+    std::unordered_map<std::string, std::size_t> lower_continue_expected;
+    std::unordered_map<std::string, std::size_t> lower_continue_children;
+    std::ifstream lin(lower, std::ios::binary);
+    while (std::getline(lin, line)) {
+        const auto cid = extract_string(line, "centroid_id");
+        const auto decision = extract_string(line, "decision");
+        const auto reason = extract_string(line, "reason");
+        const auto chosen = extract_u64(line, "chosen_k");
+        const auto dataset_size = extract_u64(line, "dataset_size");
+        if (reason.has_value() && *reason == "depth_cap_reached") {
+            if (!dataset_size.has_value() || *dataset_size == 0 || !cid.has_value()) {
+                std::cerr << "empty lower leaf dataset detected\n";
+                return 1;
+            }
+            const auto pos = cid->rfind('_');
+            if (pos != std::string::npos) {
+                ++lower_continue_children[cid->substr(0, pos)];
+            }
+        }
+        if (decision.has_value() && *decision == "continue" && cid.has_value() && chosen.has_value()) {
+            lower_continue_expected[*cid] = static_cast<std::size_t>(*chosen);
+        }
+    }
+    for (const auto& kv : lower_continue_expected) {
+        if (kv.second == 0 || lower_continue_children[kv.first] != kv.second) {
+            std::cerr << "lower clustering no-empty invariant failed\n";
+            return 1;
+        }
+    }
+
     if (cstats.compliance_status != "pass") {
         std::cerr << "compliance expected pass in default test mode\n";
         return 1;

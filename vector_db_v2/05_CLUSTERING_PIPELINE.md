@@ -15,10 +15,12 @@ Define v2 clustering design for a 4-layer hierarchy (Top, Mid, Lower, Final), in
 1. Load live vectors and packed row-major buffer.
 2. Estimate intrinsic dimensionality and derive `k_min`/`k_max`.
 3. Run binary elbow selection over integer k-range.
-4. Run optional validation stage (stability/quality policy for current state).
-5. Persist and atomically replace current artifacts under `clusters/current/`.
-6. Update `cluster_manifest.json` for the active clustering state.
-7. Emit terminal stage lifecycle events for start and completion/failure, including stage elapsed and cumulative pipeline elapsed.
+4. Realize `chosen_k` with true Lloyd k-means initialized by k-means++ (effective `k = min(chosen_k, dataset_size)`).
+5. Enforce deterministic no-empty-cluster repair before stage completion.
+6. Run optional validation stage (stability/quality policy for current state).
+7. Persist and atomically replace current artifacts under `clusters/current/`.
+8. Update `cluster_manifest.json` for the active clustering state.
+9. Emit terminal stage lifecycle events for start and completion/failure, including stage elapsed and cumulative pipeline elapsed.
 
 ## Mid Layer Pipeline
 
@@ -26,9 +28,10 @@ Define v2 clustering design for a 4-layer hierarchy (Top, Mid, Lower, Final), in
 2. Read Top layer `assignments.json`.
 3. Assign each embedding to its top-1 Top-layer centroid.
 4. Build one child dataset per centroid using only that centroid's assigned embeddings.
-5. Run Mid-layer clustering once globally over these child datasets (single pass, non-recursive).
-6. Write Mid-layer artifacts and summary.
-7. Emit terminal stage lifecycle events for start and completion/failure, including stage elapsed and cumulative pipeline elapsed.
+5. For each parent Top centroid dataset, run local k-selection then local Lloyd k-means (k-means++ init) to produce Mid children.
+6. Enforce no-empty-cluster guarantee for each parent Mid realization.
+7. Write Mid-layer artifacts and summary.
+8. Emit terminal stage lifecycle events for start and completion/failure, including stage elapsed and cumulative pipeline elapsed.
 
 ## Lower Layer Pipeline
 
@@ -36,9 +39,10 @@ Define v2 clustering design for a 4-layer hierarchy (Top, Mid, Lower, Final), in
 2. Continue per-centroid clustering from Mid-layer outputs.
 3. Apply a per-centroid continued-processing split gate before each centroid job.
 4. If the gate passes, re-split the full parent centroid dataset (outlier subgroup evidence is not the split dataset).
-5. For each centroid that passes the gate, recluster its child dataset independently (no cross-centroid mixing).
-6. Write centroid-level Lower-layer artifacts and aggregate Lower-layer summary.
-7. Emit terminal stage lifecycle events for start and completion/failure, plus per-centroid gate/job timing events.
+5. For each centroid that passes the gate, run local k-selection then local Lloyd k-means (k-means++ init) independently (no cross-centroid mixing).
+6. Enforce no-empty-cluster guarantee for each parent Lower realization.
+7. Write centroid-level Lower-layer artifacts and aggregate Lower-layer summary.
+8. Emit terminal stage lifecycle events for start and completion/failure, plus per-centroid gate/job timing events.
 
 ## Lower-Layer Continued-Processing Split Gate
 

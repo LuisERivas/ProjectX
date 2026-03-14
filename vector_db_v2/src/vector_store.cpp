@@ -695,6 +695,13 @@ struct VectorStore::Impl {
         double objective = 0.0;
         std::vector<std::size_t> tested_ks;
     };
+    struct KMeansResult {
+        std::vector<std::size_t> assignments;
+        std::vector<std::vector<float>> centroids;
+        std::vector<std::size_t> counts;
+        std::size_t iterations = 0;
+        std::size_t empty_cluster_repairs = 0;
+    };
 
     static double l2_sq(const std::vector<float>& a, const std::vector<float>& b) {
         double s = 0.0;
@@ -846,21 +853,156 @@ struct VectorStore::Impl {
         return out;
     }
 
-    static std::vector<float> compute_centroid(const std::vector<const std::vector<float>*>& rows_ptr) {
-        std::vector<float> c(kVectorDim, 0.0f);
-        if (rows_ptr.empty()) {
-            return c;
-        }
-        for (const auto* p : rows_ptr) {
-            for (std::size_t d = 0; d < kVectorDim; ++d) {
-                c[d] += (*p)[d];
+    static std::size_t nearest_centroid_index(const std::vector<float>& v, const std::vector<std::vector<float>>& centroids) {
+        std::size_t best_j = 0;
+        double best_d = std::numeric_limits<double>::max();
+        for (std::size_t j = 0; j < centroids.size(); ++j) {
+            const double d = l2_sq(v, centroids[j]);
+            if (d < best_d) {
+                best_d = d;
+                best_j = j;
             }
         }
-        const float inv = 1.0f / static_cast<float>(rows_ptr.size());
-        for (float& v : c) {
-            v *= inv;
+        return best_j;
+    }
+
+    static std::vector<std::vector<float>> init_kmeanspp_centroids(const std::vector<const std::vector<float>*>& vectors, std::size_t k) {
+        std::vector<std::vector<float>> centroids;
+        if (vectors.empty() || k == 0) {
+            return centroids;
         }
-        return c;
+        k = std::max<std::size_t>(1, std::min<std::size_t>(k, vectors.size()));
+        centroids.reserve(k);
+        centroids.push_back(*vectors[0]);
+
+        std::vector<double> nearest_dist_sq(vectors.size(), std::numeric_limits<double>::max());
+        while (centroids.size() < k) {
+            std::size_t best_idx = 0;
+            double best_score = -1.0;
+            for (std::size_t i = 0; i < vectors.size(); ++i) {
+                const double d = l2_sq(*vectors[i], centroids.back());
+                if (d < nearest_dist_sq[i]) {
+                    nearest_dist_sq[i] = d;
+                }
+                if (nearest_dist_sq[i] > best_score) {
+                    best_score = nearest_dist_sq[i];
+                    best_idx = i;
+                }
+            }
+            centroids.push_back(*vectors[best_idx]);
+        }
+        return centroids;
+    }
+
+    static std::size_t repair_empty_clusters(const std::vector<const std::vector<float>*>& vectors,
+                                             const std::vector<std::vector<float>>& centroids,
+                                             std::vector<std::size_t>& assignments,
+                                             std::vector<std::size_t>& counts) {
+        std::size_t repairs = 0;
+        if (vectors.empty() || centroids.empty()) {
+            return repairs;
+        }
+
+        for (std::size_t empty_idx = 0; empty_idx < counts.size(); ++empty_idx) {
+            if (counts[empty_idx] > 0) {
+                continue;
+            }
+            std::size_t donor_point = 0;
+            std::size_t donor_cluster = 0;
+            double donor_score = -1.0;
+            for (std::size_t i = 0; i < vectors.size(); ++i) {
+                const std::size_t current = assignments[i];
+                if (counts[current] <= 1) {
+                    continue;
+                }
+                const double d = l2_sq(*vectors[i], centroids[current]);
+                if (d > donor_score) {
+                    donor_score = d;
+                    donor_point = i;
+                    donor_cluster = current;
+                }
+            }
+            if (donor_score < 0.0) {
+                continue;
+            }
+            assignments[donor_point] = empty_idx;
+            --counts[donor_cluster];
+            ++counts[empty_idx];
+            ++repairs;
+        }
+        return repairs;
+    }
+
+    static KMeansResult run_kmeans_no_empty(const std::vector<const std::vector<float>*>& vectors, std::size_t requested_k) {
+        KMeansResult out{};
+        if (vectors.empty()) {
+            return out;
+        }
+        const std::size_t n = vectors.size();
+        const std::size_t k = std::max<std::size_t>(1, std::min<std::size_t>(requested_k, n));
+        out.assignments.assign(n, 0);
+        out.centroids = init_kmeanspp_centroids(vectors, k);
+        out.counts.assign(k, 0);
+        if (out.centroids.empty()) {
+            out.centroids.push_back(*vectors[0]);
+            out.counts.assign(1, 0);
+        }
+
+        constexpr std::size_t kMaxIterations = 48;
+        constexpr double kCentroidShiftEps = 1e-6;
+        std::vector<std::vector<float>> next_centroids = out.centroids;
+        for (std::size_t iter = 0; iter < kMaxIterations; ++iter) {
+            out.iterations = iter + 1;
+            std::fill(out.counts.begin(), out.counts.end(), 0);
+            bool assignment_changed = false;
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::size_t assigned = nearest_centroid_index(*vectors[i], out.centroids);
+                if (assigned != out.assignments[i]) {
+                    assignment_changed = true;
+                }
+                out.assignments[i] = assigned;
+                ++out.counts[assigned];
+            }
+
+            const std::size_t repairs = repair_empty_clusters(vectors, out.centroids, out.assignments, out.counts);
+            out.empty_cluster_repairs += repairs;
+            if (repairs > 0) {
+                assignment_changed = true;
+            }
+            std::fill(next_centroids.begin(), next_centroids.end(), std::vector<float>(kVectorDim, 0.0f));
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::size_t c = out.assignments[i];
+                for (std::size_t d = 0; d < kVectorDim; ++d) {
+                    next_centroids[c][d] += (*vectors[i])[d];
+                }
+            }
+            for (std::size_t c = 0; c < k; ++c) {
+                if (out.counts[c] == 0) {
+                    next_centroids[c] = out.centroids[c];
+                    continue;
+                }
+                const float inv = 1.0f / static_cast<float>(out.counts[c]);
+                for (std::size_t d = 0; d < kVectorDim; ++d) {
+                    next_centroids[c][d] *= inv;
+                }
+            }
+
+            double max_shift = 0.0;
+            for (std::size_t c = 0; c < k; ++c) {
+                const double shift = l2_sq(out.centroids[c], next_centroids[c]);
+                if (shift > max_shift) {
+                    max_shift = shift;
+                }
+            }
+            out.centroids = next_centroids;
+
+            const bool all_non_empty =
+                std::all_of(out.counts.begin(), out.counts.end(), [](std::size_t cnt) { return cnt > 0; });
+            if (!assignment_changed && max_shift <= kCentroidShiftEps && all_non_empty) {
+                break;
+            }
+        }
+        return out;
     }
 
     std::vector<const std::vector<float>*> vectors_from_ids(const std::vector<std::uint64_t>& ids) const {
@@ -883,11 +1025,21 @@ struct VectorStore::Impl {
                                double objective) {
         fs::create_directories(clusters_current());
 
-        std::vector<std::vector<const std::vector<float>*>> groups(chosen_k);
+        std::vector<const std::vector<float>*> vectors;
+        vectors.reserve(recs.size());
+        for (const auto& rec : recs) {
+            vectors.push_back(&rec.vector);
+        }
+        const auto kmeans = run_kmeans_no_empty(vectors, chosen_k);
+        if (kmeans.assignments.size() != recs.size()) {
+            return Status::Error("top k-means assignment cardinality mismatch");
+        }
+        const std::size_t bucket_count = kmeans.centroids.size();
+        std::vector<std::vector<const std::vector<float>*>> groups(bucket_count);
         std::ostringstream assignments;
         assignments << "[\n";
         for (std::size_t i = 0; i < recs.size(); ++i) {
-            const auto centroid = static_cast<std::size_t>(recs[i].embedding_id % chosen_k);
+            const auto centroid = kmeans.assignments[i];
             groups[centroid].push_back(&recs[i].vector);
             assignments << "  {\"embedding_id\": " << recs[i].embedding_id << ", \"top_centroid_id\": \"top_" << centroid << "\"}";
             if (i + 1 < recs.size()) {
@@ -898,9 +1050,9 @@ struct VectorStore::Impl {
         assignments << "]\n";
 
         std::vector<float> centroids;
-        centroids.reserve(chosen_k * kVectorDim);
-        for (std::size_t i = 0; i < chosen_k; ++i) {
-            const auto c = compute_centroid(groups[i]);
+        centroids.reserve(bucket_count * kVectorDim);
+        for (std::size_t i = 0; i < bucket_count; ++i) {
+            const auto& c = kmeans.centroids[i];
             centroids.insert(centroids.end(), c.begin(), c.end());
         }
 
@@ -911,7 +1063,7 @@ struct VectorStore::Impl {
                << "}\n";
         std::ostringstream elbow;
         elbow << "{\n"
-              << "  \"chosen_k\": " << chosen_k << ",\n"
+              << "  \"chosen_k\": " << bucket_count << ",\n"
               << "  \"objective\": " << std::fixed << std::setprecision(6) << objective << "\n"
               << "}\n";
         const std::string stability = "{\n  \"status\": \"placeholder_m1\"\n}\n";
@@ -928,7 +1080,7 @@ struct VectorStore::Impl {
         manifest << "{\n"
                  << "  \"active_state\": \"current\",\n"
                  << "  \"vectors_indexed\": " << recs.size() << ",\n"
-                 << "  \"chosen_k\": " << chosen_k << ",\n"
+                 << "  \"chosen_k\": " << bucket_count << ",\n"
                  << "  \"k_min\": " << k_min << ",\n"
                  << "  \"k_max\": " << k_max << ",\n"
                  << "  \"build_lsn\": " << last_lsn << "\n"
@@ -940,7 +1092,7 @@ struct VectorStore::Impl {
         cstats.available = true;
         cstats.build_lsn = last_lsn;
         cstats.vectors_indexed = recs.size();
-        cstats.chosen_k = chosen_k;
+        cstats.chosen_k = bucket_count;
         cstats.k_min = k_min;
         cstats.k_max = k_max;
         cstats.objective = objective;
@@ -994,25 +1146,28 @@ struct VectorStore::Impl {
             const auto k_max = compute_k_max(ids.size());
             const auto vecs = vectors_from_ids(ids);
             const auto selected = select_elbow_k_binary(vecs, k_min, k_max);
-            const auto chosen_k = selected.chosen_k;
-            const auto bucket_count = std::max<std::size_t>(1, chosen_k);
+            const auto kmeans = run_kmeans_no_empty(vecs, selected.chosen_k);
+            if (kmeans.assignments.size() != ids.size()) {
+                return Status::Error("mid k-means assignment cardinality mismatch");
+            }
+            const auto bucket_count = kmeans.centroids.size();
             const std::string tested_ks_json = to_json_u64_array(selected.tested_ks);
             emit_event("k_selection", "mid_k_selection", "Mid K Selection", "computed", 0.0, 0.0,
                        {{"parent_top_centroid_id", top_id},
                         {"k_min", std::to_string(k_min)},
                         {"k_max", std::to_string(k_max)},
-                        {"chosen_k", std::to_string(chosen_k)},
+                        {"chosen_k", std::to_string(bucket_count)},
                         {"tested_ks", tested_ks_json}});
             std::cout << "k-telemetry phase=mid parent_top_centroid_id=" << top_id
                       << " k_min=" << k_min
                       << " k_max=" << k_max
-                      << " chosen_k=" << chosen_k
+                      << " chosen_k=" << bucket_count
                       << " tested_ks=" << to_compact_ks_preview(selected.tested_ks) << "\n";
 
             std::vector<std::vector<std::uint64_t>> buckets(bucket_count);
-            for (const auto id : ids) {
-                const auto idx = static_cast<std::size_t>(id % bucket_count);
-                buckets[idx].push_back(id);
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                const auto idx = kmeans.assignments[i];
+                buckets[idx].push_back(ids[i]);
             }
 
             std::size_t produced_for_top = 0;
@@ -1038,7 +1193,7 @@ struct VectorStore::Impl {
                     << ", \"source_rows\": " << ids.size()
                     << ", \"k_min\": " << k_min
                     << ", \"k_max\": " << k_max
-                    << ", \"chosen_k\": " << chosen_k
+                    << ", \"chosen_k\": " << bucket_count
                     << ", \"produced_mid_centroids\": " << produced_for_top
                     << "}";
         }
@@ -1127,18 +1282,22 @@ struct VectorStore::Impl {
             const auto k_max = compute_k_max(ids.size());
             const auto vecs = vectors_from_ids(ids);
             const auto selected = select_elbow_k_binary(vecs, k_min, k_max);
-            const auto chosen_k = selected.chosen_k;
+            const auto kmeans = run_kmeans_no_empty(vecs, selected.chosen_k);
+            if (kmeans.assignments.size() != ids.size()) {
+                return Status::Error("lower k-means assignment cardinality mismatch");
+            }
+            const auto bucket_count = kmeans.centroids.size();
             const std::string tested_ks_json = to_json_u64_array(selected.tested_ks);
             emit_event("k_selection", "lower_k_selection", "Lower K Selection", "computed", 0.0, 0.0,
                        {{"parent_mid_centroid_id", mid},
                         {"k_min", std::to_string(k_min)},
                         {"k_max", std::to_string(k_max)},
-                        {"chosen_k", std::to_string(chosen_k)},
+                        {"chosen_k", std::to_string(bucket_count)},
                         {"tested_ks", tested_ks_json}});
             std::cout << "k-telemetry phase=lower parent_mid_centroid_id=" << mid
                       << " k_min=" << k_min
                       << " k_max=" << k_max
-                      << " chosen_k=" << chosen_k
+                      << " chosen_k=" << bucket_count
                       << " tested_ks=" << to_compact_ks_preview(selected.tested_ks) << "\n";
             const bool cont = ids.size() >= 64;
             gate_rows.push_back(LowerGateEval{
@@ -1147,19 +1306,18 @@ struct VectorStore::Impl {
                 ids.size(),
                 k_min,
                 k_max,
-                chosen_k,
+                bucket_count,
                 cont ? "size_above_split_threshold" : "size_below_split_threshold",
             });
             if (!cont) {
-                append_leaf(mid, ids, "stop", k_min, k_max, chosen_k);
+                append_leaf(mid, ids, "stop", k_min, k_max, bucket_count);
                 continue;
             }
 
-            const auto bucket_count = std::max<std::size_t>(1, chosen_k);
             std::vector<std::vector<std::uint64_t>> buckets(bucket_count);
-            for (const auto id : ids) {
-                const auto idx = static_cast<std::size_t>(id % bucket_count);
-                buckets[idx].push_back(id);
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                const auto idx = kmeans.assignments[i];
+                buckets[idx].push_back(ids[i]);
             }
             for (std::size_t i = 0; i < buckets.size(); ++i) {
                 if (buckets[i].empty()) {
@@ -1172,10 +1330,10 @@ struct VectorStore::Impl {
                     buckets[i].size(),
                     k_min,
                     k_max,
-                    chosen_k,
+                    bucket_count,
                     "depth_cap_reached",
                 });
-                append_leaf(leaf_id, buckets[i], "stop", k_min, k_max, chosen_k);
+                append_leaf(leaf_id, buckets[i], "stop", k_min, k_max, bucket_count);
             }
         }
 

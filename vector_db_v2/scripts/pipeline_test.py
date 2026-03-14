@@ -95,6 +95,65 @@ def count_unique_key_rows(path: Path, key: str) -> int:
     return len(uniq)
 
 
+def count_rows_by_key(path: Path, key: str) -> dict[str, int]:
+    rows = read_json(path)
+    out: dict[str, int] = {}
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict) or key not in row:
+            continue
+        k = str(row[key])
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def assert_no_empty_mid(mid_summary: object) -> None:
+    if not isinstance(mid_summary, dict):
+        raise RuntimeError("mid summary must be an object")
+    per_top = mid_summary.get("per_top_centroid", [])
+    if not isinstance(per_top, list):
+        raise RuntimeError("mid summary per_top_centroid must be a list")
+    for row in per_top:
+        if not isinstance(row, dict):
+            continue
+        chosen_k = int(row.get("chosen_k", 0))
+        produced = int(row.get("produced_mid_centroids", 0))
+        if chosen_k <= 0 or produced != chosen_k:
+            raise RuntimeError("mid no-empty invariant failed for at least one top parent")
+
+
+def assert_no_empty_lower(lower_summary: object) -> None:
+    if not isinstance(lower_summary, dict):
+        raise RuntimeError("lower summary must be an object")
+    gate_rows = lower_summary.get("gate_evaluations", [])
+    if not isinstance(gate_rows, list):
+        raise RuntimeError("lower summary gate_evaluations must be a list")
+
+    continue_expected: dict[str, int] = {}
+    continue_children: dict[str, int] = {}
+    for row in gate_rows:
+        if not isinstance(row, dict):
+            continue
+        cid = str(row.get("centroid_id", ""))
+        decision = str(row.get("decision", ""))
+        reason = str(row.get("reason", ""))
+        chosen_k = int(row.get("chosen_k", 0))
+        dataset_size = int(row.get("dataset_size", 0))
+        if reason == "depth_cap_reached":
+            if dataset_size <= 0:
+                raise RuntimeError("lower no-empty invariant failed: empty depth_cap_reached leaf")
+            parent, _, _ = cid.rpartition("_")
+            if parent:
+                continue_children[parent] = continue_children.get(parent, 0) + 1
+        if decision == "continue":
+            continue_expected[cid] = chosen_k
+
+    for parent, expected in continue_expected.items():
+        if expected <= 0 or continue_children.get(parent, 0) != expected:
+            raise RuntimeError(f"lower no-empty invariant failed for parent {parent}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=10000)
@@ -165,11 +224,29 @@ def main() -> int:
     store_stats = json.loads(stats_text)
     lower_summary = read_json(lower_summary_path)
     final_summary = read_json(final_summary_path)
+    mid_summary = read_json(data_dir / "clusters" / "current" / "mid_layer_clustering" / "MID_LAYER_CLUSTERING.json")
+    cluster_stats_obj = json.loads(cstats)
 
     embedding_total = int(store_stats.get("live_rows", 0))
     top_cluster_count = count_unique_key_rows(top_assignments, "top_centroid_id")
     mid_cluster_count = count_unique_key_rows(mid_assignments, "mid_centroid_id")
     lower_cluster_count = len(lower_summary.get("leaf_datasets", [])) if isinstance(lower_summary, dict) else 0
+
+    top_rows = count_rows_by_key(top_assignments, "top_centroid_id")
+    if not top_rows:
+        raise RuntimeError("top assignments missing")
+    if int(cluster_stats_obj.get("chosen_k", 0)) != len(top_rows):
+        raise RuntimeError("top no-empty invariant failed: unique top centroids != chosen_k")
+    if any(count <= 0 for count in top_rows.values()):
+        raise RuntimeError("top no-empty invariant failed: empty top centroid detected")
+
+    mid_rows = count_rows_by_key(mid_assignments, "mid_centroid_id")
+    if not mid_rows:
+        raise RuntimeError("mid assignments missing")
+    if any(count <= 0 for count in mid_rows.values()):
+        raise RuntimeError("mid no-empty invariant failed: empty mid centroid detected")
+    assert_no_empty_mid(mid_summary)
+    assert_no_empty_lower(lower_summary)
 
     final_cluster_count = 0
     if isinstance(final_summary, dict):
@@ -197,6 +274,11 @@ def main() -> int:
         "data_dir": str(data_dir),
         "stats": store_stats,
         "cluster_stats": json.loads(cstats),
+        "no_empty_cluster_checks": {
+            "top": "pass",
+            "mid": "pass",
+            "lower": "pass",
+        },
         "cluster_health": json.loads(chealth),
         "cluster_counts": {
             "total_embeddings": embedding_total,

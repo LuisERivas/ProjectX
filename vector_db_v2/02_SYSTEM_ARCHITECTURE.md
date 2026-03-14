@@ -54,9 +54,9 @@ flowchart TD
 
 - **Write path:** validate -> append WAL -> apply state -> periodic checkpoint.
 - **Read path:** validate query vector -> score live embeddings exactly -> rank top-k by vector similarity -> return IDs/scores.
-- **Top layer path:** load live vectors -> estimate k-range -> elbow select -> evaluate/validate -> write top-layer artifacts.
-- **Mid layer path:** start only after Top layer succeeds -> assign each embedding to top-1 Top-layer centroid -> build one child dataset per centroid -> run one global Mid-layer pass -> write Mid-layer artifacts.
-- **Lower layer path:** start only after Mid outputs exist -> run per-centroid continued-processing split gate using outlier subgroup evidence + local sibling baseline -> if gate passes, re-split full parent centroid dataset -> process each eligible child dataset independently (no cross-centroid mixing) -> write per-centroid Lower-layer artifacts + aggregate summary + per-centroid timing events.
+- **Top layer path:** load live vectors -> estimate k-range -> elbow select -> realize selected `k` via Lloyd k-means with k-means++ init -> deterministic empty-cluster repair if needed -> evaluate/validate -> write top-layer artifacts.
+- **Mid layer path:** start only after Top layer succeeds -> assign each embedding to top-1 Top-layer centroid -> build one child dataset per centroid -> run per-parent local k-selection + Lloyd k-means (k-means++ init) with no-empty guarantee -> write Mid-layer artifacts.
+- **Lower layer path:** start only after Mid outputs exist -> run per-centroid continued-processing split gate using outlier subgroup evidence + local sibling baseline -> if gate passes, re-split full parent centroid dataset -> process each eligible child dataset with per-parent local k-selection + Lloyd k-means (k-means++ init, no-empty guarantee, no cross-centroid mixing) -> write per-centroid Lower-layer artifacts + aggregate summary + per-centroid timing events.
 - **Final layer path:** start only after all required Lower-layer gate evaluations and eligible jobs complete -> consume eligible gate-fail leaf centroid datasets (`05` canonical eligibility rule) -> run passthrough per-leaf finalization (no cross-centroid mixing) using C++/CUDA implementation target for performance-critical execution -> write per-cluster Final-layer artifacts + aggregate Final-layer summary.
 
 ## Decisions and Rationale
