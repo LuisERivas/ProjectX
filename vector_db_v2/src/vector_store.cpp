@@ -341,6 +341,16 @@ struct VectorStore::Impl {
                     double elapsed_ms,
                     double pipeline_elapsed_ms,
                     const std::vector<std::pair<std::string, std::string>>& extra = {}) const {
+        auto is_json_scalar_or_container = [](const std::string& v) -> bool {
+            if (v.empty()) {
+                return false;
+            }
+            const char c = v[0];
+            if (c == '[' || c == '{' || c == '-' || std::isdigit(c)) {
+                return true;
+            }
+            return v == "true" || v == "false" || v == "null";
+        };
         std::ostringstream os;
         os << "{"
            << "\"event_type\":\"" << json_escape(event_type) << "\","
@@ -353,7 +363,7 @@ struct VectorStore::Impl {
            << "\"pipeline_elapsed_ms\":" << std::fixed << std::setprecision(3) << pipeline_elapsed_ms;
         for (const auto& kv : extra) {
             os << ",\"" << json_escape(kv.first) << "\":";
-            if (kv.second == "true" || kv.second == "false" || (!kv.second.empty() && (std::isdigit(kv.second[0]) || kv.second[0] == '-'))) {
+            if (is_json_scalar_or_container(kv.second)) {
                 os << kv.second;
             } else {
                 os << "\"" << json_escape(kv.second) << "\"";
@@ -361,6 +371,36 @@ struct VectorStore::Impl {
         }
         os << "}";
         std::cout << os.str() << "\n";
+    }
+
+    static std::string to_json_u64_array(const std::vector<std::size_t>& values) {
+        std::ostringstream os;
+        os << "[";
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            if (i > 0) {
+                os << ",";
+            }
+            os << values[i];
+        }
+        os << "]";
+        return os.str();
+    }
+
+    static std::string to_compact_ks_preview(const std::vector<std::size_t>& values, std::size_t max_items = 24) {
+        std::ostringstream os;
+        os << "[";
+        const std::size_t limit = std::min(values.size(), max_items);
+        for (std::size_t i = 0; i < limit; ++i) {
+            if (i > 0) {
+                os << ",";
+            }
+            os << values[i];
+        }
+        if (values.size() > max_items) {
+            os << ",...(" << values.size() << " total)";
+        }
+        os << "]";
+        return os.str();
     }
 
     Status write_manifest() const {
@@ -653,6 +693,7 @@ struct VectorStore::Impl {
     struct KSelectionResult {
         std::size_t chosen_k = 2;
         double objective = 0.0;
+        std::vector<std::size_t> tested_ks;
     };
 
     static double l2_sq(const std::vector<float>& a, const std::vector<float>& b) {
@@ -753,6 +794,7 @@ struct VectorStore::Impl {
         const auto sampled = sample_vectors(vectors);
 
         std::unordered_map<std::size_t, double> cache;
+        std::vector<std::size_t> tested_order;
         auto eval = [&](std::size_t k) -> double {
             const auto it = cache.find(k);
             if (it != cache.end()) {
@@ -760,6 +802,7 @@ struct VectorStore::Impl {
             }
             const double v = k_objective(sampled, k);
             cache[k] = v;
+            tested_order.push_back(k);
             return v;
         };
         auto knee_score = [&](std::size_t k) -> double {
@@ -799,6 +842,7 @@ struct VectorStore::Impl {
         }
         out.chosen_k = best_k;
         out.objective = eval(best_k);
+        out.tested_ks = tested_order;
         return out;
     }
 
@@ -952,6 +996,18 @@ struct VectorStore::Impl {
             const auto selected = select_elbow_k_binary(vecs, k_min, k_max);
             const auto chosen_k = selected.chosen_k;
             const auto bucket_count = std::max<std::size_t>(1, chosen_k);
+            const std::string tested_ks_json = to_json_u64_array(selected.tested_ks);
+            emit_event("k_selection", "mid_k_selection", "Mid K Selection", "computed", 0.0, 0.0,
+                       {{"parent_top_centroid_id", top_id},
+                        {"k_min", std::to_string(k_min)},
+                        {"k_max", std::to_string(k_max)},
+                        {"chosen_k", std::to_string(chosen_k)},
+                        {"tested_ks", tested_ks_json}});
+            std::cout << "k-telemetry phase=mid parent_top_centroid_id=" << top_id
+                      << " k_min=" << k_min
+                      << " k_max=" << k_max
+                      << " chosen_k=" << chosen_k
+                      << " tested_ks=" << to_compact_ks_preview(selected.tested_ks) << "\n";
 
             std::vector<std::vector<std::uint64_t>> buckets(bucket_count);
             for (const auto id : ids) {
@@ -1072,6 +1128,18 @@ struct VectorStore::Impl {
             const auto vecs = vectors_from_ids(ids);
             const auto selected = select_elbow_k_binary(vecs, k_min, k_max);
             const auto chosen_k = selected.chosen_k;
+            const std::string tested_ks_json = to_json_u64_array(selected.tested_ks);
+            emit_event("k_selection", "lower_k_selection", "Lower K Selection", "computed", 0.0, 0.0,
+                       {{"parent_mid_centroid_id", mid},
+                        {"k_min", std::to_string(k_min)},
+                        {"k_max", std::to_string(k_max)},
+                        {"chosen_k", std::to_string(chosen_k)},
+                        {"tested_ks", tested_ks_json}});
+            std::cout << "k-telemetry phase=lower parent_mid_centroid_id=" << mid
+                      << " k_min=" << k_min
+                      << " k_max=" << k_max
+                      << " chosen_k=" << chosen_k
+                      << " tested_ks=" << to_compact_ks_preview(selected.tested_ks) << "\n";
             const bool cont = ids.size() >= 64;
             gate_rows.push_back(LowerGateEval{
                 mid,
@@ -1590,6 +1658,11 @@ Status VectorStore::build_top_clusters(std::uint32_t seed) {
     }
     const auto selected = Impl::select_elbow_k_binary(vecs, k_min, k_max);
     const auto chosen_k = selected.chosen_k;
+    std::cout << "k-telemetry phase=top"
+              << " k_min=" << k_min
+              << " k_max=" << k_max
+              << " chosen_k=" << chosen_k
+              << " tested_ks=" << Impl::to_compact_ks_preview(selected.tested_ks) << "\n";
     const auto s = impl_->write_top_artifacts(recs, k_min, k_max, chosen_k, selected.objective);
     if (!s.ok) {
         (void)impl_->write_cluster_runtime_state();
@@ -1599,7 +1672,11 @@ Status VectorStore::build_top_clusters(std::uint32_t seed) {
     }
     (void)impl_->write_cluster_runtime_state();
     impl_->emit_event("stage_end", stage_id, "Top Layer", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms(),
-                      {{"records_processed", std::to_string(recs.size())}});
+                      {{"records_processed", std::to_string(recs.size())},
+                       {"k_min", std::to_string(k_min)},
+                       {"k_max", std::to_string(k_max)},
+                       {"chosen_k", std::to_string(chosen_k)},
+                       {"tested_ks", Impl::to_json_u64_array(selected.tested_ks)}});
     impl_->emit_event("pipeline_summary", "pipeline", "Pipeline Summary", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
     return Status::Ok();
 }
@@ -1634,7 +1711,8 @@ Status VectorStore::build_mid_layer_clusters(std::uint32_t seed) {
         return s;
     }
     (void)impl_->write_cluster_runtime_state();
-    impl_->emit_event("stage_end", stage_id, "Mid Layer", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
+    impl_->emit_event("stage_end", stage_id, "Mid Layer", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms(),
+                      {{"k_selection_scope", "per_parent_top_centroid"}});
     impl_->emit_event("pipeline_summary", "pipeline", "Pipeline Summary", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
     return Status::Ok();
 }
@@ -1669,7 +1747,8 @@ Status VectorStore::build_lower_layer_clusters(std::uint32_t seed) {
         return s;
     }
     (void)impl_->write_cluster_runtime_state();
-    impl_->emit_event("stage_end", stage_id, "Lower Layer", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
+    impl_->emit_event("stage_end", stage_id, "Lower Layer", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms(),
+                      {{"k_selection_scope", "per_parent_mid_centroid"}});
     impl_->emit_event("pipeline_summary", "pipeline", "Pipeline Summary", "completed", pipeline.elapsed_ms(), pipeline.elapsed_ms());
     return Status::Ok();
 }
