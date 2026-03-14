@@ -1270,7 +1270,7 @@ struct VectorStore::Impl {
             aggregate << "    {\"final_cluster_id\": \"" << final_cluster_id << "\", "
                       << "\"source_lower_centroid_id\": \"" << cid
                       << "\", \"records_processed\": " << sorted_ids.size()
-                      << "\", \"final_layer_output_status\": \"written\", "
+                      << ", \"final_layer_output_status\": \"written\", "
                       << "\"assignments_file_present\": true}";
 
             emit_event("stage_end", "final_per_cluster", "Final Per-Leaf Finalization", "completed", 0.0, 0.0,
