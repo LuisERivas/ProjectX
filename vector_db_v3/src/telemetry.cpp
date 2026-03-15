@@ -114,7 +114,7 @@ Status load_stage_baseline(
     }
 
     const std::regex row_re(
-        R"(\{"stage_id":"([^"]+)","stage_elapsed_ms":(-?[0-9]+(?:\.[0-9]+)?)\})");
+        "\\{\"stage_id\":\"([^\"]+)\",\"stage_elapsed_ms\":(-?[0-9]+(\\.[0-9]+)?)\\}");
     auto begin = std::sregex_iterator(body.begin(), body.end(), row_re);
     const auto end = std::sregex_iterator();
     for (auto it = begin; it != end; ++it) {
