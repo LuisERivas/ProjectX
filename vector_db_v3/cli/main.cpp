@@ -162,8 +162,19 @@ bool load_text_file(const std::filesystem::path& p, std::string& out) {
 }
 
 bool parse_vec_arg_1024(const std::string& arg, std::vector<float>& out, std::string& error) {
+    // Treat comma-containing input as inline CSV immediately.
+    if (arg.find(',') != std::string::npos) {
+        return parse_vector_csv_1024(arg, out, error);
+    }
+
     std::string source = arg;
-    if (std::filesystem::exists(arg)) {
+    std::error_code ec;
+    const bool path_exists = std::filesystem::exists(std::filesystem::path(arg), ec);
+    if (ec) {
+        error = "vector input path check failed";
+        return false;
+    }
+    if (path_exists) {
         if (!load_text_file(arg, source)) {
             error = "failed to read vector file";
             return false;
