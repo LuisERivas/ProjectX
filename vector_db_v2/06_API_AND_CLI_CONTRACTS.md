@@ -139,12 +139,37 @@ Required event fields:
 - `error_code` and `error_message` (required for failure events)
 - `non_compliance_stage` (required for hardware non-compliance failures)
 
+Required `pipeline_summary` reporting fields:
+
+- `event_type` must be `pipeline_summary`.
+- `status` (`completed` or `failed`).
+- `pipeline_elapsed_ms`.
+- `stages_completed` (count of successfully completed stages in the run).
+- `stages_failed` (count of failed stages in the run).
+- `records_processed_total` (sum across applicable stages).
+- `final_output_status` (for example: `written`, `failed`, `partial`).
+- `summary_version` (contract version for summary parsing compatibility).
+
 Ordering and validity rules:
 
 - Events are emitted in execution order.
 - Every `stage_start` has exactly one matching `stage_end` or `stage_fail`.
 - `elapsed_ms` and `pipeline_elapsed_ms` are non-negative.
 - `pipeline_elapsed_ms` is monotonic over event stream.
+
+Previous-run baseline rule (required for `pipeline_summary`):
+
+- `pipeline_summary` must include previous-run baseline comparison fields when a prior comparable run exists.
+- Required baseline fields when available:
+  - `baseline_available=true`
+  - `baseline_run_id`
+  - `baseline_pipeline_elapsed_ms`
+  - `delta_pipeline_elapsed_ms`
+  - `delta_pipeline_elapsed_pct`
+- If no comparable prior run exists, emit:
+  - `baseline_available=false`
+  - `baseline_unavailable_reason` (for example: `no_prior_run`, `schema_mismatch`, `incompatible_config`)
+- Baseline comparison must only use runs with compatible pipeline schema/version and materially comparable runtime config.
 
 Stdout/stderr responsibilities:
 
