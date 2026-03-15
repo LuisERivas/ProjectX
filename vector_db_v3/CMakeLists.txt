@@ -52,8 +52,32 @@ add_executable(vectordb_v3_codec_corruption_tests
 )
 target_link_libraries(vectordb_v3_codec_corruption_tests PRIVATE vectordb_v3)
 
+add_executable(vectordb_v3_durability_wal_tests
+    tests/test_durability_wal.cpp
+)
+target_link_libraries(vectordb_v3_durability_wal_tests PRIVATE vectordb_v3)
+
+add_executable(vectordb_v3_durability_checkpoint_tests
+    tests/test_durability_checkpoint.cpp
+)
+target_link_libraries(vectordb_v3_durability_checkpoint_tests PRIVATE vectordb_v3)
+
+add_executable(vectordb_v3_durability_replay_crash_tests
+    tests/test_durability_replay_crash.cpp
+)
+target_link_libraries(vectordb_v3_durability_replay_crash_tests PRIVATE vectordb_v3)
+
+add_executable(vectordb_v3_durability_corruption_tests
+    tests/test_durability_corruption.cpp
+)
+target_link_libraries(vectordb_v3_durability_corruption_tests PRIVATE vectordb_v3)
+
 enable_testing()
 add_test(NAME vectordb_v3_tests COMMAND vectordb_v3_tests)
 add_test(NAME vectordb_v3_codec_primitives_tests COMMAND vectordb_v3_codec_primitives_tests)
 add_test(NAME vectordb_v3_codec_artifacts_tests COMMAND vectordb_v3_codec_artifacts_tests)
 add_test(NAME vectordb_v3_codec_corruption_tests COMMAND vectordb_v3_codec_corruption_tests)
+add_test(NAME vectordb_v3_durability_wal_tests COMMAND vectordb_v3_durability_wal_tests)
+add_test(NAME vectordb_v3_durability_checkpoint_tests COMMAND vectordb_v3_durability_checkpoint_tests)
+add_test(NAME vectordb_v3_durability_replay_crash_tests COMMAND vectordb_v3_durability_replay_crash_tests)
+add_test(NAME vectordb_v3_durability_corruption_tests COMMAND vectordb_v3_durability_corruption_tests)

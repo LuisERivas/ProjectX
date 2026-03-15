@@ -18,6 +18,16 @@ inline std::filesystem::path segments_dir(const std::filesystem::path& data_dir)
     return data_dir / "segments";
 }
 
+inline std::filesystem::path checkpoint_bin(
+    const std::filesystem::path& data_dir,
+    std::uint64_t checkpoint_lsn) {
+    return segments_dir(data_dir) / ("checkpoint_" + std::to_string(checkpoint_lsn) + ".bin");
+}
+
+inline std::filesystem::path checkpoint_temp_bin(const std::filesystem::path& data_dir) {
+    return segments_dir(data_dir) / "checkpoint_tmp.bin";
+}
+
 inline std::filesystem::path clusters_current_dir(const std::filesystem::path& data_dir) {
     return data_dir / "clusters" / "current";
 }

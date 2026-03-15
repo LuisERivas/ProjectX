@@ -1,14 +1,31 @@
 #include "vector_db_v3/vector_store.hpp"
 
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
+#include <regex>
 #include <sstream>
 #include <utility>
+#include <vector>
 
+#include "vector_db_v3/codec/checksum.hpp"
+#include "vector_db_v3/codec/endian.hpp"
+#include "vector_db_v3/codec/io.hpp"
 #include "vector_db_v3/paths.hpp"
 #include "vector_db_v3/telemetry.hpp"
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -16,22 +33,370 @@ namespace vector_db_v3 {
 
 namespace {
 
-Status not_implemented_status() {
-    return Status::Error("not implemented in section2 scaffold", 1);
-}
+constexpr std::uint32_t kWalMagic = 0x4C415756U;         // VWAL
+constexpr std::uint16_t kWalSchemaVersion = 1U;
+constexpr std::uint8_t kWalOpInsert = 1U;
+constexpr std::uint8_t kWalOpDelete = 2U;
+constexpr std::size_t kWalFixedBytes = 32U;              // through payload_bytes
+constexpr std::size_t kWalMinRecordBytes = kWalFixedBytes + 4U;
 
-bool write_text_file(const fs::path& p, const std::string& body) {
-    try {
-        fs::create_directories(p.parent_path());
-        std::ofstream out(p, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            return false;
-        }
-        out << body;
-        return true;
-    } catch (...) {
+constexpr std::uint32_t kCheckpointMagic = 0x504B4356U;  // VCKP
+constexpr std::uint16_t kCheckpointSchemaVersion = 1U;
+constexpr std::size_t kCheckpointHeaderBytes = 36U;
+
+struct ManifestMeta {
+    std::uint64_t checkpoint_lsn = 0;
+    std::uint64_t last_lsn = 0;
+    std::string checkpoint_file;
+};
+
+struct WalEntry {
+    std::uint64_t lsn = 0;
+    std::uint8_t op = 0;
+    std::uint64_t embedding_id = 0;
+    std::vector<float> vector;
+};
+
+bool sync_file_descriptor(const fs::path& p) {
+#ifdef _WIN32
+    const int fd = _open(p.string().c_str(), _O_RDONLY | _O_BINARY);
+    if (fd < 0) {
         return false;
     }
+    const int rc = _commit(fd);
+    _close(fd);
+    return rc == 0;
+#else
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    const int rc = ::fsync(fd);
+    ::close(fd);
+    return rc == 0;
+#endif
+}
+
+Status write_manifest_json_atomic(const fs::path& path, const ManifestMeta& meta) {
+    std::ostringstream out;
+    out << "{\n"
+        << "  \"schema_version\": 1,\n"
+        << "  \"status\": \"active\",\n"
+        << "  \"durability_version\": 1,\n"
+        << "  \"checkpoint_lsn\": " << meta.checkpoint_lsn << ",\n"
+        << "  \"last_lsn\": " << meta.last_lsn << ",\n"
+        << "  \"checkpoint_file\": \"" << meta.checkpoint_file << "\"\n"
+        << "}\n";
+    const std::string s = out.str();
+    const std::vector<std::uint8_t> bytes(s.begin(), s.end());
+    return codec::write_atomic_bytes(path, bytes);
+}
+
+std::uint64_t parse_u64_or_default(const std::string& body, const std::string& key, std::uint64_t fallback) {
+    const std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
+    std::smatch m;
+    if (!std::regex_search(body, m, re) || m.size() < 2) {
+        return fallback;
+    }
+    try {
+        return static_cast<std::uint64_t>(std::stoull(m[1].str()));
+    } catch (...) {
+        return fallback;
+    }
+}
+
+std::string parse_string_or_default(const std::string& body, const std::string& key, const std::string& fallback) {
+    const std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+    std::smatch m;
+    if (!std::regex_search(body, m, re) || m.size() < 2) {
+        return fallback;
+    }
+    return m[1].str();
+}
+
+Status load_manifest_json(const fs::path& path, ManifestMeta* out) {
+    if (out == nullptr) {
+        return Status::Error("load_manifest_json: out is null");
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return Status::Error("manifest.json missing; run init first");
+    }
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    const std::string body = buffer.str();
+    out->checkpoint_lsn = parse_u64_or_default(body, "checkpoint_lsn", 0);
+    out->last_lsn = parse_u64_or_default(body, "last_lsn", 0);
+    out->checkpoint_file = parse_string_or_default(body, "checkpoint_file", "");
+    return Status::Ok();
+}
+
+Status write_truncated_file(const fs::path& path, const std::vector<std::uint8_t>& bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return Status::Error("failed truncating file " + path.string());
+    }
+    if (!bytes.empty()) {
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    out.flush();
+    if (!out || !sync_file_descriptor(path)) {
+        return Status::Error("failed syncing truncated file " + path.string());
+    }
+    return Status::Ok();
+}
+
+Status encode_wal_entry_bytes(const WalEntry& entry, std::vector<std::uint8_t>* out) {
+    if (out == nullptr) {
+        return Status::Error("encode_wal_entry_bytes: out is null");
+    }
+    const bool is_insert = entry.op == kWalOpInsert;
+    const bool is_delete = entry.op == kWalOpDelete;
+    if (!is_insert && !is_delete) {
+        return Status::Error("encode_wal_entry_bytes: invalid op");
+    }
+    if (is_insert && entry.vector.size() != kVectorDim) {
+        return Status::Error("encode_wal_entry_bytes: insert vector dim mismatch");
+    }
+    if (is_delete && !entry.vector.empty()) {
+        return Status::Error("encode_wal_entry_bytes: delete should not carry vector payload");
+    }
+
+    std::vector<std::uint8_t> payload;
+    if (is_insert) {
+        payload.resize(kVectorDim * sizeof(float), 0U);
+        for (std::size_t i = 0; i < kVectorDim; ++i) {
+            codec::store_le_f32(payload.data() + i * sizeof(float), entry.vector[i]);
+        }
+    }
+    const std::uint32_t payload_bytes = static_cast<std::uint32_t>(payload.size());
+    const std::uint32_t vector_dim = is_insert ? static_cast<std::uint32_t>(kVectorDim) : 0U;
+
+    out->assign(kWalFixedBytes + payload_bytes + 4U, 0U);
+    codec::store_le_u32(out->data() + 0U, kWalMagic);
+    codec::store_le_u16(out->data() + 4U, kWalSchemaVersion);
+    (*out)[6U] = entry.op;
+    (*out)[7U] = 0U;
+    codec::store_le_u64(out->data() + 8U, entry.lsn);
+    codec::store_le_u64(out->data() + 16U, entry.embedding_id);
+    codec::store_le_u32(out->data() + 24U, vector_dim);
+    codec::store_le_u32(out->data() + 28U, payload_bytes);
+    if (!payload.empty()) {
+        std::memcpy(out->data() + kWalFixedBytes, payload.data(), payload.size());
+    }
+    const std::uint32_t crc = codec::crc32(out->data() + 4U, kWalFixedBytes - 4U + payload.size());
+    codec::store_le_u32(out->data() + kWalFixedBytes + payload.size(), crc);
+    return Status::Ok();
+}
+
+Status append_wal_entry(const fs::path& wal_path, const WalEntry& entry) {
+    std::vector<std::uint8_t> bytes;
+    const Status enc = encode_wal_entry_bytes(entry, &bytes);
+    if (!enc.ok) {
+        return enc;
+    }
+    std::ofstream out(wal_path, std::ios::binary | std::ios::app);
+    if (!out) {
+        return Status::Error("append_wal_entry: unable to open wal.log");
+    }
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    out.flush();
+    if (!out) {
+        return Status::Error("append_wal_entry: write failed");
+    }
+    if (!sync_file_descriptor(wal_path)) {
+        return Status::Error("append_wal_entry: fsync/_commit failed");
+    }
+    return Status::Ok();
+}
+
+Status load_checkpoint_snapshot(
+    const fs::path& checkpoint_path,
+    std::uint64_t* checkpoint_lsn,
+    std::map<std::uint64_t, Record>* rows) {
+    if (checkpoint_lsn == nullptr || rows == nullptr) {
+        return Status::Error("load_checkpoint_snapshot: invalid outputs");
+    }
+    std::vector<std::uint8_t> bytes;
+    const Status rd = codec::read_file_bytes(checkpoint_path, &bytes);
+    if (!rd.ok) {
+        return rd;
+    }
+    if (bytes.size() < kCheckpointHeaderBytes) {
+        return Status::Error("checkpoint corrupted: header too short");
+    }
+    const std::uint32_t magic = codec::load_le_u32(bytes.data() + 0U);
+    const std::uint16_t version = codec::load_le_u16(bytes.data() + 4U);
+    const std::uint16_t reserved = codec::load_le_u16(bytes.data() + 6U);
+    const std::uint64_t lsn = codec::load_le_u64(bytes.data() + 8U);
+    const std::uint64_t row_count = codec::load_le_u64(bytes.data() + 16U);
+    const std::uint64_t payload_bytes_u64 = codec::load_le_u64(bytes.data() + 24U);
+    const std::uint32_t payload_crc = codec::load_le_u32(bytes.data() + 32U);
+    if (magic != kCheckpointMagic || version != kCheckpointSchemaVersion || reserved != 0U) {
+        return Status::Error("checkpoint corrupted: bad magic/version/reserved");
+    }
+    const std::size_t payload_bytes = static_cast<std::size_t>(payload_bytes_u64);
+    if (bytes.size() != kCheckpointHeaderBytes + payload_bytes) {
+        return Status::Error("checkpoint corrupted: payload size mismatch");
+    }
+    const std::size_t expected_row_bytes = sizeof(std::uint64_t) + kVectorDim * sizeof(float);
+    if (payload_bytes != static_cast<std::size_t>(row_count) * expected_row_bytes) {
+        return Status::Error("checkpoint corrupted: row_count mismatch");
+    }
+    const std::uint32_t crc = codec::crc32(bytes.data() + kCheckpointHeaderBytes, payload_bytes);
+    if (crc != payload_crc) {
+        return Status::Error("checkpoint corrupted: payload checksum mismatch");
+    }
+
+    rows->clear();
+    for (std::size_t i = 0; i < static_cast<std::size_t>(row_count); ++i) {
+        const std::size_t row_base = kCheckpointHeaderBytes + i * expected_row_bytes;
+        const std::uint64_t id = codec::load_le_u64(bytes.data() + row_base);
+        std::vector<float> vec(kVectorDim, 0.0f);
+        const std::size_t vec_base = row_base + sizeof(std::uint64_t);
+        for (std::size_t d = 0; d < kVectorDim; ++d) {
+            vec[d] = codec::load_le_f32(bytes.data() + vec_base + d * sizeof(float));
+        }
+        (*rows)[id] = Record{id, std::move(vec)};
+    }
+    *checkpoint_lsn = lsn;
+    return Status::Ok();
+}
+
+Status write_checkpoint_snapshot(
+    const fs::path& path,
+    std::uint64_t checkpoint_lsn,
+    const std::map<std::uint64_t, Record>& rows) {
+    const std::size_t row_bytes = sizeof(std::uint64_t) + kVectorDim * sizeof(float);
+    std::vector<std::uint8_t> payload(rows.size() * row_bytes, 0U);
+    std::size_t idx = 0;
+    for (const auto& kv : rows) {
+        const std::size_t base = idx * row_bytes;
+        codec::store_le_u64(payload.data() + base, kv.first);
+        const Record& rec = kv.second;
+        if (rec.vector.size() != kVectorDim) {
+            return Status::Error("write_checkpoint_snapshot: record has invalid vector dim");
+        }
+        const std::size_t vec_base = base + sizeof(std::uint64_t);
+        for (std::size_t d = 0; d < kVectorDim; ++d) {
+            codec::store_le_f32(payload.data() + vec_base + d * sizeof(float), rec.vector[d]);
+        }
+        ++idx;
+    }
+
+    std::vector<std::uint8_t> out(kCheckpointHeaderBytes + payload.size(), 0U);
+    codec::store_le_u32(out.data() + 0U, kCheckpointMagic);
+    codec::store_le_u16(out.data() + 4U, kCheckpointSchemaVersion);
+    codec::store_le_u16(out.data() + 6U, 0U);
+    codec::store_le_u64(out.data() + 8U, checkpoint_lsn);
+    codec::store_le_u64(out.data() + 16U, static_cast<std::uint64_t>(rows.size()));
+    codec::store_le_u64(out.data() + 24U, static_cast<std::uint64_t>(payload.size()));
+    codec::store_le_u32(out.data() + 32U, codec::crc32(payload));
+    if (!payload.empty()) {
+        std::memcpy(out.data() + kCheckpointHeaderBytes, payload.data(), payload.size());
+    }
+    return codec::write_atomic_bytes(path, out);
+}
+
+Status replay_wal_entries(
+    const fs::path& wal_path,
+    std::uint64_t checkpoint_lsn,
+    std::uint64_t* last_lsn,
+    std::size_t* wal_entries,
+    std::size_t* tombstone_rows,
+    std::map<std::uint64_t, Record>* rows) {
+    if (last_lsn == nullptr || wal_entries == nullptr || tombstone_rows == nullptr || rows == nullptr) {
+        return Status::Error("replay_wal_entries: invalid outputs");
+    }
+    std::vector<std::uint8_t> bytes;
+    const Status rd = codec::read_file_bytes(wal_path, &bytes);
+    if (!rd.ok) {
+        return rd;
+    }
+    std::size_t offset = 0;
+    std::size_t last_valid_offset = 0;
+    std::uint64_t prev_lsn = 0;
+    std::size_t parsed_entries = 0;
+    std::size_t tombstones = 0;
+
+    while (offset < bytes.size()) {
+        const std::size_t remain = bytes.size() - offset;
+        if (remain < kWalMinRecordBytes) {
+            bytes.resize(last_valid_offset);
+            const Status trunc = write_truncated_file(wal_path, bytes);
+            if (!trunc.ok) {
+                return trunc;
+            }
+            break;
+        }
+
+        const std::uint8_t* p = bytes.data() + offset;
+        const std::uint32_t magic = codec::load_le_u32(p + 0U);
+        if (magic != kWalMagic) {
+            return Status::Error("wal corruption: magic mismatch");
+        }
+        const std::uint16_t version = codec::load_le_u16(p + 4U);
+        const std::uint8_t op = p[6U];
+        const std::uint8_t reserved = p[7U];
+        const std::uint64_t lsn = codec::load_le_u64(p + 8U);
+        const std::uint64_t embedding_id = codec::load_le_u64(p + 16U);
+        const std::uint32_t vector_dim = codec::load_le_u32(p + 24U);
+        const std::uint32_t payload_bytes = codec::load_le_u32(p + 28U);
+        const std::size_t record_bytes = kWalFixedBytes + payload_bytes + 4U;
+        if (remain < record_bytes) {
+            bytes.resize(last_valid_offset);
+            const Status trunc = write_truncated_file(wal_path, bytes);
+            if (!trunc.ok) {
+                return trunc;
+            }
+            break;
+        }
+        if (version != kWalSchemaVersion || reserved != 0U) {
+            return Status::Error("wal corruption: bad version/reserved");
+        }
+        const std::uint32_t stored_crc = codec::load_le_u32(p + kWalFixedBytes + payload_bytes);
+        const std::uint32_t calc_crc = codec::crc32(p + 4U, kWalFixedBytes - 4U + payload_bytes);
+        if (stored_crc != calc_crc) {
+            return Status::Error("wal corruption: checksum mismatch");
+        }
+        if (prev_lsn != 0 && lsn <= prev_lsn) {
+            return Status::Error("wal corruption: non-monotonic LSN sequence");
+        }
+        prev_lsn = lsn;
+
+        if (op == kWalOpInsert) {
+            if (vector_dim != static_cast<std::uint32_t>(kVectorDim) ||
+                payload_bytes != static_cast<std::uint32_t>(kVectorDim * sizeof(float))) {
+                return Status::Error("wal corruption: invalid insert payload");
+            }
+            if (lsn > checkpoint_lsn) {
+                std::vector<float> vec(kVectorDim, 0.0f);
+                for (std::size_t d = 0; d < kVectorDim; ++d) {
+                    vec[d] = codec::load_le_f32(p + kWalFixedBytes + d * sizeof(float));
+                }
+                (*rows)[embedding_id] = Record{embedding_id, std::move(vec)};
+            }
+        } else if (op == kWalOpDelete) {
+            if (vector_dim != 0U || payload_bytes != 0U) {
+                return Status::Error("wal corruption: invalid delete payload");
+            }
+            if (lsn > checkpoint_lsn) {
+                rows->erase(embedding_id);
+                ++tombstones;
+            }
+        } else {
+            return Status::Error("wal corruption: unknown op code");
+        }
+
+        ++parsed_entries;
+        *last_lsn = std::max(*last_lsn, lsn);
+        last_valid_offset = offset + record_bytes;
+        offset = last_valid_offset;
+    }
+
+    *wal_entries = parsed_entries;
+    *tombstone_rows = tombstones;
+    return Status::Ok();
 }
 
 }  // namespace
@@ -42,6 +407,11 @@ struct VectorStore::Impl {
     fs::path data_dir;
     bool opened = false;
     std::map<std::uint64_t, Record> rows;
+    std::uint64_t last_lsn = 0;
+    std::uint64_t checkpoint_lsn = 0;
+    std::size_t wal_entries = 0;
+    std::size_t tombstone_rows = 0;
+    std::string checkpoint_file;
 };
 
 VectorStore::VectorStore(std::string data_dir) : impl_(new Impl(std::move(data_dir))) {}
@@ -52,18 +422,17 @@ Status VectorStore::init() {
         fs::create_directories(impl_->data_dir);
         fs::create_directories(paths::segments_dir(impl_->data_dir));
         fs::create_directories(paths::clusters_current_dir(impl_->data_dir));
-
-        const std::string manifest = "{\n"
-                                     "  \"schema_version\": 1,\n"
-                                     "  \"status\": \"section2_scaffold\"\n"
-                                     "}\n";
-        if (!write_text_file(paths::manifest(impl_->data_dir), manifest)) {
-            return Status::Error("failed writing manifest.json");
+        if (!fs::exists(paths::manifest(impl_->data_dir))) {
+            ManifestMeta meta{};
+            const Status write = write_manifest_json_atomic(paths::manifest(impl_->data_dir), meta);
+            if (!write.ok) {
+                return write;
+            }
         }
         if (!fs::exists(paths::wal(impl_->data_dir))) {
-            std::ofstream wal(paths::wal(impl_->data_dir), std::ios::binary);
-            if (!wal) {
-                return Status::Error("failed creating wal.log");
+            const Status write = codec::write_atomic_bytes(paths::wal(impl_->data_dir), {});
+            if (!write.ok) {
+                return Status::Error("failed creating wal.log: " + write.message);
             }
         }
         return Status::Ok();
@@ -78,6 +447,51 @@ Status VectorStore::open() {
     if (!fs::exists(paths::manifest(impl_->data_dir))) {
         return Status::Error("manifest.json missing; run init first");
     }
+    if (!fs::exists(paths::wal(impl_->data_dir))) {
+        const Status make_wal = codec::write_atomic_bytes(paths::wal(impl_->data_dir), {});
+        if (!make_wal.ok) {
+            return Status::Error("failed creating wal.log on open: " + make_wal.message);
+        }
+    }
+    impl_->rows.clear();
+    impl_->last_lsn = 0;
+    impl_->checkpoint_lsn = 0;
+    impl_->wal_entries = 0;
+    impl_->tombstone_rows = 0;
+    impl_->checkpoint_file.clear();
+
+    ManifestMeta manifest{};
+    const Status m = load_manifest_json(paths::manifest(impl_->data_dir), &manifest);
+    if (!m.ok) {
+        return m;
+    }
+    impl_->checkpoint_lsn = manifest.checkpoint_lsn;
+    impl_->last_lsn = manifest.last_lsn;
+    impl_->checkpoint_file = manifest.checkpoint_file;
+    if (!manifest.checkpoint_file.empty()) {
+        const fs::path cp = impl_->data_dir / manifest.checkpoint_file;
+        if (!fs::exists(cp)) {
+            return Status::Error("checkpoint file missing: " + cp.string());
+        }
+        std::uint64_t cp_lsn = 0;
+        const Status load_cp = load_checkpoint_snapshot(cp, &cp_lsn, &impl_->rows);
+        if (!load_cp.ok) {
+            return load_cp;
+        }
+        if (cp_lsn != manifest.checkpoint_lsn) {
+            return Status::Error("checkpoint_lsn mismatch between manifest and checkpoint file");
+        }
+    }
+    const Status replay = replay_wal_entries(
+        paths::wal(impl_->data_dir),
+        impl_->checkpoint_lsn,
+        &impl_->last_lsn,
+        &impl_->wal_entries,
+        &impl_->tombstone_rows,
+        &impl_->rows);
+    if (!replay.ok) {
+        return replay;
+    }
     impl_->opened = true;
     return Status::Ok();
 }
@@ -91,37 +505,97 @@ Status VectorStore::checkpoint() {
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
+    const std::uint64_t snapshot_lsn = impl_->last_lsn;
+    const fs::path checkpoint_path = paths::checkpoint_bin(impl_->data_dir, snapshot_lsn);
+    const Status write_cp = write_checkpoint_snapshot(checkpoint_path, snapshot_lsn, impl_->rows);
+    if (!write_cp.ok) {
+        return write_cp;
+    }
+
+    ManifestMeta meta{};
+    meta.checkpoint_lsn = snapshot_lsn;
+    meta.last_lsn = impl_->last_lsn;
+    meta.checkpoint_file = fs::relative(checkpoint_path, impl_->data_dir).generic_string();
+    const Status write_manifest = write_manifest_json_atomic(paths::manifest(impl_->data_dir), meta);
+    if (!write_manifest.ok) {
+        return write_manifest;
+    }
+
+    const Status wal_reset = codec::write_atomic_bytes(paths::wal(impl_->data_dir), {});
+    if (!wal_reset.ok) {
+        return Status::Error("checkpoint succeeded but wal rotation failed: " + wal_reset.message);
+    }
+    impl_->checkpoint_lsn = snapshot_lsn;
+    impl_->wal_entries = 0;
+    impl_->checkpoint_file = meta.checkpoint_file;
+    impl_->tombstone_rows = 0;
     return Status::Ok();
 }
 
 Status VectorStore::insert(std::uint64_t embedding_id, const std::vector<float>& vector_fp32_1024) {
-    (void)embedding_id;
-    (void)vector_fp32_1024;
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return not_implemented_status();
+    if (vector_fp32_1024.size() != kVectorDim) {
+        return Status::Error("insert: vector dimension mismatch");
+    }
+    WalEntry entry{};
+    entry.lsn = impl_->last_lsn + 1U;
+    entry.op = kWalOpInsert;
+    entry.embedding_id = embedding_id;
+    entry.vector = vector_fp32_1024;
+    const Status wal = append_wal_entry(paths::wal(impl_->data_dir), entry);
+    if (!wal.ok) {
+        return wal;
+    }
+    impl_->rows[embedding_id] = Record{embedding_id, vector_fp32_1024};
+    impl_->last_lsn = entry.lsn;
+    impl_->wal_entries += 1U;
+    return Status::Ok();
 }
 
 Status VectorStore::insert_batch(const std::vector<Record>& records) {
-    (void)records;
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return not_implemented_status();
+    for (const auto& rec : records) {
+        const Status s = insert(rec.embedding_id, rec.vector);
+        if (!s.ok) {
+            return s;
+        }
+    }
+    return Status::Ok();
 }
 
 Status VectorStore::remove(std::uint64_t embedding_id) {
-    (void)embedding_id;
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return not_implemented_status();
+    const auto it = impl_->rows.find(embedding_id);
+    if (it == impl_->rows.end()) {
+        return Status::Error("delete: embedding_id not found");
+    }
+    WalEntry entry{};
+    entry.lsn = impl_->last_lsn + 1U;
+    entry.op = kWalOpDelete;
+    entry.embedding_id = embedding_id;
+    const Status wal = append_wal_entry(paths::wal(impl_->data_dir), entry);
+    if (!wal.ok) {
+        return wal;
+    }
+    impl_->rows.erase(it);
+    impl_->last_lsn = entry.lsn;
+    impl_->wal_entries += 1U;
+    impl_->tombstone_rows += 1U;
+    return Status::Ok();
 }
 
 std::optional<Record> VectorStore::get(std::uint64_t embedding_id) const {
-    (void)embedding_id;
-    return std::nullopt;
+    const auto it = impl_->rows.find(embedding_id);
+    if (it == impl_->rows.end()) {
+        return std::nullopt;
+    }
+    return it->second;
 }
 
 std::vector<SearchResult> VectorStore::search_exact(const std::vector<float>& query, std::size_t top_k) const {
@@ -132,17 +606,17 @@ std::vector<SearchResult> VectorStore::search_exact(const std::vector<float>& qu
 
 Stats VectorStore::stats() const {
     Stats out{};
-    out.total_rows = impl_->rows.size();
+    out.total_rows = impl_->rows.size() + impl_->tombstone_rows;
     out.live_rows = impl_->rows.size();
-    out.tombstone_rows = 0;
+    out.tombstone_rows = impl_->tombstone_rows;
     return out;
 }
 
 WalStats VectorStore::wal_stats() const {
     WalStats out{};
-    out.checkpoint_lsn = 0;
-    out.last_lsn = 0;
-    out.wal_entries = 0;
+    out.checkpoint_lsn = impl_->checkpoint_lsn;
+    out.last_lsn = impl_->last_lsn;
+    out.wal_entries = impl_->wal_entries;
     return out;
 }
 

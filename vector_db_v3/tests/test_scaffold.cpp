@@ -43,8 +43,13 @@ int main() {
     }
 
     s = store.insert(1, std::vector<float>(vector_db_v3::kVectorDim, 0.0f));
-    if (s.ok) {
-        std::cerr << "insert should be placeholder failure in section2 scaffold\n";
+    if (!s.ok) {
+        std::cerr << "insert should succeed in durability section: " << s.message << "\n";
+        return 1;
+    }
+    const auto rec = store.get(1);
+    if (!rec.has_value() || rec->vector.size() != vector_db_v3::kVectorDim) {
+        std::cerr << "insert/get durability path failed\n";
         return 1;
     }
 
