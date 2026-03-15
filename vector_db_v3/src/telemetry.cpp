@@ -65,6 +65,14 @@ std::string event_type_to_string(const EventType event_type) {
             return "stage_skip";
         case EventType::PipelineSummary:
             return "pipeline_summary";
+        case EventType::StageProgress:
+            return "stage_progress";
+        case EventType::ArtifactWrite:
+            return "artifact_write";
+        case EventType::KSelection:
+            return "k_selection";
+        case EventType::ComplianceCheck:
+            return "compliance_check";
     }
     return "unknown";
 }

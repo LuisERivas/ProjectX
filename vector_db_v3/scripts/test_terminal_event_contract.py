@@ -78,10 +78,43 @@ def assert_monotonic_pipeline_elapsed(events: list[dict]) -> None:
 
 
 def assert_exact_lifecycle(events: list[dict], terminal_event: str) -> None:
-    order = [e["event_type"] for e in events]
+    lifecycle = {"pipeline_start", "stage_start", "stage_end", "stage_fail", "stage_skip", "pipeline_summary"}
+    order = [e["event_type"] for e in events if e["event_type"] in lifecycle]
     expected = ["pipeline_start", "stage_start", terminal_event, "pipeline_summary"]
     if order != expected:
         raise AssertionError(f"unexpected event order: got={order}, expected={expected}")
+
+
+def assert_top_stage_sub_events(events: list[dict]) -> None:
+    k_selection = [e for e in events if e.get("event_type") == "k_selection"]
+    if not k_selection:
+        raise AssertionError("missing k_selection event")
+    latest = k_selection[-1]
+    for key in ["k_min", "k_max", "chosen_k", "tested_ks"]:
+        if key not in latest:
+            raise AssertionError(f"k_selection missing {key}")
+    if int(latest["k_min"]) <= 0 or int(latest["k_max"]) <= 0:
+        raise AssertionError("k bounds must be positive")
+    if int(latest["chosen_k"]) < int(latest["k_min"]) or int(latest["chosen_k"]) > int(latest["k_max"]):
+        raise AssertionError("chosen_k must be within [k_min,k_max]")
+
+    artifact_writes = [e for e in events if e.get("event_type") == "artifact_write"]
+    expected = {
+        "id_estimate.bin",
+        "elbow_trace.bin",
+        "centroids.bin",
+        "assignments.bin",
+        "stability_report.bin",
+        "cluster_manifest.bin",
+    }
+    observed = set()
+    for e in artifact_writes:
+        path = str(e.get("artifact_path", ""))
+        for name in expected:
+            if path.endswith(name):
+                observed.add(name)
+    if observed != expected:
+        raise AssertionError(f"artifact_write coverage mismatch: observed={sorted(observed)}")
 
 
 def main() -> int:
@@ -110,6 +143,7 @@ def main() -> int:
         assert_exact_lifecycle(events, "stage_end")
         assert_common_fields(events)
         assert_monotonic_pipeline_elapsed(events)
+        assert_top_stage_sub_events(events)
         stage_start = next(e for e in events if e["event_type"] == "stage_start")
         if "stage_started_ts" not in stage_start or "stage_elapsed_ms" not in stage_start:
             raise AssertionError("stage_start missing baseline lifecycle fields")

@@ -31,6 +31,8 @@ Status decode_stability_report(const std::vector<std::uint8_t>& bytes, Stability
 
 Status encode_top_assignments(const std::vector<TopAssignmentRow>& rows, std::vector<std::uint8_t>* out);
 Status decode_top_assignments(const std::vector<std::uint8_t>& bytes, std::vector<TopAssignmentRow>* out);
+Status encode_top_centroids(const std::vector<TopCentroidRow>& rows, std::vector<std::uint8_t>* out);
+Status decode_top_centroids(const std::vector<std::uint8_t>& bytes, std::vector<TopCentroidRow>* out);
 Status encode_mid_assignments(const std::vector<MidAssignmentRow>& rows, std::vector<std::uint8_t>* out);
 Status decode_mid_assignments(const std::vector<std::uint8_t>& bytes, std::vector<MidAssignmentRow>* out);
 Status encode_final_assignments(const std::vector<FinalAssignmentRow>& rows, std::vector<std::uint8_t>* out);
@@ -58,6 +60,13 @@ Status write_stability_report_file(const std::filesystem::path& path, const Stab
 Status read_stability_report_file(const std::filesystem::path& path, StabilityReportRow* row);
 Status write_top_assignments_file(const std::filesystem::path& path, const std::vector<TopAssignmentRow>& rows);
 Status read_top_assignments_file(const std::filesystem::path& path, std::vector<TopAssignmentRow>* rows);
+Status write_top_centroids_file(const std::filesystem::path& path, const std::vector<TopCentroidRow>& rows);
+Status read_top_centroids_file(const std::filesystem::path& path, std::vector<TopCentroidRow>* rows);
+Status write_cluster_manifest_file(const std::filesystem::path& path, const std::vector<std::uint8_t>& payload);
+Status read_cluster_manifest_file(
+    const std::filesystem::path& path,
+    CommonHeader* header,
+    std::vector<std::uint8_t>* payload);
 Status write_mid_assignments_file(const std::filesystem::path& path, const std::vector<MidAssignmentRow>& rows);
 Status read_mid_assignments_file(const std::filesystem::path& path, std::vector<MidAssignmentRow>* rows);
 Status write_final_assignments_file(const std::filesystem::path& path, const std::vector<FinalAssignmentRow>& rows);
@@ -79,6 +88,7 @@ Status validate_id_estimate(const IdEstimateRow& row);
 Status validate_elbow_trace(const std::vector<ElbowTraceRow>& rows, std::optional<std::uint32_t> chosen_k = std::nullopt);
 Status validate_stability_report(const StabilityReportRow& row);
 Status validate_top_assignments(const std::vector<TopAssignmentRow>& rows);
+Status validate_top_centroids(const std::vector<TopCentroidRow>& rows);
 Status validate_mid_assignments(const std::vector<MidAssignmentRow>& rows);
 Status validate_final_assignments(const std::vector<FinalAssignmentRow>& rows);
 Status validate_k_search_bounds_batch(const std::vector<KSearchBoundsBatchRow>& rows);

@@ -56,6 +56,11 @@ struct TopAssignmentRow {
     std::uint32_t top_centroid_numeric_id = 0;
 };
 
+struct TopCentroidRow {
+    std::uint32_t top_centroid_numeric_id = 0;
+    std::array<float, 1024> centroid_vector{};
+};
+
 struct MidAssignmentRow {
     std::uint64_t embedding_id = 0;
     std::uint32_t mid_centroid_numeric_id = 0;
@@ -109,6 +114,7 @@ constexpr std::size_t kIdEstimateRecordSize = 12;
 constexpr std::size_t kElbowTraceRecordSize = 12;
 constexpr std::size_t kStabilityReportRecordSize = 20;
 constexpr std::size_t kTopAssignmentRecordSize = 12;
+constexpr std::size_t kTopCentroidRecordSize = 4 + (1024 * sizeof(float));
 constexpr std::size_t kMidAssignmentRecordSize = 16;
 constexpr std::size_t kFinalAssignmentRecordSize = 12;
 constexpr std::size_t kKSearchBoundsBatchRecordSize = 24;

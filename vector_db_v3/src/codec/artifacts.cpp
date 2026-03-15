@@ -329,6 +329,37 @@ Status decode_top_assignments(const std::vector<std::uint8_t>& bytes, std::vecto
     return validate_top_assignments(*out);
 }
 
+Status encode_top_centroids(const std::vector<TopCentroidRow>& rows, std::vector<std::uint8_t>* out) {
+    return encode_rows(
+        rows,
+        kTopCentroidRecordSize,
+        [](const TopCentroidRow& row, std::uint8_t* dst) {
+            store_le_u32(dst + 0U, row.top_centroid_numeric_id);
+            for (std::size_t i = 0; i < row.centroid_vector.size(); ++i) {
+                store_le_f32(dst + 4U + (i * sizeof(float)), row.centroid_vector[i]);
+            }
+        },
+        out);
+}
+
+Status decode_top_centroids(const std::vector<std::uint8_t>& bytes, std::vector<TopCentroidRow>* out) {
+    const Status s = decode_rows(
+        bytes,
+        kTopCentroidRecordSize,
+        "centroids.bin(top)",
+        [](const std::uint8_t* src, TopCentroidRow* row) {
+            row->top_centroid_numeric_id = load_le_u32(src + 0U);
+            for (std::size_t i = 0; i < row->centroid_vector.size(); ++i) {
+                row->centroid_vector[i] = load_le_f32(src + 4U + (i * sizeof(float)));
+            }
+        },
+        out);
+    if (!s.ok) {
+        return s;
+    }
+    return validate_top_centroids(*out);
+}
+
 Status encode_mid_assignments(const std::vector<MidAssignmentRow>& rows, std::vector<std::uint8_t>* out) {
     return encode_rows(
         rows,
@@ -497,6 +528,39 @@ Status read_top_assignments_file(const std::filesystem::path& path, std::vector<
     return read_rows_record(path, rows, decode_top_assignments);
 }
 
+Status write_top_centroids_file(const std::filesystem::path& path, const std::vector<TopCentroidRow>& rows) {
+    return write_rows_record(path, rows, encode_top_centroids);
+}
+
+Status read_top_centroids_file(const std::filesystem::path& path, std::vector<TopCentroidRow>* rows) {
+    return read_rows_record(path, rows, decode_top_centroids);
+}
+
+Status write_cluster_manifest_file(const std::filesystem::path& path, const std::vector<std::uint8_t>& payload) {
+    CommonHeader header{};
+    header.schema_version = 1U;
+    header.record_type = 0x0F01U;
+    header.record_count = 1U;
+    std::vector<std::uint8_t> bytes;
+    const Status enc = encode_header_plus_payload(header, payload, &bytes);
+    if (!enc.ok) {
+        return enc;
+    }
+    return write_atomic_bytes(path, bytes);
+}
+
+Status read_cluster_manifest_file(
+    const std::filesystem::path& path,
+    CommonHeader* header,
+    std::vector<std::uint8_t>* payload) {
+    std::vector<std::uint8_t> bytes;
+    const Status rd = read_file_bytes(path, &bytes);
+    if (!rd.ok) {
+        return rd;
+    }
+    return decode_header_plus_payload(bytes, header, payload);
+}
+
 Status write_mid_assignments_file(const std::filesystem::path& path, const std::vector<MidAssignmentRow>& rows) {
     return write_rows_record(path, rows, encode_mid_assignments);
 }
@@ -582,6 +646,15 @@ Status validate_stability_report(const StabilityReportRow& row) {
 
 Status validate_top_assignments(const std::vector<TopAssignmentRow>& rows) {
     return validate_sorted_unique_embedding_ids(rows, "assignments.bin(top)");
+}
+
+Status validate_top_centroids(const std::vector<TopCentroidRow>& rows) {
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (rows[i].top_centroid_numeric_id != static_cast<std::uint32_t>(i)) {
+            return Status::Error("centroids.bin(top): centroid IDs must be dense ascending from zero");
+        }
+    }
+    return Status::Ok();
 }
 
 Status validate_mid_assignments(const std::vector<MidAssignmentRow>& rows) {

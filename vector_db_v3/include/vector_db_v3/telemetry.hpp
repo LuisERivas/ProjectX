@@ -22,6 +22,10 @@ enum class EventType {
     StageFail,
     StageSkip,
     PipelineSummary,
+    StageProgress,
+    ArtifactWrite,
+    KSelection,
+    ComplianceCheck,
 };
 
 std::string event_type_to_string(EventType event_type);

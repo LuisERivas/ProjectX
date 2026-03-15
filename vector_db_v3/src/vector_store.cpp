@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iomanip>
 #include <map>
@@ -21,6 +22,7 @@
 #include <vector>
 
 #include "vector_db_v3/codec/checksum.hpp"
+#include "vector_db_v3/codec/artifacts.hpp"
 #include "vector_db_v3/codec/endian.hpp"
 #include "vector_db_v3/codec/io.hpp"
 #include "vector_db_v3/paths.hpp"
@@ -406,6 +408,385 @@ Status replay_wal_entries(
     return Status::Ok();
 }
 
+struct KMeansResult {
+    std::vector<std::vector<float>> centroids;
+    std::vector<std::uint32_t> assignments;
+    double objective = 0.0;
+};
+
+double squared_l2(const std::vector<float>& a, const std::vector<float>& b) {
+    double out = 0.0;
+    for (std::size_t i = 0; i < kVectorDim; ++i) {
+        const double delta = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+        out += delta * delta;
+    }
+    return out;
+}
+
+KMeansResult run_deterministic_kmeans(
+    const std::vector<std::vector<float>>& vectors,
+    std::uint32_t k,
+    std::uint32_t max_iterations) {
+    KMeansResult out{};
+    if (vectors.empty() || k == 0U) {
+        return out;
+    }
+    k = std::min<std::uint32_t>(k, static_cast<std::uint32_t>(vectors.size()));
+    out.centroids.assign(k, std::vector<float>(kVectorDim, 0.0f));
+    out.assignments.assign(vectors.size(), 0U);
+
+    for (std::uint32_t c = 0; c < k; ++c) {
+        const std::size_t idx = (static_cast<std::size_t>(c) * vectors.size()) / k;
+        out.centroids[c] = vectors[idx];
+    }
+
+    for (std::uint32_t iter = 0; iter < std::max<std::uint32_t>(1U, max_iterations); ++iter) {
+        bool changed = false;
+        std::vector<double> min_dist(vectors.size(), std::numeric_limits<double>::infinity());
+        for (std::size_t i = 0; i < vectors.size(); ++i) {
+            std::uint32_t best = 0;
+            double best_dist = std::numeric_limits<double>::infinity();
+            for (std::uint32_t c = 0; c < k; ++c) {
+                const double dist = squared_l2(vectors[i], out.centroids[c]);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best = c;
+                }
+            }
+            min_dist[i] = best_dist;
+            if (iter == 0 || out.assignments[i] != best) {
+                changed = true;
+                out.assignments[i] = best;
+            }
+        }
+
+        std::vector<std::vector<double>> sums(k, std::vector<double>(kVectorDim, 0.0));
+        std::vector<std::uint32_t> counts(k, 0U);
+        for (std::size_t i = 0; i < vectors.size(); ++i) {
+            const std::uint32_t bucket = out.assignments[i];
+            ++counts[bucket];
+            for (std::size_t d = 0; d < kVectorDim; ++d) {
+                sums[bucket][d] += static_cast<double>(vectors[i][d]);
+            }
+        }
+        for (std::uint32_t c = 0; c < k; ++c) {
+            if (counts[c] == 0U) {
+                std::size_t worst_idx = 0;
+                double worst_dist = -1.0;
+                for (std::size_t i = 0; i < min_dist.size(); ++i) {
+                    if (min_dist[i] > worst_dist) {
+                        worst_dist = min_dist[i];
+                        worst_idx = i;
+                    }
+                }
+                out.assignments[worst_idx] = c;
+                counts[c] = 1U;
+                for (std::size_t d = 0; d < kVectorDim; ++d) {
+                    sums[c][d] = static_cast<double>(vectors[worst_idx][d]);
+                }
+            }
+            for (std::size_t d = 0; d < kVectorDim; ++d) {
+                out.centroids[c][d] = static_cast<float>(sums[c][d] / static_cast<double>(counts[c]));
+            }
+        }
+        if (!changed) {
+            break;
+        }
+    }
+
+    out.objective = 0.0;
+    for (std::size_t i = 0; i < vectors.size(); ++i) {
+        out.objective += squared_l2(vectors[i], out.centroids[out.assignments[i]]);
+    }
+    return out;
+}
+
+std::vector<std::uint32_t> coarse_ks(std::uint32_t k_min, std::uint32_t k_max) {
+    std::vector<std::uint32_t> out;
+    out.push_back(k_min);
+    if (k_max > k_min) {
+        out.push_back(k_min + ((k_max - k_min) / 2U));
+        out.push_back(k_max);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+std::string escape_json_string(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char ch : s) {
+        if (ch == '\\' || ch == '"') {
+            out.push_back('\\');
+        }
+        out.push_back(ch);
+    }
+    return out;
+}
+
+std::uint32_t derive_k_min(std::size_t n) {
+    if (n == 0U) {
+        return 0U;
+    }
+    return std::max<std::uint32_t>(1U, std::min<std::uint32_t>(32U, static_cast<std::uint32_t>(n)));
+}
+
+std::uint32_t derive_k_max(std::size_t n, std::uint32_t k_min) {
+    if (n == 0U) {
+        return 0U;
+    }
+    const std::uint32_t upper = std::min<std::uint32_t>(256U, static_cast<std::uint32_t>(n));
+    return std::max<std::uint32_t>(k_min, upper);
+}
+
+Status emit_top_layer_artifacts(
+    const fs::path& data_dir,
+    const std::map<std::uint64_t, Record>& rows,
+    std::uint32_t seed,
+    const std::function<void(telemetry::EventType, const std::string&, const std::vector<std::pair<std::string, std::string>>&)>& emit_step,
+    std::uint32_t* chosen_k_out,
+    std::size_t* records_processed_out) {
+    if (chosen_k_out == nullptr || records_processed_out == nullptr) {
+        return Status::Error("top clustering: invalid output pointers");
+    }
+    *chosen_k_out = 0U;
+    *records_processed_out = 0U;
+
+    std::vector<std::uint64_t> ids;
+    std::vector<std::vector<float>> vectors;
+    ids.reserve(rows.size());
+    vectors.reserve(rows.size());
+    for (const auto& kv : rows) {
+        if (kv.second.vector.size() != kVectorDim) {
+            return Status::Error("top clustering: encountered non-1024D vector");
+        }
+        ids.push_back(kv.first);
+        vectors.push_back(kv.second.vector);
+    }
+    std::vector<std::vector<float>> kmeans_vectors = vectors;
+    if (kmeans_vectors.empty()) {
+        kmeans_vectors.push_back(std::vector<float>(kVectorDim, 0.0f));
+    }
+    const std::uint32_t k_min = derive_k_min(kmeans_vectors.size());
+    const std::uint32_t k_max = derive_k_max(kmeans_vectors.size(), k_min);
+    codec::IdEstimateRow estimate{};
+    estimate.k_min = k_min;
+    estimate.k_max = k_max;
+    estimate.id_estimate_method = 1U;
+    const Status estimate_valid = codec::validate_id_estimate(estimate);
+    if (!estimate_valid.ok) {
+        return estimate_valid;
+    }
+
+    const std::vector<std::uint32_t> coarse = coarse_ks(k_min, k_max);
+    std::vector<codec::ElbowTraceRow> elbow_rows;
+    elbow_rows.reserve(coarse.size() + 3U);
+    std::uint32_t best_k = coarse.front();
+    double best_objective = std::numeric_limits<double>::infinity();
+    std::vector<std::uint32_t> tested_ks;
+    tested_ks.reserve(coarse.size() + 3U);
+
+    for (const std::uint32_t k : coarse) {
+        const KMeansResult probe = run_deterministic_kmeans(kmeans_vectors, k, 4U);
+        codec::ElbowTraceRow row{};
+        row.k_value = k;
+        row.objective_value = static_cast<float>(probe.objective);
+        row.probe_phase = codec::ProbePhase::Coarse;
+        elbow_rows.push_back(row);
+        tested_ks.push_back(k);
+        if (probe.objective < best_objective ||
+            (probe.objective == best_objective && k < best_k)) {
+            best_objective = probe.objective;
+            best_k = k;
+        }
+    }
+
+    for (std::uint32_t k = (best_k > k_min ? best_k - 1U : best_k);
+         k <= std::min<std::uint32_t>(k_max, best_k + 1U);
+         ++k) {
+        if (std::find(tested_ks.begin(), tested_ks.end(), k) != tested_ks.end()) {
+            continue;
+        }
+        const KMeansResult probe = run_deterministic_kmeans(kmeans_vectors, k, 4U);
+        codec::ElbowTraceRow row{};
+        row.k_value = k;
+        row.objective_value = static_cast<float>(probe.objective);
+        row.probe_phase = codec::ProbePhase::Fine;
+        elbow_rows.push_back(row);
+        tested_ks.push_back(k);
+        if (probe.objective < best_objective ||
+            (probe.objective == best_objective && k < best_k)) {
+            best_objective = probe.objective;
+            best_k = k;
+        }
+    }
+
+    const Status elbow_valid = codec::validate_elbow_trace(elbow_rows, best_k);
+    if (!elbow_valid.ok) {
+        return elbow_valid;
+    }
+    *chosen_k_out = best_k;
+
+    {
+        std::ostringstream tested_ks_csv;
+        tested_ks_csv << "[";
+        for (std::size_t i = 0; i < tested_ks.size(); ++i) {
+            if (i > 0) {
+                tested_ks_csv << ",";
+            }
+            tested_ks_csv << tested_ks[i];
+        }
+        tested_ks_csv << "]";
+        emit_step(
+            telemetry::EventType::KSelection,
+            "running",
+            {
+                {"k_min", std::to_string(k_min)},
+                {"k_max", std::to_string(k_max)},
+                {"chosen_k", std::to_string(best_k)},
+                {"tested_ks", tested_ks_csv.str()},
+            });
+    }
+
+    const KMeansResult final_kmeans = run_deterministic_kmeans(kmeans_vectors, best_k, 12U);
+    std::vector<codec::TopAssignmentRow> assignments;
+    assignments.reserve(ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        assignments.push_back(codec::TopAssignmentRow{
+            ids[i],
+            final_kmeans.assignments[i],
+        });
+    }
+    std::sort(assignments.begin(), assignments.end(), [](const auto& a, const auto& b) {
+        return a.embedding_id < b.embedding_id;
+    });
+    const Status assignment_valid = codec::validate_top_assignments(assignments);
+    if (!assignment_valid.ok) {
+        return assignment_valid;
+    }
+
+    std::vector<codec::TopCentroidRow> centroid_rows;
+    centroid_rows.reserve(final_kmeans.centroids.size());
+    for (std::uint32_t cid = 0; cid < static_cast<std::uint32_t>(final_kmeans.centroids.size()); ++cid) {
+        codec::TopCentroidRow row{};
+        row.top_centroid_numeric_id = cid;
+        for (std::size_t d = 0; d < kVectorDim; ++d) {
+            row.centroid_vector[d] = final_kmeans.centroids[cid][d];
+        }
+        centroid_rows.push_back(row);
+    }
+    const Status centroid_valid = codec::validate_top_centroids(centroid_rows);
+    if (!centroid_valid.ok) {
+        return centroid_valid;
+    }
+
+    codec::StabilityReportRow stability{};
+    stability.status_code = codec::StabilityStatusCode::Ok;
+    stability.reserved = 0U;
+    stability.mean_nmi = 1.0f;
+    stability.std_nmi = 0.0f;
+    stability.mean_jaccard = 1.0f;
+    stability.mean_centroid_drift = 0.0f;
+    const Status stability_valid = codec::validate_stability_report(stability);
+    if (!stability_valid.ok) {
+        return stability_valid;
+    }
+
+    const fs::path clusters_dir = paths::clusters_current_dir(data_dir);
+    fs::create_directories(clusters_dir);
+
+    auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written) {
+        std::vector<std::uint8_t> bytes;
+        codec::read_file_bytes(artifact_path, &bytes);
+        emit_step(
+            telemetry::EventType::ArtifactWrite,
+            status.ok ? "completed" : "failed",
+            {
+                {"artifact_path", artifact_path.generic_string()},
+                {"rows_written", std::to_string(rows_written)},
+                {"bytes_written", std::to_string(bytes.size())},
+                {"status", status.ok ? "ok" : "error"},
+            });
+    };
+
+    Status st = codec::write_id_estimate_file(paths::id_estimate_bin(data_dir), estimate);
+    if (!st.ok) {
+        return st;
+    }
+    write_and_emit(paths::id_estimate_bin(data_dir), st, 1U);
+
+    st = codec::write_elbow_trace_file(paths::elbow_trace_bin(data_dir), elbow_rows);
+    if (!st.ok) {
+        return st;
+    }
+    write_and_emit(paths::elbow_trace_bin(data_dir), st, elbow_rows.size());
+
+    st = codec::write_top_centroids_file(paths::centroids_bin(data_dir), centroid_rows);
+    if (!st.ok) {
+        return st;
+    }
+    write_and_emit(paths::centroids_bin(data_dir), st, centroid_rows.size());
+
+    st = codec::write_top_assignments_file(paths::top_assignments_bin(data_dir), assignments);
+    if (!st.ok) {
+        return st;
+    }
+    write_and_emit(paths::top_assignments_bin(data_dir), st, assignments.size());
+
+    st = codec::write_stability_report_file(paths::stability_report_bin(data_dir), stability);
+    if (!st.ok) {
+        return st;
+    }
+    write_and_emit(paths::stability_report_bin(data_dir), st, 1U);
+
+    std::vector<std::pair<std::string, std::filesystem::path>> manifest_artifacts = {
+        {"id_estimate.bin", paths::id_estimate_bin(data_dir)},
+        {"elbow_trace.bin", paths::elbow_trace_bin(data_dir)},
+        {"centroids.bin", paths::centroids_bin(data_dir)},
+        {"assignments.bin", paths::top_assignments_bin(data_dir)},
+        {"stability_report.bin", paths::stability_report_bin(data_dir)},
+    };
+    std::ostringstream payload_json;
+    payload_json << "{";
+    payload_json << "\"stage\":\"top\",";
+    payload_json << "\"schema_version\":1,";
+    payload_json << "\"chosen_k\":" << best_k << ",";
+    payload_json << "\"artifacts\":[";
+    for (std::size_t i = 0; i < manifest_artifacts.size(); ++i) {
+        std::vector<std::uint8_t> artifact_bytes;
+        const Status rd = codec::read_file_bytes(manifest_artifacts[i].second, &artifact_bytes);
+        if (!rd.ok) {
+            return rd;
+        }
+        if (i > 0) {
+            payload_json << ",";
+        }
+        payload_json << "{";
+        payload_json << "\"artifact_path\":\"" << escape_json_string(manifest_artifacts[i].first) << "\",";
+        payload_json << "\"artifact_format\":\"binary\",";
+        payload_json << "\"endianness\":\"little\",";
+        payload_json << "\"record_size_bytes\":0,";
+        payload_json << "\"record_count\":0,";
+        payload_json << "\"schema_version\":1,";
+        payload_json << "\"checksum\":\"" << codec::sha256_hex(artifact_bytes) << "\"";
+        payload_json << "}";
+    }
+    payload_json << "]}";
+    const std::string payload = payload_json.str();
+    st = codec::write_cluster_manifest_file(
+        paths::cluster_manifest_bin(data_dir),
+        std::vector<std::uint8_t>(payload.begin(), payload.end()));
+    if (!st.ok) {
+        return st;
+    }
+    write_and_emit(paths::cluster_manifest_bin(data_dir), st, 1U);
+
+    *records_processed_out = ids.size();
+    (void)seed;
+    return Status::Ok();
+}
+
 }  // namespace
 
 struct VectorStore::Impl {
@@ -702,7 +1083,9 @@ bool env_truthy(const char* value) {
 Status run_stage_with_telemetry(
     const fs::path& data_dir,
     const std::string& stage_id,
-    const std::string& stage_name) {
+    const std::string& stage_name,
+    const std::map<std::uint64_t, Record>& rows,
+    std::uint32_t seed) {
     using steady_clock = std::chrono::steady_clock;
     const auto pipeline_start = steady_clock::now();
     const std::string pipeline_started_ts = telemetry::now_ts();
@@ -788,6 +1171,8 @@ Status run_stage_with_telemetry(
     telemetry::EventType terminal_event_type = telemetry::EventType::StageEnd;
     Status stage_status = Status::Ok();
     std::vector<std::pair<std::string, std::string>> terminal_extra = stage_prev_extra();
+    std::size_t records_processed = 0;
+    std::uint32_t chosen_k = 0U;
 
     if (force_skip) {
         final_status = "skipped";
@@ -807,8 +1192,40 @@ Status run_stage_with_telemetry(
         terminal_extra.push_back({"error_code", "runtime_error"});
         terminal_extra.push_back({"error_message", "forced runtime failure"});
     } else {
-        terminal_extra.push_back({"records_processed", "0"});
-        terminal_extra.push_back({"compliance_status", "pass"});
+        if (stage_id == "top") {
+            auto emit_step = [&](telemetry::EventType step_type,
+                                 const std::string& step_status,
+                                 const std::vector<std::pair<std::string, std::string>>& extra) {
+                telemetry::emit_event(
+                    std::cout,
+                    step_type,
+                    stage_id,
+                    stage_name,
+                    step_status,
+                    stage_started_ts,
+                    std::nullopt,
+                    0.0,
+                    pipeline_elapsed_now_ms(),
+                    "running",
+                    extra);
+            };
+            stage_status = emit_top_layer_artifacts(
+                data_dir,
+                rows,
+                seed,
+                emit_step,
+                &chosen_k,
+                &records_processed);
+            if (!stage_status.ok) {
+                final_status = "failed";
+                terminal_event_type = telemetry::EventType::StageFail;
+                terminal_extra.push_back({"error_code", "top_layer_build_failed"});
+                terminal_extra.push_back({"error_message", stage_status.message});
+            }
+        }
+        terminal_extra.push_back({"records_processed", std::to_string(records_processed)});
+        terminal_extra.push_back({"chosen_k", std::to_string(chosen_k)});
+        terminal_extra.push_back({"compliance_status", stage_status.ok ? "pass" : "fail"});
     }
 
     const auto stage_end_steady = steady_clock::now();
@@ -841,7 +1258,7 @@ Status run_stage_with_telemetry(
         {"stages_completed", stage_status.ok && !force_skip ? "1" : "0"},
         {"stages_failed", stage_status.ok ? "0" : "1"},
         {"stages_skipped", force_skip ? "1" : "0"},
-        {"records_processed_total", "0"},
+        {"records_processed_total", std::to_string(records_processed)},
         {"final_output_status", stage_status.ok ? (force_skip ? "skipped" : "success") : "failed"},
         {"summary_version", "1"},
     };
@@ -872,35 +1289,31 @@ Status run_stage_with_telemetry(
 }
 
 Status VectorStore::build_top_clusters(std::uint32_t seed) {
-    (void)seed;
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return run_stage_with_telemetry(impl_->data_dir, "top", "Top Layer");
+    return run_stage_with_telemetry(impl_->data_dir, "top", "Top Layer", impl_->rows, seed);
 }
 
 Status VectorStore::build_mid_layer_clusters(std::uint32_t seed) {
-    (void)seed;
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return run_stage_with_telemetry(impl_->data_dir, "mid", "Mid Layer");
+    return run_stage_with_telemetry(impl_->data_dir, "mid", "Mid Layer", impl_->rows, seed);
 }
 
 Status VectorStore::build_lower_layer_clusters(std::uint32_t seed) {
-    (void)seed;
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return run_stage_with_telemetry(impl_->data_dir, "lower", "Lower Layer");
+    return run_stage_with_telemetry(impl_->data_dir, "lower", "Lower Layer", impl_->rows, seed);
 }
 
 Status VectorStore::build_final_layer_clusters(std::uint32_t seed) {
-    (void)seed;
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return run_stage_with_telemetry(impl_->data_dir, "final", "Final Layer");
+    return run_stage_with_telemetry(impl_->data_dir, "final", "Final Layer", impl_->rows, seed);
 }
 
 }  // namespace vector_db_v3

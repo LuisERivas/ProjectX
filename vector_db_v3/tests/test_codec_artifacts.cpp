@@ -71,6 +71,22 @@ int main() {
     }
 
     {
+        TopCentroidRow c0{};
+        c0.top_centroid_numeric_id = 0U;
+        c0.centroid_vector[0] = 1.25f;
+        TopCentroidRow c1{};
+        c1.top_centroid_numeric_id = 1U;
+        c1.centroid_vector[0] = 2.50f;
+        std::vector<TopCentroidRow> rows = {c0, c1};
+        std::vector<std::uint8_t> bytes;
+        std::vector<TopCentroidRow> decoded;
+        ok &= expect(encode_top_centroids(rows, &bytes).ok, "encode top centroids");
+        ok &= expect(decode_top_centroids(bytes, &decoded).ok, "decode top centroids");
+        ok &= expect(decoded.size() == 2U, "centroid row count");
+        ok &= expect(validate_top_centroids(decoded).ok, "validate top centroids");
+    }
+
+    {
         std::vector<MidAssignmentRow> mid = {{10U, 5U, 1U}, {11U, 5U, 1U}, {20U, 6U, 2U}};
         std::vector<FinalAssignmentRow> fin = {{10U, 50U}, {11U, 50U}, {20U, 60U}};
         std::vector<std::uint8_t> b1;
@@ -141,6 +157,18 @@ int main() {
         ok &= expect(write_id_estimate_file(root / "id_estimate.bin", row).ok, "write id_estimate file");
         ok &= expect(read_id_estimate_file(root / "id_estimate.bin", &loaded).ok, "read id_estimate file");
         ok &= expect(loaded.k_max == 4U, "id_estimate file roundtrip");
+
+        std::vector<std::uint8_t> payload = {'{', '}', '\n'};
+        CommonHeader hdr{};
+        std::vector<std::uint8_t> loaded_payload;
+        ok &= expect(
+            write_cluster_manifest_file(root / "cluster_manifest.bin", payload).ok,
+            "write cluster_manifest file");
+        ok &= expect(
+            read_cluster_manifest_file(root / "cluster_manifest.bin", &hdr, &loaded_payload).ok,
+            "read cluster_manifest file");
+        ok &= expect(hdr.schema_version == 1U, "cluster_manifest schema version");
+        ok &= expect(loaded_payload == payload, "cluster_manifest payload roundtrip");
     }
 
     if (!ok) {
