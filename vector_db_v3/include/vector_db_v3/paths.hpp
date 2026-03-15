@@ -116,4 +116,8 @@ inline std::filesystem::path post_cluster_membership_bin(const std::filesystem::
     return clusters_current_dir(data_dir) / "post_cluster_membership.bin";
 }
 
+inline std::filesystem::path telemetry_baseline_jsonl(const std::filesystem::path& data_dir) {
+    return clusters_current_dir(data_dir) / "telemetry_stage_baseline.jsonl";
+}
+
 }  // namespace vector_db_v3::paths

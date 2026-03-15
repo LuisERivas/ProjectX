@@ -1,15 +1,21 @@
 #include "vector_db_v3/vector_store.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <map>
 #include <optional>
 #include <regex>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -648,14 +654,187 @@ ClusterHealth VectorStore::cluster_health() const {
     return out;
 }
 
-static Status emit_stub_stage(const std::string& stage_id, const std::string& stage_name) {
-    telemetry::emit_event(std::cout, "pipeline_start", "pipeline", "Pipeline", "running", 0.0, 0.0);
-    telemetry::emit_event(std::cout, "stage_start", stage_id, stage_name, "running", 0.0, 0.0);
-    telemetry::emit_event(std::cout, "stage_end", stage_id, stage_name, "completed", 0.0, 0.0,
-                          {{"records_processed", "0"}});
-    telemetry::emit_event(std::cout, "pipeline_summary", "pipeline", "Pipeline", "completed", 0.0, 0.0,
-                          {{"stages_completed", "1"}, {"stages_failed", "0"}});
-    return Status::Ok();
+bool env_truthy(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s == "1" || s == "true" || s == "yes" || s == "on";
+}
+
+Status run_stage_with_telemetry(
+    const fs::path& data_dir,
+    const std::string& stage_id,
+    const std::string& stage_name) {
+    using steady_clock = std::chrono::steady_clock;
+    const auto pipeline_start = steady_clock::now();
+    const std::string pipeline_started_ts = telemetry::now_ts();
+    double last_pipeline_elapsed_ms = 0.0;
+    std::unordered_map<std::string, double> current_stage_elapsed_ms;
+
+    std::unordered_map<std::string, double> previous_stage_elapsed_ms;
+    bool previous_run_available = false;
+    std::string baseline_unavailable_reason;
+    const fs::path baseline_path = paths::telemetry_baseline_jsonl(data_dir);
+    const Status baseline_load = telemetry::load_stage_baseline(
+        baseline_path,
+        &previous_stage_elapsed_ms,
+        &previous_run_available,
+        &baseline_unavailable_reason);
+    if (!baseline_load.ok) {
+        previous_run_available = false;
+        baseline_unavailable_reason = "baseline_load_error";
+    }
+
+    auto pipeline_elapsed_now_ms = [&]() -> double {
+        const auto now = steady_clock::now();
+        const auto elapsed = std::chrono::duration<double, std::milli>(now - pipeline_start).count();
+        return telemetry::monotonic_ms(elapsed, &last_pipeline_elapsed_ms);
+    };
+
+    auto stage_prev_extra = [&]() -> std::vector<std::pair<std::string, std::string>> {
+        std::vector<std::pair<std::string, std::string>> extra;
+        const auto prev_it = previous_stage_elapsed_ms.find(stage_id);
+        const bool has_prev = previous_run_available && prev_it != previous_stage_elapsed_ms.end();
+        extra.push_back({"previous_run_available", has_prev ? "true" : "false"});
+        if (has_prev) {
+            std::ostringstream os_prev;
+            os_prev << std::fixed << std::setprecision(3) << prev_it->second;
+            extra.push_back({"previous_run_stage_elapsed_ms", os_prev.str()});
+        } else {
+            extra.push_back({"previous_run_stage_elapsed_ms", "null"});
+            if (!previous_run_available && !baseline_unavailable_reason.empty()) {
+                extra.push_back({"baseline_unavailable_reason", baseline_unavailable_reason});
+            }
+        }
+        return extra;
+    };
+
+    telemetry::emit_event(
+        std::cout,
+        telemetry::EventType::PipelineStart,
+        "pipeline",
+        "Pipeline",
+        "running",
+        pipeline_started_ts,
+        std::nullopt,
+        0.0,
+        0.0,
+        "running",
+        stage_prev_extra());
+
+    const auto stage_start_steady = steady_clock::now();
+    const std::string stage_started_ts = telemetry::now_ts();
+    {
+        std::vector<std::pair<std::string, std::string>> extra = stage_prev_extra();
+        extra.push_back({"stage_started_ts", stage_started_ts});
+        extra.push_back({"stage_elapsed_ms", "0.000"});
+        telemetry::emit_event(
+            std::cout,
+            telemetry::EventType::StageStart,
+            stage_id,
+            stage_name,
+            "running",
+            stage_started_ts,
+            std::nullopt,
+            0.0,
+            pipeline_elapsed_now_ms(),
+            "running",
+            extra);
+    }
+
+    const bool force_skip = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_SKIP"));
+    const bool force_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_FAIL"));
+    const bool force_compliance_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_COMPLIANCE_FAIL"));
+
+    std::string final_status = "completed";
+    telemetry::EventType terminal_event_type = telemetry::EventType::StageEnd;
+    Status stage_status = Status::Ok();
+    std::vector<std::pair<std::string, std::string>> terminal_extra = stage_prev_extra();
+
+    if (force_skip) {
+        final_status = "skipped";
+        terminal_event_type = telemetry::EventType::StageSkip;
+    } else if (force_compliance_fail) {
+        final_status = "failed";
+        terminal_event_type = telemetry::EventType::StageFail;
+        stage_status = Status::Error("forced compliance failure");
+        terminal_extra.push_back({"error_code", "compliance_fail_fast"});
+        terminal_extra.push_back({"error_message", "forced compliance failure"});
+        terminal_extra.push_back({"non_compliance_stage", stage_id});
+        terminal_extra.push_back({"compliance_status", "fail"});
+    } else if (force_fail) {
+        final_status = "failed";
+        terminal_event_type = telemetry::EventType::StageFail;
+        stage_status = Status::Error("forced runtime failure");
+        terminal_extra.push_back({"error_code", "runtime_error"});
+        terminal_extra.push_back({"error_message", "forced runtime failure"});
+    } else {
+        terminal_extra.push_back({"records_processed", "0"});
+        terminal_extra.push_back({"compliance_status", "pass"});
+    }
+
+    const auto stage_end_steady = steady_clock::now();
+    const double raw_stage_elapsed_ms =
+        std::chrono::duration<double, std::milli>(stage_end_steady - stage_start_steady).count();
+    const double stage_elapsed_ms = raw_stage_elapsed_ms >= 0.0 && std::isfinite(raw_stage_elapsed_ms) ?
+        raw_stage_elapsed_ms : 0.0;
+    current_stage_elapsed_ms[stage_id] = stage_elapsed_ms;
+
+    {
+        std::ostringstream stage_elapsed_os;
+        stage_elapsed_os << std::fixed << std::setprecision(3) << stage_elapsed_ms;
+        terminal_extra.push_back({"stage_started_ts", stage_started_ts});
+        terminal_extra.push_back({"stage_elapsed_ms", stage_elapsed_os.str()});
+    }
+    telemetry::emit_event(
+        std::cout,
+        terminal_event_type,
+        stage_id,
+        stage_name,
+        final_status,
+        stage_started_ts,
+        telemetry::now_ts(),
+        stage_elapsed_ms,
+        pipeline_elapsed_now_ms(),
+        final_status,
+        terminal_extra);
+
+    std::vector<std::pair<std::string, std::string>> summary_extra = {
+        {"stages_completed", stage_status.ok && !force_skip ? "1" : "0"},
+        {"stages_failed", stage_status.ok ? "0" : "1"},
+        {"stages_skipped", force_skip ? "1" : "0"},
+        {"records_processed_total", "0"},
+        {"final_output_status", stage_status.ok ? (force_skip ? "skipped" : "success") : "failed"},
+        {"summary_version", "1"},
+    };
+    if (!previous_run_available) {
+        summary_extra.push_back({"baseline_unavailable_reason",
+                                 baseline_unavailable_reason.empty() ? "no_previous_run_baseline" :
+                                     baseline_unavailable_reason});
+    }
+
+    telemetry::emit_event(
+        std::cout,
+        telemetry::EventType::PipelineSummary,
+        "pipeline",
+        "Pipeline",
+        stage_status.ok ? "completed" : "failed",
+        pipeline_started_ts,
+        telemetry::now_ts(),
+        pipeline_elapsed_now_ms(),
+        pipeline_elapsed_now_ms(),
+        stage_status.ok ? "completed" : "failed",
+        summary_extra);
+
+    const Status baseline_write = telemetry::write_stage_baseline(baseline_path, current_stage_elapsed_ms);
+    if (!baseline_write.ok && stage_status.ok) {
+        return baseline_write;
+    }
+    return stage_status;
 }
 
 Status VectorStore::build_top_clusters(std::uint32_t seed) {
@@ -663,7 +842,7 @@ Status VectorStore::build_top_clusters(std::uint32_t seed) {
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return emit_stub_stage("top", "Top Layer");
+    return run_stage_with_telemetry(impl_->data_dir, "top", "Top Layer");
 }
 
 Status VectorStore::build_mid_layer_clusters(std::uint32_t seed) {
@@ -671,7 +850,7 @@ Status VectorStore::build_mid_layer_clusters(std::uint32_t seed) {
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return emit_stub_stage("mid", "Mid Layer");
+    return run_stage_with_telemetry(impl_->data_dir, "mid", "Mid Layer");
 }
 
 Status VectorStore::build_lower_layer_clusters(std::uint32_t seed) {
@@ -679,7 +858,7 @@ Status VectorStore::build_lower_layer_clusters(std::uint32_t seed) {
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return emit_stub_stage("lower", "Lower Layer");
+    return run_stage_with_telemetry(impl_->data_dir, "lower", "Lower Layer");
 }
 
 Status VectorStore::build_final_layer_clusters(std::uint32_t seed) {
@@ -687,7 +866,7 @@ Status VectorStore::build_final_layer_clusters(std::uint32_t seed) {
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
-    return emit_stub_stage("final", "Final Layer");
+    return run_stage_with_telemetry(impl_->data_dir, "final", "Final Layer");
 }
 
 }  // namespace vector_db_v3

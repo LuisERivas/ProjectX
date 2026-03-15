@@ -87,4 +87,7 @@ if(Python3_Interpreter_FOUND)
     add_test(
         NAME vectordb_v3_cli_contract_tests
         COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_cli_contract.py")
+    add_test(
+        NAME vectordb_v3_terminal_event_contract_tests
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_terminal_event_contract.py")
 endif()
