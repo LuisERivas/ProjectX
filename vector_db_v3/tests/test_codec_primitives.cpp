@@ -23,16 +23,16 @@ bool expect(bool cond, const char* msg) {
 int main() {
     bool ok = true;
 
-    std::vector<std::uint8_t> bytes(16, 0U);
+    std::vector<std::uint8_t> bytes(24, 0U);
     vector_db_v3::codec::store_le_u16(bytes.data() + 0, 0x1234U);
     vector_db_v3::codec::store_le_u32(bytes.data() + 2, 0xAABBCCDDU);
     vector_db_v3::codec::store_le_u64(bytes.data() + 6, 0x1122334455667788ULL);
-    vector_db_v3::codec::store_le_f32(bytes.data() + 14 - 4, 1.5f);
+    vector_db_v3::codec::store_le_f32(bytes.data() + 16, 1.5f);
 
     ok &= expect(vector_db_v3::codec::load_le_u16(bytes.data() + 0) == 0x1234U, "u16 roundtrip");
     ok &= expect(vector_db_v3::codec::load_le_u32(bytes.data() + 2) == 0xAABBCCDDU, "u32 roundtrip");
     ok &= expect(vector_db_v3::codec::load_le_u64(bytes.data() + 6) == 0x1122334455667788ULL, "u64 roundtrip");
-    ok &= expect(vector_db_v3::codec::load_le_f32(bytes.data() + 10) == 1.5f, "f32 roundtrip");
+    ok &= expect(vector_db_v3::codec::load_le_f32(bytes.data() + 16) == 1.5f, "f32 roundtrip");
     ok &= expect(vector_db_v3::codec::host_is_little_endian(), "host endianness expected little");
 
     const std::vector<std::uint8_t> crc_input = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
