@@ -81,3 +81,10 @@ add_test(NAME vectordb_v3_durability_wal_tests COMMAND vectordb_v3_durability_wa
 add_test(NAME vectordb_v3_durability_checkpoint_tests COMMAND vectordb_v3_durability_checkpoint_tests)
 add_test(NAME vectordb_v3_durability_replay_crash_tests COMMAND vectordb_v3_durability_replay_crash_tests)
 add_test(NAME vectordb_v3_durability_corruption_tests COMMAND vectordb_v3_durability_corruption_tests)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME vectordb_v3_cli_contract_tests
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_cli_contract.py")
+endif()

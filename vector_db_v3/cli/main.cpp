@@ -1,6 +1,10 @@
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -75,6 +79,154 @@ bool parse_u32(const std::string& s, std::uint32_t& out) {
     }
 }
 
+std::string trim(const std::string& s) {
+    const auto left = s.find_first_not_of(" \t\r\n");
+    if (left == std::string::npos) {
+        return "";
+    }
+    const auto right = s.find_last_not_of(" \t\r\n");
+    return s.substr(left, right - left + 1);
+}
+
+std::string json_escape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (const char c : in) {
+        switch (c) {
+            case '\\':
+                out += "\\\\";
+                break;
+            case '"':
+                out += "\\\"";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                out.push_back(c);
+                break;
+        }
+    }
+    return out;
+}
+
+int emit_usage_error(const std::string& message) {
+    std::cerr << "error: " << message << "\n";
+    return 2;
+}
+
+int emit_runtime_error(const std::string& message) {
+    std::cerr << "error: " << message << "\n";
+    return 1;
+}
+
+bool parse_vector_csv_1024(const std::string& csv, std::vector<float>& out, std::string& error) {
+    out.clear();
+    std::stringstream ss(csv);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        const std::string t = trim(token);
+        if (t.empty()) {
+            error = "vector parse failed: empty token";
+            return false;
+        }
+        try {
+            out.push_back(std::stof(t));
+        } catch (...) {
+            error = "vector parse failed: non-numeric value";
+            return false;
+        }
+    }
+    if (out.size() != vector_db_v3::kVectorDim) {
+        error = "vector dimension mismatch: expected 1024 values";
+        return false;
+    }
+    return true;
+}
+
+bool load_text_file(const std::filesystem::path& p, std::string& out) {
+    std::ifstream in(p, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::stringstream buf;
+    buf << in.rdbuf();
+    out = buf.str();
+    return true;
+}
+
+bool parse_vec_arg_1024(const std::string& arg, std::vector<float>& out, std::string& error) {
+    std::string source = arg;
+    if (std::filesystem::exists(arg)) {
+        if (!load_text_file(arg, source)) {
+            error = "failed to read vector file";
+            return false;
+        }
+    }
+    return parse_vector_csv_1024(source, out, error);
+}
+
+bool parse_jsonl_record(const std::string& line, vector_db_v3::Record& out, std::string& error) {
+    static const std::regex id_re("\"embedding_id\"\\s*:\\s*([0-9]+)");
+    static const std::regex vec_re("\"vector\"\\s*:\\s*\\[([^\\]]*)\\]");
+    std::smatch m_id;
+    std::smatch m_vec;
+    if (!std::regex_search(line, m_id, id_re) || m_id.size() < 2) {
+        error = "jsonl row missing embedding_id";
+        return false;
+    }
+    if (!std::regex_search(line, m_vec, vec_re) || m_vec.size() < 2) {
+        error = "jsonl row missing vector";
+        return false;
+    }
+    try {
+        out.embedding_id = static_cast<std::uint64_t>(std::stoull(m_id[1].str()));
+    } catch (...) {
+        error = "jsonl row embedding_id parse failed";
+        return false;
+    }
+    std::vector<float> vec;
+    if (!parse_vector_csv_1024(m_vec[1].str(), vec, error)) {
+        return false;
+    }
+    out.vector = std::move(vec);
+    return true;
+}
+
+bool parse_jsonl_records(
+    const std::string& input_path,
+    std::vector<vector_db_v3::Record>& records,
+    std::string& error) {
+    std::ifstream in(input_path, std::ios::binary);
+    if (!in) {
+        error = "unable to open input jsonl file";
+        return false;
+    }
+    records.clear();
+    std::string line;
+    std::size_t line_no = 0;
+    while (std::getline(in, line)) {
+        ++line_no;
+        const std::string t = trim(line);
+        if (t.empty()) {
+            continue;
+        }
+        vector_db_v3::Record rec{};
+        if (!parse_jsonl_record(t, rec, error)) {
+            error += " at line " + std::to_string(line_no);
+            return false;
+        }
+        records.push_back(std::move(rec));
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -100,10 +252,9 @@ int main(int argc, char** argv) {
     if (command == "init") {
         const auto s = store.init();
         if (!s.ok) {
-            std::cerr << "error: " << s.message << "\n";
-            return 1;
+            return emit_runtime_error(s.message);
         }
-        std::cout << "ok: initialized " << path << "\n";
+        std::cout << "{\"status\":\"ok\",\"command\":\"init\",\"path\":\"" << json_escape(path) << "\"}\n";
         return 0;
     }
 
@@ -115,15 +266,18 @@ int main(int argc, char** argv) {
         const auto vec_arg = get_arg(args, "--vec");
         std::uint64_t id = 0;
         if (id_arg.empty() || vec_arg.empty() || !parse_u64(id_arg, id)) {
-            print_usage();
-            return 2;
+            return emit_usage_error("insert requires --id <u64> and --vec <file_or_csv>");
         }
-        const auto s = store.insert(id, {});
+        std::vector<float> vec;
+        std::string parse_error;
+        if (!parse_vec_arg_1024(vec_arg, vec, parse_error)) {
+            return emit_usage_error(parse_error);
+        }
+        const auto s = store.insert(id, vec);
         if (!s.ok) {
-            std::cerr << "error: " << s.message << "\n";
-            return 1;
+            return emit_runtime_error(s.message);
         }
-        std::cout << "ok: inserted " << id << "\n";
+        std::cout << "{\"status\":\"ok\",\"command\":\"insert\",\"embedding_id\":" << id << "}\n";
         return 0;
     }
 
@@ -134,22 +288,47 @@ int main(int argc, char** argv) {
         const auto input = get_arg(args, "--input");
         const auto batch_size_arg = get_arg(args, "--batch-size");
         if (input.empty()) {
-            print_usage();
-            return 2;
+            return emit_usage_error("bulk-insert requires --input <jsonl>");
         }
+        std::uint32_t batch_size = 1000;
         if (!batch_size_arg.empty()) {
             std::uint32_t tmp = 0;
             if (!parse_u32(batch_size_arg, tmp) || tmp == 0) {
-                std::cerr << "error: --batch-size must be >= 1\n";
-                return 1;
+                return emit_usage_error("--batch-size must be >= 1");
+            }
+            batch_size = tmp;
+        }
+        std::vector<vector_db_v3::Record> records;
+        std::string parse_error;
+        if (!parse_jsonl_records(input, records, parse_error)) {
+            return emit_usage_error(parse_error);
+        }
+        std::size_t inserted = 0;
+        std::size_t batches = 0;
+        std::vector<vector_db_v3::Record> chunk;
+        chunk.reserve(batch_size);
+        for (const auto& rec : records) {
+            chunk.push_back(rec);
+            if (chunk.size() >= batch_size) {
+                const auto s = store.insert_batch(chunk);
+                if (!s.ok) {
+                    return emit_runtime_error(s.message);
+                }
+                inserted += chunk.size();
+                ++batches;
+                chunk.clear();
             }
         }
-        const auto s = store.insert_batch({});
-        if (!s.ok) {
-            std::cerr << "error: " << s.message << "\n";
-            return 1;
+        if (!chunk.empty()) {
+            const auto s = store.insert_batch(chunk);
+            if (!s.ok) {
+                return emit_runtime_error(s.message);
+            }
+            inserted += chunk.size();
+            ++batches;
         }
-        std::cout << "ok: bulk inserted 0\n";
+        std::cout << "{\"status\":\"ok\",\"command\":\"bulk-insert\",\"inserted\":" << inserted
+                  << ",\"batches\":" << batches << "}\n";
         return 0;
     }
 
@@ -160,15 +339,13 @@ int main(int argc, char** argv) {
         const auto id_arg = get_arg(args, "--id");
         std::uint64_t id = 0;
         if (id_arg.empty() || !parse_u64(id_arg, id)) {
-            print_usage();
-            return 2;
+            return emit_usage_error("delete requires --id <u64>");
         }
         const auto s = store.remove(id);
         if (!s.ok) {
-            std::cerr << "error: " << s.message << "\n";
-            return 1;
+            return emit_runtime_error(s.message);
         }
-        std::cout << "ok: deleted " << id << "\n";
+        std::cout << "{\"status\":\"ok\",\"command\":\"delete\",\"embedding_id\":" << id << "}\n";
         return 0;
     }
 
@@ -179,15 +356,20 @@ int main(int argc, char** argv) {
         const auto id_arg = get_arg(args, "--id");
         std::uint64_t id = 0;
         if (id_arg.empty() || !parse_u64(id_arg, id)) {
-            print_usage();
-            return 2;
+            return emit_usage_error("get requires --id <u64>");
         }
         const auto rec = store.get(id);
         if (!rec.has_value()) {
-            std::cerr << "error: not found\n";
-            return 1;
+            return emit_runtime_error("not found");
         }
-        std::cout << "{\"embedding_id\": " << rec->embedding_id << "}\n";
+        std::cout << "{\"embedding_id\":" << rec->embedding_id << ",\"vector\":[";
+        for (std::size_t i = 0; i < rec->vector.size(); ++i) {
+            std::cout << std::fixed << std::setprecision(8) << rec->vector[i];
+            if (i + 1 < rec->vector.size()) {
+                std::cout << ",";
+            }
+        }
+        std::cout << "]}\n";
         return 0;
     }
 
@@ -198,15 +380,18 @@ int main(int argc, char** argv) {
         const auto vec_arg = get_arg(args, "--vec");
         std::uint32_t topk = 10;
         if (vec_arg.empty()) {
-            print_usage();
-            return 2;
+            return emit_usage_error("search requires --vec <file_or_csv>");
         }
         const auto topk_arg = get_arg(args, "--topk");
         if (!topk_arg.empty() && !parse_u32(topk_arg, topk)) {
-            print_usage();
-            return 2;
+            return emit_usage_error("search --topk must be a valid u32");
         }
-        const auto res = store.search_exact({}, static_cast<std::size_t>(topk));
+        std::vector<float> query;
+        std::string parse_error;
+        if (!parse_vec_arg_1024(vec_arg, query, parse_error)) {
+            return emit_usage_error(parse_error);
+        }
+        const auto res = store.search_exact(query, static_cast<std::size_t>(topk));
         std::cout << "[\n";
         for (std::size_t i = 0; i < res.size(); ++i) {
             std::cout << "  {\"embedding_id\": " << res[i].embedding_id << ", \"score\": "
@@ -249,10 +434,9 @@ int main(int argc, char** argv) {
         }
         const auto s = store.checkpoint();
         if (!s.ok) {
-            std::cerr << "error: " << s.message << "\n";
-            return 1;
+            return emit_runtime_error(s.message);
         }
-        std::cout << "ok: checkpoint\n";
+        std::cout << "{\"status\":\"ok\",\"command\":\"checkpoint\"}\n";
         return 0;
     }
 
@@ -263,8 +447,7 @@ int main(int argc, char** argv) {
         std::uint32_t seed = 1234;
         const auto seed_arg = get_arg(args, "--seed");
         if (!seed_arg.empty() && !parse_u32(seed_arg, seed)) {
-            print_usage();
-            return 2;
+            return emit_usage_error("cluster build --seed must be a valid u32");
         }
         vector_db_v3::Status s{};
         if (stage == "top") {
@@ -277,10 +460,9 @@ int main(int argc, char** argv) {
             s = store.build_final_layer_clusters(seed);
         }
         if (!s.ok) {
-            std::cerr << "error: " << s.message << "\n";
-            return 1;
+            return emit_runtime_error(s.message);
         }
-        std::cout << "ok: build " << stage << "\n";
+        std::cout << "{\"status\":\"ok\",\"command\":\"build-" << stage << "\",\"seed\":" << seed << "}\n";
         return 0;
     };
 
