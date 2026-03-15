@@ -31,6 +31,20 @@ def parse_json(stdout: str):
     return json.loads(text)
 
 
+def parse_final_command_json(stdout: str):
+    command_obj = None
+    for line in stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "event_type" not in obj:
+            command_obj = obj
+    if command_obj is None:
+        raise ValueError("missing final command json")
+    return command_obj
+
+
 def vec_csv(value: float) -> str:
     return ",".join(f"{value + i * 0.001:.6f}" for i in range(1024))
 
@@ -137,6 +151,20 @@ def main() -> int:
     payload = parse_json(out)
     if payload.get("command") != "checkpoint":
         return fail("checkpoint payload mismatch", out, err)
+
+    code, out, err = run([str(cli), "build-top-clusters", "--path", str(data_dir), "--seed", "7"], root)
+    if code != 0:
+        return fail("build-top-clusters should succeed", out, err)
+    payload = parse_final_command_json(out)
+    if payload.get("status") != "ok" or payload.get("command") != "build-top":
+        return fail("build-top-clusters command payload mismatch", out, err)
+
+    code, out, err = run([str(cli), "build-mid-layer-clusters", "--path", str(data_dir), "--seed", "7"], root)
+    if code != 0:
+        return fail("build-mid-layer-clusters should succeed", out, err)
+    payload = parse_final_command_json(out)
+    if payload.get("status") != "ok" or payload.get("command") != "build-mid":
+        return fail("build-mid-layer-clusters command payload mismatch", out, err)
 
     code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "4", "--vec", "1,2,3"], root)
     if code != 2:

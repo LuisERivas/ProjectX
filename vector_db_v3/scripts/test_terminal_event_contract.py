@@ -117,6 +117,24 @@ def assert_top_stage_sub_events(events: list[dict]) -> None:
         raise AssertionError(f"artifact_write coverage mismatch: observed={sorted(observed)}")
 
 
+def assert_mid_stage_sub_events(events: list[dict]) -> None:
+    artifact_writes = [e for e in events if e.get("event_type") == "artifact_write"]
+    observed = set()
+    for e in artifact_writes:
+        path = str(e.get("artifact_path", ""))
+        if path.endswith("mid_layer_clustering/assignments.bin"):
+            observed.add("mid_assignments")
+        if path.endswith("mid_layer_clustering/MID_LAYER_CLUSTERING.bin"):
+            observed.add("mid_summary")
+    if observed != {"mid_assignments", "mid_summary"}:
+        raise AssertionError(f"mid artifact_write coverage mismatch: observed={sorted(observed)}")
+
+    progress_events = [e for e in events if e.get("event_type") == "stage_progress"]
+    for event in progress_events:
+        if "centroid_id" not in event or "job_id" not in event:
+            raise AssertionError("mid stage_progress events must include centroid_id and job_id")
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     build_dir = root / "build"
@@ -171,6 +189,21 @@ def main() -> int:
         float(prev)
     except Exception as exc:
         return fail(f"second run baseline contract mismatch: {exc}", out, err)
+
+    # Mid-stage success path.
+    code, out, err = run([str(cli), "build-mid-layer-clusters", "--path", str(data_dir)], root)
+    if code != 0:
+        return fail("build-mid-layer-clusters should succeed", out, err)
+    events, cmd = parse_lines(out)
+    try:
+        assert_exact_lifecycle(events, "stage_end")
+        assert_common_fields(events)
+        assert_monotonic_pipeline_elapsed(events)
+        assert_mid_stage_sub_events(events)
+    except Exception as exc:
+        return fail(f"mid run telemetry contract mismatch: {exc}", out, err)
+    if not cmd or cmd.get("status") != "ok":
+        return fail("final command JSON missing for successful mid build stage", out, err)
 
     # Forced runtime failure path.
     env_fail = dict(os.environ)

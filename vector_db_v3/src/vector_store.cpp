@@ -787,6 +787,249 @@ Status emit_top_layer_artifacts(
     return Status::Ok();
 }
 
+Status emit_mid_layer_artifacts(
+    const fs::path& data_dir,
+    const std::map<std::uint64_t, Record>& rows,
+    std::uint32_t seed,
+    const std::function<void(telemetry::EventType, const std::string&, const std::vector<std::pair<std::string, std::string>>&)>& emit_step,
+    std::uint32_t* chosen_k_out,
+    std::size_t* records_processed_out) {
+    if (chosen_k_out == nullptr || records_processed_out == nullptr) {
+        return Status::Error("mid clustering: invalid output pointers");
+    }
+    *chosen_k_out = 0U;
+    *records_processed_out = 0U;
+
+    std::vector<codec::TopAssignmentRow> top_assignments;
+    const Status read_top = codec::read_top_assignments_file(paths::top_assignments_bin(data_dir), &top_assignments);
+    if (!read_top.ok) {
+        return Status::Error("mid clustering: failed reading top assignments; run build-top-clusters first");
+    }
+    const Status top_assignments_valid = codec::validate_top_assignments(top_assignments);
+    if (!top_assignments_valid.ok) {
+        return Status::Error("mid clustering: invalid top assignments input: " + top_assignments_valid.message);
+    }
+
+    struct ParentItem {
+        std::uint64_t embedding_id = 0;
+        std::vector<float> vector;
+    };
+    std::map<std::uint32_t, std::vector<ParentItem>> parent_groups;
+    parent_groups.clear();
+    for (const auto& row : top_assignments) {
+        const auto it = rows.find(row.embedding_id);
+        if (it == rows.end()) {
+            return Status::Error("mid clustering: top assignment references missing live embedding_id");
+        }
+        if (it->second.vector.size() != kVectorDim) {
+            return Status::Error("mid clustering: encountered non-1024D vector");
+        }
+        parent_groups[row.top_centroid_numeric_id].push_back(ParentItem{row.embedding_id, it->second.vector});
+    }
+
+    std::vector<codec::MidAssignmentRow> mid_rows;
+    mid_rows.reserve(top_assignments.size());
+
+    struct ParentJobSummary {
+        std::uint32_t centroid_id = 0;
+        std::string job_id;
+        std::uint32_t dataset_size = 0;
+        std::uint32_t chosen_k = 0;
+        std::uint32_t k_min = 0;
+        std::uint32_t k_max = 0;
+    };
+    std::vector<ParentJobSummary> parent_jobs;
+    parent_jobs.reserve(parent_groups.size());
+
+    std::uint32_t global_mid_offset = 0U;
+    std::uint32_t parent_job_index = 0U;
+    for (const auto& parent_entry : parent_groups) {
+        const std::uint32_t parent_id = parent_entry.first;
+        const auto& items = parent_entry.second;
+        const std::string job_id = "mid-parent-" + std::to_string(parent_job_index++);
+        emit_step(
+            telemetry::EventType::StageProgress,
+            "running",
+            {
+                {"centroid_id", std::to_string(parent_id)},
+                {"job_id", job_id},
+                {"job_phase", "start"},
+                {"dataset_size", std::to_string(items.size())},
+            });
+
+        std::vector<std::vector<float>> parent_vectors;
+        parent_vectors.reserve(items.size());
+        for (const auto& item : items) {
+            parent_vectors.push_back(item.vector);
+        }
+        if (parent_vectors.empty()) {
+            continue;
+        }
+
+        const std::uint32_t k_min = derive_k_min(parent_vectors.size());
+        const std::uint32_t k_max = derive_k_max(parent_vectors.size(), k_min);
+        const std::vector<std::uint32_t> coarse = coarse_ks(k_min, k_max);
+
+        std::uint32_t best_k = coarse.empty() ? k_min : coarse.front();
+        double best_objective = std::numeric_limits<double>::infinity();
+        std::vector<std::uint32_t> tested_ks;
+        tested_ks.reserve(coarse.size() + 3U);
+
+        for (const std::uint32_t k : coarse) {
+            const KMeansResult probe = run_deterministic_kmeans(parent_vectors, k, 4U);
+            tested_ks.push_back(k);
+            if (probe.objective < best_objective ||
+                (probe.objective == best_objective && k < best_k)) {
+                best_objective = probe.objective;
+                best_k = k;
+            }
+        }
+        for (std::uint32_t k = (best_k > k_min ? best_k - 1U : best_k);
+             k <= std::min<std::uint32_t>(k_max, best_k + 1U);
+             ++k) {
+            if (std::find(tested_ks.begin(), tested_ks.end(), k) != tested_ks.end()) {
+                continue;
+            }
+            const KMeansResult probe = run_deterministic_kmeans(parent_vectors, k, 4U);
+            tested_ks.push_back(k);
+            if (probe.objective < best_objective ||
+                (probe.objective == best_objective && k < best_k)) {
+                best_objective = probe.objective;
+                best_k = k;
+            }
+        }
+
+        std::ostringstream tested_ks_json;
+        tested_ks_json << "[";
+        for (std::size_t i = 0; i < tested_ks.size(); ++i) {
+            if (i > 0) {
+                tested_ks_json << ",";
+            }
+            tested_ks_json << tested_ks[i];
+        }
+        tested_ks_json << "]";
+        emit_step(
+            telemetry::EventType::KSelection,
+            "running",
+            {
+                {"centroid_id", std::to_string(parent_id)},
+                {"job_id", job_id},
+                {"k_min", std::to_string(k_min)},
+                {"k_max", std::to_string(k_max)},
+                {"chosen_k", std::to_string(best_k)},
+                {"tested_ks", tested_ks_json.str()},
+            });
+
+        const KMeansResult final_kmeans = run_deterministic_kmeans(parent_vectors, best_k, 12U);
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            mid_rows.push_back(codec::MidAssignmentRow{
+                items[i].embedding_id,
+                static_cast<std::uint32_t>(global_mid_offset + final_kmeans.assignments[i]),
+                parent_id,
+            });
+        }
+        parent_jobs.push_back(ParentJobSummary{
+            parent_id,
+            job_id,
+            static_cast<std::uint32_t>(items.size()),
+            best_k,
+            k_min,
+            k_max,
+        });
+        global_mid_offset += best_k;
+
+        emit_step(
+            telemetry::EventType::StageProgress,
+            "running",
+            {
+                {"centroid_id", std::to_string(parent_id)},
+                {"job_id", job_id},
+                {"job_phase", "end"},
+                {"dataset_size", std::to_string(items.size())},
+                {"chosen_k", std::to_string(best_k)},
+            });
+    }
+
+    std::sort(mid_rows.begin(), mid_rows.end(), [](const auto& a, const auto& b) {
+        return a.embedding_id < b.embedding_id;
+    });
+    const Status mid_valid = codec::validate_mid_assignments(mid_rows);
+    if (!mid_valid.ok) {
+        return mid_valid;
+    }
+    if (mid_rows.size() != top_assignments.size()) {
+        return Status::Error("mid clustering: assignments row-count mismatch vs top assignments");
+    }
+
+    const fs::path mid_dir = paths::mid_layer_dir(data_dir);
+    fs::create_directories(mid_dir);
+
+    auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written) {
+        std::vector<std::uint8_t> bytes;
+        codec::read_file_bytes(artifact_path, &bytes);
+        emit_step(
+            telemetry::EventType::ArtifactWrite,
+            status.ok ? "completed" : "failed",
+            {
+                {"artifact_path", artifact_path.generic_string()},
+                {"rows_written", std::to_string(rows_written)},
+                {"bytes_written", std::to_string(bytes.size())},
+                {"status", status.ok ? "ok" : "error"},
+            });
+    };
+
+    Status st = codec::write_mid_assignments_file(paths::mid_layer_assignments_bin(data_dir), mid_rows);
+    if (!st.ok) {
+        return st;
+    }
+    write_and_emit(paths::mid_layer_assignments_bin(data_dir), st, mid_rows.size());
+
+    std::vector<std::uint8_t> mid_assign_bytes;
+    const Status mid_assign_rd = codec::read_file_bytes(paths::mid_layer_assignments_bin(data_dir), &mid_assign_bytes);
+    if (!mid_assign_rd.ok) {
+        return mid_assign_rd;
+    }
+    std::ostringstream payload_json;
+    payload_json << "{";
+    payload_json << "\"stage\":\"mid\",";
+    payload_json << "\"schema_version\":1,";
+    payload_json << "\"record_count\":" << mid_rows.size() << ",";
+    payload_json << "\"artifact_path\":\"mid_layer_clustering/assignments.bin\",";
+    payload_json << "\"artifact_format\":\"assignments.bin.v1\",";
+    payload_json << "\"endianness\":\"little\",";
+    payload_json << "\"record_size_bytes\":" << codec::kMidAssignmentRecordSize << ",";
+    payload_json << "\"checksum\":\"" << codec::sha256_hex(mid_assign_bytes) << "\",";
+    payload_json << "\"parent_jobs\":[";
+    for (std::size_t i = 0; i < parent_jobs.size(); ++i) {
+        if (i > 0) {
+            payload_json << ",";
+        }
+        payload_json << "{";
+        payload_json << "\"centroid_id\":" << parent_jobs[i].centroid_id << ",";
+        payload_json << "\"job_id\":\"" << escape_json_string(parent_jobs[i].job_id) << "\",";
+        payload_json << "\"dataset_size\":" << parent_jobs[i].dataset_size << ",";
+        payload_json << "\"k_min\":" << parent_jobs[i].k_min << ",";
+        payload_json << "\"k_max\":" << parent_jobs[i].k_max << ",";
+        payload_json << "\"chosen_k\":" << parent_jobs[i].chosen_k;
+        payload_json << "}";
+    }
+    payload_json << "]}";
+
+    const std::string payload = payload_json.str();
+    st = codec::write_cluster_manifest_file(
+        paths::mid_layer_clustering_bin(data_dir),
+        std::vector<std::uint8_t>(payload.begin(), payload.end()));
+    if (!st.ok) {
+        return st;
+    }
+    write_and_emit(paths::mid_layer_clustering_bin(data_dir), st, 1U);
+
+    *chosen_k_out = global_mid_offset;
+    *records_processed_out = mid_rows.size();
+    (void)seed;
+    return Status::Ok();
+}
+
 }  // namespace
 
 struct VectorStore::Impl {
@@ -1220,6 +1463,36 @@ Status run_stage_with_telemetry(
                 final_status = "failed";
                 terminal_event_type = telemetry::EventType::StageFail;
                 terminal_extra.push_back({"error_code", "top_layer_build_failed"});
+                terminal_extra.push_back({"error_message", stage_status.message});
+            }
+        } else if (stage_id == "mid") {
+            auto emit_step = [&](telemetry::EventType step_type,
+                                 const std::string& step_status,
+                                 const std::vector<std::pair<std::string, std::string>>& extra) {
+                telemetry::emit_event(
+                    std::cout,
+                    step_type,
+                    stage_id,
+                    stage_name,
+                    step_status,
+                    stage_started_ts,
+                    std::nullopt,
+                    0.0,
+                    pipeline_elapsed_now_ms(),
+                    "running",
+                    extra);
+            };
+            stage_status = emit_mid_layer_artifacts(
+                data_dir,
+                rows,
+                seed,
+                emit_step,
+                &chosen_k,
+                &records_processed);
+            if (!stage_status.ok) {
+                final_status = "failed";
+                terminal_event_type = telemetry::EventType::StageFail;
+                terminal_extra.push_back({"error_code", "mid_layer_build_failed"});
                 terminal_extra.push_back({"error_message", stage_status.message});
             }
         }

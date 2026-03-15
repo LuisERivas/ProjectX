@@ -67,6 +67,22 @@ int main() {
     }
 
     {
+        std::vector<MidAssignmentRow> rows = {
+            {11U, 4U, 1U},
+            {10U, 3U, 1U},
+        };
+        ok &= expect_fail(validate_mid_assignments(rows), "mid assignments must be sorted by embedding_id");
+    }
+
+    {
+        std::vector<MidAssignmentRow> rows = {
+            {10U, 3U, 1U},
+            {10U, 4U, 2U},
+        };
+        ok &= expect_fail(validate_mid_assignments(rows), "mid assignments duplicate embedding_id");
+    }
+
+    {
         std::vector<KSearchBoundsBatchRow> rows = {
             {StageLevel::Top, GateDecision::Continue, 0U, 1U, 2U, 4U, 3U, 9U},
         };
