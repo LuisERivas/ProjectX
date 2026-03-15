@@ -35,6 +35,10 @@ def vec_csv(value: float) -> str:
     return ",".join(f"{value + i * 0.001:.6f}" for i in range(1024))
 
 
+def vec_const_csv(value: float) -> str:
+    return ",".join(f"{value:.6f}" for _ in range(1024))
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     build_dir = root / "build"
@@ -95,6 +99,30 @@ def main() -> int:
         return fail(f"search stdout should be json array: {exc}", out, err)
     if not isinstance(arr, list):
         return fail("search should emit json array", out, err)
+    # Scores must be non-increasing for exact search ranking.
+    for i in range(1, len(arr)):
+        if arr[i - 1]["score"] < arr[i]["score"]:
+            return fail("search scores are not sorted descending", out, err)
+
+    # Insert tie-case records and verify deterministic tie-break by embedding_id ascending.
+    tie_vec = vec_const_csv(1.0)
+    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "100", "--vec", tie_vec], root)
+    if code != 0:
+        return fail("insert tie record 100 should succeed", out, err)
+    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "101", "--vec", tie_vec], root)
+    if code != 0:
+        return fail("insert tie record 101 should succeed", out, err)
+    zero_query = vec_const_csv(0.0)
+    code, out, err = run([str(cli), "search", "--path", str(data_dir), "--vec", zero_query, "--topk", "5"], root)
+    if code != 0:
+        return fail("zero-query search should succeed", out, err)
+    arr = parse_json(out)
+    if len(arr) < 5:
+        return fail("zero-query search should return at least 5 rows", out, err)
+    # All scores are ties at zero -> must sort by embedding_id ascending.
+    ids = [row["embedding_id"] for row in arr]
+    if ids != sorted(ids):
+        return fail("tie-break ordering should be embedding_id ascending", out, err)
 
     code, out, err = run([str(cli), "delete", "--path", str(data_dir), "--id", "1"], root)
     if code != 0:

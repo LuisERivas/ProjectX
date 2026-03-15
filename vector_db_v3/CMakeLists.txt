@@ -72,6 +72,11 @@ add_executable(vectordb_v3_durability_corruption_tests
 )
 target_link_libraries(vectordb_v3_durability_corruption_tests PRIVATE vectordb_v3)
 
+add_executable(vectordb_v3_exact_search_tests
+    tests/test_exact_search.cpp
+)
+target_link_libraries(vectordb_v3_exact_search_tests PRIVATE vectordb_v3)
+
 enable_testing()
 add_test(NAME vectordb_v3_tests COMMAND vectordb_v3_tests)
 add_test(NAME vectordb_v3_codec_primitives_tests COMMAND vectordb_v3_codec_primitives_tests)
@@ -81,6 +86,7 @@ add_test(NAME vectordb_v3_durability_wal_tests COMMAND vectordb_v3_durability_wa
 add_test(NAME vectordb_v3_durability_checkpoint_tests COMMAND vectordb_v3_durability_checkpoint_tests)
 add_test(NAME vectordb_v3_durability_replay_crash_tests COMMAND vectordb_v3_durability_replay_crash_tests)
 add_test(NAME vectordb_v3_durability_corruption_tests COMMAND vectordb_v3_durability_corruption_tests)
+add_test(NAME vectordb_v3_exact_search_tests COMMAND vectordb_v3_exact_search_tests)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

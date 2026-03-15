@@ -12,6 +12,7 @@
 #include <iostream>
 #include <iomanip>
 #include <map>
+#include <limits>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -605,9 +606,42 @@ std::optional<Record> VectorStore::get(std::uint64_t embedding_id) const {
 }
 
 std::vector<SearchResult> VectorStore::search_exact(const std::vector<float>& query, std::size_t top_k) const {
-    (void)query;
-    (void)top_k;
-    return {};
+    if (query.size() != kVectorDim || top_k == 0 || impl_->rows.empty()) {
+        return {};
+    }
+
+    std::vector<SearchResult> out;
+    out.reserve(impl_->rows.size());
+    for (const auto& kv : impl_->rows) {
+        const std::uint64_t embedding_id = kv.first;
+        const auto& row = kv.second;
+        if (row.vector.size() != kVectorDim) {
+            continue;
+        }
+        double score = 0.0;
+        for (std::size_t i = 0; i < kVectorDim; ++i) {
+            score += static_cast<double>(query[i]) * static_cast<double>(row.vector[i]);
+        }
+        if (!std::isfinite(score)) {
+            score = -std::numeric_limits<double>::infinity();
+        }
+        out.push_back(SearchResult{embedding_id, score});
+    }
+
+    std::sort(out.begin(), out.end(), [](const SearchResult& a, const SearchResult& b) {
+        if (a.score > b.score) {
+            return true;
+        }
+        if (a.score < b.score) {
+            return false;
+        }
+        return a.embedding_id < b.embedding_id;
+    });
+
+    if (top_k < out.size()) {
+        out.resize(top_k);
+    }
+    return out;
 }
 
 Stats VectorStore::stats() const {
