@@ -102,6 +102,16 @@ add_executable(vectordb_v3_final_layer_eligibility_reconciliation_tests
 )
 target_link_libraries(vectordb_v3_final_layer_eligibility_reconciliation_tests PRIVATE vectordb_v3)
 
+add_executable(vectordb_v3_compliance_pass_tests
+    tests/test_compliance_pass.cpp
+)
+target_link_libraries(vectordb_v3_compliance_pass_tests PRIVATE vectordb_v3)
+
+add_executable(vectordb_v3_compliance_fail_fast_tests
+    tests/test_compliance_fail_fast.cpp
+)
+target_link_libraries(vectordb_v3_compliance_fail_fast_tests PRIVATE vectordb_v3)
+
 enable_testing()
 add_test(NAME vectordb_v3_tests COMMAND vectordb_v3_tests)
 add_test(NAME vectordb_v3_codec_primitives_tests COMMAND vectordb_v3_codec_primitives_tests)
@@ -119,6 +129,8 @@ add_test(NAME vectordb_v3_final_layer_artifacts_tests COMMAND vectordb_v3_final_
 add_test(
     NAME vectordb_v3_final_layer_eligibility_reconciliation_tests
     COMMAND vectordb_v3_final_layer_eligibility_reconciliation_tests)
+add_test(NAME vectordb_v3_compliance_pass_tests COMMAND vectordb_v3_compliance_pass_tests)
+add_test(NAME vectordb_v3_compliance_fail_fast_tests COMMAND vectordb_v3_compliance_fail_fast_tests)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

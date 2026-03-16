@@ -4,11 +4,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import os
 from pathlib import Path
 
 
-def run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
-    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=env)
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -26,17 +27,27 @@ def main() -> int:
     if data_dir.exists():
         shutil.rmtree(data_dir)
 
-    code, out, err = run([str(cli), "init", "--path", str(data_dir)], root)
+    env_pass = dict(os.environ)
+    env_pass["VECTOR_DB_V3_COMPLIANCE_PROFILE"] = "pass"
+
+    code, out, err = run([str(cli), "init", "--path", str(data_dir)], root, env=env_pass)
     if code != 0:
         print(out)
         print(err, file=sys.stderr)
         return 1
-    code, out, err = run([str(cli), "stats", "--path", str(data_dir)], root)
+    code, out, err = run([str(cli), "stats", "--path", str(data_dir)], root, env=env_pass)
     if code != 0:
         print(out)
         print(err, file=sys.stderr)
         return 1
-    code, out, err = run([str(cli), "unknown-cmd", "--path", str(data_dir)], root)
+    code, out, err = run([str(cli), "cluster-stats", "--path", str(data_dir)], root, env=env_pass)
+    if code != 0 or "\"compliance_status\"" not in out:
+        print("error: cluster-stats should include compliance_status", file=sys.stderr)
+        print(out)
+        print(err, file=sys.stderr)
+        return 1
+
+    code, out, err = run([str(cli), "unknown-cmd", "--path", str(data_dir)], root, env=env_pass)
     if code != 2:
         print("error: unknown command should return exit code 2", file=sys.stderr)
         print(out)

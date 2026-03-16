@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -8,8 +9,8 @@ import tempfile
 from pathlib import Path
 
 
-def run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
-    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=env)
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -66,7 +67,10 @@ def main() -> int:
     if data_dir.exists():
         shutil.rmtree(data_dir)
 
-    code, out, err = run([str(cli), "init", "--path", str(data_dir)], root)
+    env_pass = dict(os.environ)
+    env_pass["VECTOR_DB_V3_COMPLIANCE_PROFILE"] = "pass"
+
+    code, out, err = run([str(cli), "init", "--path", str(data_dir)], root, env=env_pass)
     if code != 0:
         return fail("init should succeed", out, err)
     try:
@@ -76,14 +80,14 @@ def main() -> int:
     if payload.get("status") != "ok" or payload.get("command") != "init":
         return fail("init json payload mismatch", out, err)
 
-    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "1", "--vec", vec_csv(1.0)], root)
+    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "1", "--vec", vec_csv(1.0)], root, env=env_pass)
     if code != 0:
         return fail("insert should succeed", out, err)
     payload = parse_json(out)
     if payload.get("command") != "insert" or payload.get("embedding_id") != 1:
         return fail("insert json payload mismatch", out, err)
 
-    code, out, err = run([str(cli), "get", "--path", str(data_dir), "--id", "1"], root)
+    code, out, err = run([str(cli), "get", "--path", str(data_dir), "--id", "1"], root, env=env_pass)
     if code != 0:
         return fail("get should succeed", out, err)
     payload = parse_json(out)
@@ -97,6 +101,7 @@ def main() -> int:
     code, out, err = run(
         [str(cli), "bulk-insert", "--path", str(data_dir), "--input", str(jsonl), "--batch-size", "1"],
         root,
+        env=env_pass,
     )
     if code != 0:
         return fail("bulk-insert should succeed", out, err)
@@ -104,7 +109,7 @@ def main() -> int:
     if payload.get("inserted") != 2:
         return fail("bulk-insert inserted count mismatch", out, err)
 
-    code, out, err = run([str(cli), "search", "--path", str(data_dir), "--vec", vec_csv(1.0), "--topk", "2"], root)
+    code, out, err = run([str(cli), "search", "--path", str(data_dir), "--vec", vec_csv(1.0), "--topk", "2"], root, env=env_pass)
     if code != 0:
         return fail("search should succeed", out, err)
     try:
@@ -120,14 +125,14 @@ def main() -> int:
 
     # Insert tie-case records and verify deterministic tie-break by embedding_id ascending.
     tie_vec = vec_const_csv(1.0)
-    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "100", "--vec", tie_vec], root)
+    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "100", "--vec", tie_vec], root, env=env_pass)
     if code != 0:
         return fail("insert tie record 100 should succeed", out, err)
-    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "101", "--vec", tie_vec], root)
+    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "101", "--vec", tie_vec], root, env=env_pass)
     if code != 0:
         return fail("insert tie record 101 should succeed", out, err)
     zero_query = vec_const_csv(0.0)
-    code, out, err = run([str(cli), "search", "--path", str(data_dir), "--vec", zero_query, "--topk", "5"], root)
+    code, out, err = run([str(cli), "search", "--path", str(data_dir), "--vec", zero_query, "--topk", "5"], root, env=env_pass)
     if code != 0:
         return fail("zero-query search should succeed", out, err)
     arr = parse_json(out)
@@ -138,55 +143,85 @@ def main() -> int:
     if ids != sorted(ids):
         return fail("tie-break ordering should be embedding_id ascending", out, err)
 
-    code, out, err = run([str(cli), "delete", "--path", str(data_dir), "--id", "1"], root)
+    code, out, err = run([str(cli), "delete", "--path", str(data_dir), "--id", "1"], root, env=env_pass)
     if code != 0:
         return fail("delete should succeed", out, err)
     payload = parse_json(out)
     if payload.get("command") != "delete" or payload.get("embedding_id") != 1:
         return fail("delete payload mismatch", out, err)
 
-    code, out, err = run([str(cli), "checkpoint", "--path", str(data_dir)], root)
+    code, out, err = run([str(cli), "checkpoint", "--path", str(data_dir)], root, env=env_pass)
     if code != 0:
         return fail("checkpoint should succeed", out, err)
     payload = parse_json(out)
     if payload.get("command") != "checkpoint":
         return fail("checkpoint payload mismatch", out, err)
 
-    code, out, err = run([str(cli), "build-top-clusters", "--path", str(data_dir), "--seed", "7"], root)
+    code, out, err = run([str(cli), "build-top-clusters", "--path", str(data_dir), "--seed", "7"], root, env=env_pass)
     if code != 0:
         return fail("build-top-clusters should succeed", out, err)
     payload = parse_final_command_json(out)
     if payload.get("status") != "ok" or payload.get("command") != "build-top":
         return fail("build-top-clusters command payload mismatch", out, err)
 
-    code, out, err = run([str(cli), "build-mid-layer-clusters", "--path", str(data_dir), "--seed", "7"], root)
+    code, out, err = run([str(cli), "build-mid-layer-clusters", "--path", str(data_dir), "--seed", "7"], root, env=env_pass)
     if code != 0:
         return fail("build-mid-layer-clusters should succeed", out, err)
     payload = parse_final_command_json(out)
     if payload.get("status") != "ok" or payload.get("command") != "build-mid":
         return fail("build-mid-layer-clusters command payload mismatch", out, err)
 
-    code, out, err = run([str(cli), "build-lower-layer-clusters", "--path", str(data_dir), "--seed", "7"], root)
+    code, out, err = run([str(cli), "build-lower-layer-clusters", "--path", str(data_dir), "--seed", "7"], root, env=env_pass)
     if code != 0:
         return fail("build-lower-layer-clusters should succeed", out, err)
     payload = parse_final_command_json(out)
     if payload.get("status") != "ok" or payload.get("command") != "build-lower":
         return fail("build-lower-layer-clusters command payload mismatch", out, err)
 
-    code, out, err = run([str(cli), "build-final-layer-clusters", "--path", str(data_dir), "--seed", "7"], root)
+    code, out, err = run([str(cli), "build-final-layer-clusters", "--path", str(data_dir), "--seed", "7"], root, env=env_pass)
     if code != 0:
         return fail("build-final-layer-clusters should succeed", out, err)
     payload = parse_final_command_json(out)
     if payload.get("status") != "ok" or payload.get("command") != "build-final":
         return fail("build-final-layer-clusters command payload mismatch", out, err)
 
-    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "4", "--vec", "1,2,3"], root)
+    code, out, err = run([str(cli), "cluster-stats", "--path", str(data_dir)], root, env=env_pass)
+    if code != 0:
+        return fail("cluster-stats should succeed", out, err)
+    payload = parse_json(out)
+    required = [
+        "cuda_required",
+        "cuda_enabled",
+        "tensor_core_required",
+        "tensor_core_active",
+        "gpu_arch_class",
+        "kernel_backend_path",
+        "hot_path_language",
+        "compliance_status",
+        "fallback_reason",
+        "non_compliance_stage",
+    ]
+    for key in required:
+        if key not in payload:
+            return fail(f"cluster-stats missing compliance field: {key}", out, err)
+    if payload.get("compliance_status") != "pass":
+        return fail("cluster-stats compliance_status should be pass under pass profile", out, err)
+
+    env_fail = dict(os.environ)
+    env_fail["VECTOR_DB_V3_FORCE_COMPLIANCE_FAIL"] = "1"
+    code, out, err = run([str(cli), "build-top-clusters", "--path", str(data_dir), "--seed", "7"], root, env=env_fail)
+    if code != 1:
+        return fail("forced compliance failure should return 1", out, err)
+    if not err.startswith("error: "):
+        return fail("forced compliance failure stderr format", out, err)
+
+    code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "4", "--vec", "1,2,3"], root, env=env_pass)
     if code != 2:
         return fail("bad vector should be usage error (2)", out, err)
     if not err.startswith("error: "):
         return fail("bad vector error format", out, err)
 
-    code, out, err = run([str(cli), "unknown-cmd", "--path", str(data_dir)], root)
+    code, out, err = run([str(cli), "unknown-cmd", "--path", str(data_dir)], root, env=env_pass)
     if code != 2:
         return fail("unknown command should return 2", out, err)
 

@@ -2069,20 +2069,17 @@ WalStats VectorStore::wal_stats() const {
 ClusterStats VectorStore::cluster_stats() const {
     ClusterStats out{};
     out.available = false;
-    out.compliance_status = "fail";
-#if VECTOR_DB_V3_CUDA_ENABLED
-    out.cuda_enabled = true;
-    out.tensor_core_active = true;
-    out.gpu_arch_class = "ampere";
-    out.kernel_backend_path = "cuda_scaffold";
-    out.compliance_status = "pass";
-#else
-    out.cuda_enabled = false;
-    out.tensor_core_active = false;
-    out.gpu_arch_class = "unknown";
-    out.kernel_backend_path = "none";
-    out.fallback_reason = "scaffold_no_cuda_runtime";
-#endif
+    const StageCompliance compliance = evaluate_stage_compliance("top");
+    out.cuda_required = compliance.cuda_required;
+    out.cuda_enabled = compliance.cuda_enabled;
+    out.tensor_core_required = compliance.tensor_core_required;
+    out.tensor_core_active = compliance.tensor_core_active;
+    out.gpu_arch_class = compliance.gpu_arch_class;
+    out.kernel_backend_path = compliance.kernel_backend_path;
+    out.hot_path_language = compliance.hot_path_language;
+    out.compliance_status = compliance.compliance_status;
+    out.fallback_reason = compliance.fallback_reason;
+    out.non_compliance_stage = compliance.non_compliance_stage;
     return out;
 }
 
@@ -2103,6 +2100,126 @@ bool env_truthy(const char* value) {
         return static_cast<char>(std::tolower(c));
     });
     return s == "1" || s == "true" || s == "yes" || s == "on";
+}
+
+struct StageCompliance {
+    bool cuda_required = true;
+    bool cuda_enabled = false;
+    bool tensor_core_required = true;
+    bool tensor_core_active = false;
+    std::string gpu_arch_class = "unknown";
+    std::string kernel_backend_path = "none";
+    std::string hot_path_language = "cpp_cuda";
+    std::string compliance_status = "fail";
+    std::string fallback_reason;
+    std::string non_compliance_stage;
+    std::string error_code;
+    std::string error_message;
+};
+
+std::string env_or_default(const char* value, const std::string& fallback) {
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return std::string(value);
+}
+
+bool stage_is_compliance_required(const std::string& stage_id) {
+    return stage_id == "top" || stage_id == "mid" || stage_id == "lower" || stage_id == "final";
+}
+
+StageCompliance evaluate_stage_compliance(const std::string& stage_id) {
+    StageCompliance c{};
+    c.cuda_required = stage_is_compliance_required(stage_id);
+    c.tensor_core_required = c.cuda_required;
+    c.hot_path_language = env_or_default(std::getenv("VECTOR_DB_V3_HOT_PATH_LANGUAGE"), "cpp_cuda");
+#if VECTOR_DB_V3_CUDA_ENABLED
+    c.cuda_enabled = true;
+    c.kernel_backend_path = "cuda_scaffold";
+    c.gpu_arch_class = "ampere";
+    c.tensor_core_active = true;
+#else
+    c.cuda_enabled = false;
+    c.kernel_backend_path = "none";
+    c.gpu_arch_class = "unknown";
+    c.tensor_core_active = false;
+#endif
+
+    if (const char* override_cuda = std::getenv("VECTOR_DB_V3_CUDA_ENABLED_OVERRIDE")) {
+        c.cuda_enabled = env_truthy(override_cuda);
+    }
+    if (const char* override_tensor = std::getenv("VECTOR_DB_V3_TENSOR_CORE_ACTIVE_OVERRIDE")) {
+        c.tensor_core_active = env_truthy(override_tensor);
+    }
+    c.gpu_arch_class = env_or_default(std::getenv("VECTOR_DB_V3_GPU_ARCH_CLASS_OVERRIDE"), c.gpu_arch_class);
+    c.kernel_backend_path = env_or_default(std::getenv("VECTOR_DB_V3_KERNEL_BACKEND_PATH_OVERRIDE"), c.kernel_backend_path);
+
+    const std::string profile = env_or_default(std::getenv("VECTOR_DB_V3_COMPLIANCE_PROFILE"), "auto");
+    if (profile == "pass") {
+        c.compliance_status = "pass";
+        c.cuda_enabled = true;
+        c.tensor_core_active = true;
+        c.gpu_arch_class = "ampere";
+        c.kernel_backend_path = "cuda_scaffold";
+        c.hot_path_language = "cpp_cuda";
+        c.fallback_reason.clear();
+        c.error_code.clear();
+        c.error_message.clear();
+        return c;
+    }
+    if (profile == "fail") {
+        c.compliance_status = "fail";
+        c.fallback_reason = "profile_forced_fail";
+        c.non_compliance_stage = stage_id;
+        c.error_code = "compliance_fail_fast";
+        c.error_message = "compliance profile forced fail";
+        return c;
+    }
+
+    if (!c.cuda_required) {
+        c.compliance_status = "pass";
+        return c;
+    }
+    if (!c.cuda_enabled) {
+        c.fallback_reason = "cuda_required_but_disabled";
+    } else if (c.gpu_arch_class != "ampere") {
+        c.fallback_reason = "gpu_arch_not_ampere";
+    } else if (c.tensor_core_required && !c.tensor_core_active) {
+        c.fallback_reason = "tensor_core_required_but_inactive";
+    } else if (c.hot_path_language != "cpp_cuda") {
+        c.fallback_reason = "hot_path_language_not_cpp_cuda";
+    }
+
+    if (!c.fallback_reason.empty()) {
+        c.compliance_status = "fail";
+        c.non_compliance_stage = stage_id;
+        c.error_code = "compliance_fail_fast";
+        c.error_message = c.fallback_reason;
+    } else {
+        c.compliance_status = "pass";
+    }
+    return c;
+}
+
+void append_compliance_fields(
+    std::vector<std::pair<std::string, std::string>>* extra,
+    const StageCompliance& c,
+    bool include_fail_only_fields) {
+    if (extra == nullptr) {
+        return;
+    }
+    extra->push_back({"cuda_required", c.cuda_required ? "true" : "false"});
+    extra->push_back({"cuda_enabled", c.cuda_enabled ? "true" : "false"});
+    extra->push_back({"tensor_core_required", c.tensor_core_required ? "true" : "false"});
+    extra->push_back({"tensor_core_active", c.tensor_core_active ? "true" : "false"});
+    extra->push_back({"gpu_arch_class", c.gpu_arch_class});
+    extra->push_back({"kernel_backend_path", c.kernel_backend_path});
+    extra->push_back({"hot_path_language", c.hot_path_language});
+    extra->push_back({"compliance_status", c.compliance_status});
+    if (include_fail_only_fields || c.compliance_status == "fail") {
+        extra->push_back({"fallback_reason", c.fallback_reason.empty() ? "none" : c.fallback_reason});
+        extra->push_back({"non_compliance_stage", c.non_compliance_stage.empty() ? "none" : c.non_compliance_stage});
+    }
 }
 
 Status run_stage_with_telemetry(
@@ -2191,6 +2308,22 @@ Status run_stage_with_telemetry(
     const bool force_skip = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_SKIP"));
     const bool force_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_FAIL"));
     const bool force_compliance_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_COMPLIANCE_FAIL"));
+    StageCompliance compliance = evaluate_stage_compliance(stage_id);
+
+    std::vector<std::pair<std::string, std::string>> compliance_extra;
+    append_compliance_fields(&compliance_extra, compliance, true);
+    telemetry::emit_event(
+        std::cout,
+        telemetry::EventType::ComplianceCheck,
+        stage_id,
+        stage_name,
+        compliance.compliance_status,
+        stage_started_ts,
+        std::nullopt,
+        0.0,
+        pipeline_elapsed_now_ms(),
+        "running",
+        compliance_extra);
 
     std::string final_status = "completed";
     telemetry::EventType terminal_event_type = telemetry::EventType::StageEnd;
@@ -2202,20 +2335,34 @@ Status run_stage_with_telemetry(
     if (force_skip) {
         final_status = "skipped";
         terminal_event_type = telemetry::EventType::StageSkip;
+        append_compliance_fields(&terminal_extra, compliance, false);
     } else if (force_compliance_fail) {
+        compliance.compliance_status = "fail";
+        compliance.fallback_reason = "forced_compliance_failure";
+        compliance.non_compliance_stage = stage_id;
+        compliance.error_code = "compliance_fail_fast";
+        compliance.error_message = "forced compliance failure";
         final_status = "failed";
         terminal_event_type = telemetry::EventType::StageFail;
         stage_status = Status::Error("forced compliance failure");
-        terminal_extra.push_back({"error_code", "compliance_fail_fast"});
-        terminal_extra.push_back({"error_message", "forced compliance failure"});
-        terminal_extra.push_back({"non_compliance_stage", stage_id});
-        terminal_extra.push_back({"compliance_status", "fail"});
+        terminal_extra.push_back({"error_code", compliance.error_code});
+        terminal_extra.push_back({"error_message", compliance.error_message});
+        append_compliance_fields(&terminal_extra, compliance, true);
+    } else if (compliance.compliance_status == "fail") {
+        final_status = "failed";
+        terminal_event_type = telemetry::EventType::StageFail;
+        const std::string reason = compliance.fallback_reason.empty() ? "unknown_reason" : compliance.fallback_reason;
+        stage_status = Status::Error("compliance fail-fast: " + reason);
+        terminal_extra.push_back({"error_code", compliance.error_code.empty() ? "compliance_fail_fast" : compliance.error_code});
+        terminal_extra.push_back({"error_message", compliance.error_message.empty() ? reason : compliance.error_message});
+        append_compliance_fields(&terminal_extra, compliance, true);
     } else if (force_fail) {
         final_status = "failed";
         terminal_event_type = telemetry::EventType::StageFail;
         stage_status = Status::Error("forced runtime failure");
         terminal_extra.push_back({"error_code", "runtime_error"});
         terminal_extra.push_back({"error_message", "forced runtime failure"});
+        append_compliance_fields(&terminal_extra, compliance, false);
     } else {
         if (stage_id == "top") {
             auto emit_step = [&](telemetry::EventType step_type,
@@ -2340,7 +2487,7 @@ Status run_stage_with_telemetry(
         }
         terminal_extra.push_back({"records_processed", std::to_string(records_processed)});
         terminal_extra.push_back({"chosen_k", std::to_string(chosen_k)});
-        terminal_extra.push_back({"compliance_status", stage_status.ok ? "pass" : "fail"});
+        append_compliance_fields(&terminal_extra, compliance, false);
     }
 
     const auto stage_end_steady = steady_clock::now();
