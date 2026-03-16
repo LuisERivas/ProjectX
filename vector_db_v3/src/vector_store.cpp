@@ -1030,6 +1030,171 @@ Status emit_mid_layer_artifacts(
     return Status::Ok();
 }
 
+Status emit_lower_layer_artifacts(
+    const fs::path& data_dir,
+    const std::map<std::uint64_t, Record>& rows,
+    std::uint32_t seed,
+    const std::function<void(telemetry::EventType, const std::string&, const std::vector<std::pair<std::string, std::string>>&)>& emit_step,
+    std::uint32_t* chosen_k_out,
+    std::size_t* records_processed_out) {
+    if (chosen_k_out == nullptr || records_processed_out == nullptr) {
+        return Status::Error("lower clustering: invalid output pointers");
+    }
+    *chosen_k_out = 0U;
+    *records_processed_out = 0U;
+
+    constexpr std::uint32_t kDefaultLowerGateThreshold = 32U;
+    std::uint32_t gate_threshold = kDefaultLowerGateThreshold;
+    if (const char* env = std::getenv("VECTOR_DB_V3_LOWER_GATE_THRESHOLD")) {
+        try {
+            const long long parsed = std::stoll(std::string(env));
+            if (parsed > 0 && parsed <= static_cast<long long>(std::numeric_limits<std::uint32_t>::max())) {
+                gate_threshold = static_cast<std::uint32_t>(parsed);
+            }
+        } catch (...) {
+            // Keep default threshold on parse errors.
+        }
+    }
+
+    std::vector<codec::MidAssignmentRow> mid_assignments;
+    const Status read_mid = codec::read_mid_assignments_file(paths::mid_layer_assignments_bin(data_dir), &mid_assignments);
+    if (!read_mid.ok) {
+        return Status::Error("lower clustering: failed reading mid assignments; run build-mid-layer-clusters first");
+    }
+    const Status mid_valid = codec::validate_mid_assignments(mid_assignments);
+    if (!mid_valid.ok) {
+        return Status::Error("lower clustering: invalid mid assignments input: " + mid_valid.message);
+    }
+
+    struct BranchKey {
+        std::uint32_t parent_top = 0;
+        std::uint32_t mid_centroid = 0;
+        bool operator<(const BranchKey& other) const {
+            if (parent_top != other.parent_top) {
+                return parent_top < other.parent_top;
+            }
+            return mid_centroid < other.mid_centroid;
+        }
+    };
+    std::map<BranchKey, std::vector<std::uint64_t>> branch_embedding_ids;
+    for (const auto& row : mid_assignments) {
+        branch_embedding_ids[BranchKey{row.parent_top_centroid_numeric_id, row.mid_centroid_numeric_id}]
+            .push_back(row.embedding_id);
+    }
+
+    for (const auto& branch : branch_embedding_ids) {
+        if (branch.second.empty()) {
+            return Status::Error("lower clustering: encountered empty branch dataset");
+        }
+    }
+
+    std::size_t stop_count = 0U;
+    std::size_t continue_count = 0U;
+    std::size_t processed_total = 0U;
+    std::ostringstream gate_rows_json;
+    gate_rows_json << "[";
+    bool first_gate_row = true;
+    std::uint32_t branch_index = 0U;
+    for (const auto& branch : branch_embedding_ids) {
+        const std::string job_id = "lower-branch-" + std::to_string(branch_index++);
+        const std::size_t dataset_size = branch.second.size();
+        for (const auto embedding_id : branch.second) {
+            if (rows.find(embedding_id) == rows.end()) {
+                return Status::Error("lower clustering: mid assignment references missing live embedding_id");
+            }
+        }
+
+        emit_step(
+            telemetry::EventType::StageProgress,
+            "running",
+            {
+                {"centroid_id", std::to_string(branch.first.mid_centroid)},
+                {"job_id", job_id},
+                {"job_phase", "start"},
+                {"dataset_size", std::to_string(dataset_size)},
+            });
+
+        const codec::GateDecision gate_decision =
+            (dataset_size <= gate_threshold) ? codec::GateDecision::Stop : codec::GateDecision::Continue;
+        if (gate_decision == codec::GateDecision::Stop) {
+            ++stop_count;
+        } else {
+            ++continue_count;
+        }
+        processed_total += dataset_size;
+
+        emit_step(
+            telemetry::EventType::StageProgress,
+            "running",
+            {
+                {"centroid_id", std::to_string(branch.first.mid_centroid)},
+                {"job_id", job_id},
+                {"job_phase", "end"},
+                {"dataset_size", std::to_string(dataset_size)},
+                {"gate_decision", gate_decision == codec::GateDecision::Stop ? "stop" : "continue"},
+                {"gate_threshold", std::to_string(gate_threshold)},
+            });
+
+        if (!first_gate_row) {
+            gate_rows_json << ",";
+        }
+        first_gate_row = false;
+        gate_rows_json << "{";
+        gate_rows_json << "\"parent_top_centroid_numeric_id\":" << branch.first.parent_top << ",";
+        gate_rows_json << "\"mid_centroid_numeric_id\":" << branch.first.mid_centroid << ",";
+        gate_rows_json << "\"centroid_id\":" << branch.first.mid_centroid << ",";
+        gate_rows_json << "\"job_id\":\"" << escape_json_string(job_id) << "\",";
+        gate_rows_json << "\"dataset_size\":" << dataset_size << ",";
+        gate_rows_json << "\"gate_decision\":\"" << (gate_decision == codec::GateDecision::Stop ? "stop" : "continue") << "\"";
+        gate_rows_json << "}";
+    }
+    gate_rows_json << "]";
+
+    const fs::path lower_dir = paths::lower_layer_dir(data_dir);
+    fs::create_directories(lower_dir);
+
+    std::ostringstream payload_json;
+    payload_json << "{";
+    payload_json << "\"stage\":\"lower\",";
+    payload_json << "\"schema_version\":1,";
+    payload_json << "\"artifact_path\":\"lower_layer_clustering/LOWER_LAYER_CLUSTERING.bin\",";
+    payload_json << "\"artifact_format\":\"LOWER_LAYER_CLUSTERING.bin.v1\",";
+    payload_json << "\"endianness\":\"little\",";
+    payload_json << "\"record_size_bytes\":0,";
+    payload_json << "\"record_count\":" << branch_embedding_ids.size() << ",";
+    payload_json << "\"gate_threshold\":" << gate_threshold << ",";
+    payload_json << "\"rows_processed_total\":" << processed_total << ",";
+    payload_json << "\"branches_continue\":" << continue_count << ",";
+    payload_json << "\"branches_stop\":" << stop_count << ",";
+    payload_json << "\"gate_outcomes\":" << gate_rows_json.str();
+    payload_json << "}";
+
+    const std::string payload = payload_json.str();
+    Status st = codec::write_cluster_manifest_file(
+        paths::lower_layer_clustering_bin(data_dir),
+        std::vector<std::uint8_t>(payload.begin(), payload.end()));
+    if (!st.ok) {
+        return st;
+    }
+
+    std::vector<std::uint8_t> lower_bytes;
+    codec::read_file_bytes(paths::lower_layer_clustering_bin(data_dir), &lower_bytes);
+    emit_step(
+        telemetry::EventType::ArtifactWrite,
+        "completed",
+        {
+            {"artifact_path", paths::lower_layer_clustering_bin(data_dir).generic_string()},
+            {"rows_written", std::to_string(branch_embedding_ids.size())},
+            {"bytes_written", std::to_string(lower_bytes.size())},
+            {"status", "ok"},
+        });
+
+    *chosen_k_out = static_cast<std::uint32_t>(continue_count + stop_count);
+    *records_processed_out = processed_total;
+    (void)seed;
+    return Status::Ok();
+}
+
 }  // namespace
 
 struct VectorStore::Impl {
@@ -1493,6 +1658,36 @@ Status run_stage_with_telemetry(
                 final_status = "failed";
                 terminal_event_type = telemetry::EventType::StageFail;
                 terminal_extra.push_back({"error_code", "mid_layer_build_failed"});
+                terminal_extra.push_back({"error_message", stage_status.message});
+            }
+        } else if (stage_id == "lower") {
+            auto emit_step = [&](telemetry::EventType step_type,
+                                 const std::string& step_status,
+                                 const std::vector<std::pair<std::string, std::string>>& extra) {
+                telemetry::emit_event(
+                    std::cout,
+                    step_type,
+                    stage_id,
+                    stage_name,
+                    step_status,
+                    stage_started_ts,
+                    std::nullopt,
+                    0.0,
+                    pipeline_elapsed_now_ms(),
+                    "running",
+                    extra);
+            };
+            stage_status = emit_lower_layer_artifacts(
+                data_dir,
+                rows,
+                seed,
+                emit_step,
+                &chosen_k,
+                &records_processed);
+            if (!stage_status.ok) {
+                final_status = "failed";
+                terminal_event_type = telemetry::EventType::StageFail;
+                terminal_extra.push_back({"error_code", "lower_layer_build_failed"});
                 terminal_extra.push_back({"error_message", stage_status.message});
             }
         }

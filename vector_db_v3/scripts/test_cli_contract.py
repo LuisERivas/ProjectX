@@ -166,6 +166,13 @@ def main() -> int:
     if payload.get("status") != "ok" or payload.get("command") != "build-mid":
         return fail("build-mid-layer-clusters command payload mismatch", out, err)
 
+    code, out, err = run([str(cli), "build-lower-layer-clusters", "--path", str(data_dir), "--seed", "7"], root)
+    if code != 0:
+        return fail("build-lower-layer-clusters should succeed", out, err)
+    payload = parse_final_command_json(out)
+    if payload.get("status") != "ok" or payload.get("command") != "build-lower":
+        return fail("build-lower-layer-clusters command payload mismatch", out, err)
+
     code, out, err = run([str(cli), "insert", "--path", str(data_dir), "--id", "4", "--vec", "1,2,3"], root)
     if code != 2:
         return fail("bad vector should be usage error (2)", out, err)

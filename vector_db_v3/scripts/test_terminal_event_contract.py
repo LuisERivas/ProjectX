@@ -135,6 +135,27 @@ def assert_mid_stage_sub_events(events: list[dict]) -> None:
             raise AssertionError("mid stage_progress events must include centroid_id and job_id")
 
 
+def assert_lower_stage_sub_events(events: list[dict]) -> None:
+    artifact_writes = [e for e in events if e.get("event_type") == "artifact_write"]
+    observed = False
+    for e in artifact_writes:
+        path = str(e.get("artifact_path", ""))
+        if path.endswith("lower_layer_clustering/LOWER_LAYER_CLUSTERING.bin"):
+            observed = True
+            break
+    if not observed:
+        raise AssertionError("lower artifact_write coverage mismatch")
+
+    progress_events = [e for e in events if e.get("event_type") == "stage_progress"]
+    if not progress_events:
+        raise AssertionError("lower stage_progress events missing")
+    for event in progress_events:
+        if "centroid_id" not in event or "job_id" not in event:
+            raise AssertionError("lower stage_progress events must include centroid_id and job_id")
+        if event.get("job_phase") == "end" and "gate_decision" not in event:
+            raise AssertionError("lower stage end progress must include gate_decision")
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     build_dir = root / "build"
@@ -204,6 +225,21 @@ def main() -> int:
         return fail(f"mid run telemetry contract mismatch: {exc}", out, err)
     if not cmd or cmd.get("status") != "ok":
         return fail("final command JSON missing for successful mid build stage", out, err)
+
+    # Lower-stage success path.
+    code, out, err = run([str(cli), "build-lower-layer-clusters", "--path", str(data_dir)], root)
+    if code != 0:
+        return fail("build-lower-layer-clusters should succeed", out, err)
+    events, cmd = parse_lines(out)
+    try:
+        assert_exact_lifecycle(events, "stage_end")
+        assert_common_fields(events)
+        assert_monotonic_pipeline_elapsed(events)
+        assert_lower_stage_sub_events(events)
+    except Exception as exc:
+        return fail(f"lower run telemetry contract mismatch: {exc}", out, err)
+    if not cmd or cmd.get("status") != "ok":
+        return fail("final command JSON missing for successful lower build stage", out, err)
 
     # Forced runtime failure path.
     env_fail = dict(os.environ)
