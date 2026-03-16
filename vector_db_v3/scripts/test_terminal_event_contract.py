@@ -138,17 +138,25 @@ def assert_mid_stage_sub_events(events: list[dict]) -> None:
 def assert_lower_stage_sub_events(events: list[dict]) -> None:
     artifact_writes = [e for e in events if e.get("event_type") == "artifact_write"]
     observed = False
+    rows_written = None
     for e in artifact_writes:
         path = str(e.get("artifact_path", ""))
         if path.endswith("lower_layer_clustering/LOWER_LAYER_CLUSTERING.bin"):
             observed = True
+            try:
+                rows_written = int(e.get("rows_written", 0))
+            except Exception:
+                rows_written = 0
             break
     if not observed:
         raise AssertionError("lower artifact_write coverage mismatch")
 
     progress_events = [e for e in events if e.get("event_type") == "stage_progress"]
     if not progress_events:
-        raise AssertionError("lower stage_progress events missing")
+        # Empty-data lower runs can legitimately have zero branch jobs.
+        if rows_written is None or rows_written > 0:
+            raise AssertionError("lower stage_progress events missing")
+        return
     for event in progress_events:
         if "centroid_id" not in event or "job_id" not in event:
             raise AssertionError("lower stage_progress events must include centroid_id and job_id")

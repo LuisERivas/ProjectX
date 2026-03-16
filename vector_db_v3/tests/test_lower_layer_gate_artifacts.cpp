@@ -2,6 +2,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cstdlib>
 
 #include "vector_db_v3/codec/artifacts.hpp"
 #include "vector_db_v3/paths.hpp"
@@ -35,6 +36,14 @@ std::size_t count_occurrences(const std::string& haystack, const std::string& ne
         pos += needle.size();
     }
     return count;
+}
+
+void set_lower_threshold_env(const char* value) {
+#ifdef _WIN32
+    _putenv_s("VECTOR_DB_V3_LOWER_GATE_THRESHOLD", value);
+#else
+    setenv("VECTOR_DB_V3_LOWER_GATE_THRESHOLD", value, 1);
+#endif
 }
 
 }  // namespace
@@ -71,12 +80,22 @@ int main() {
     ok &= expect(payload_str.find("\"gate_threshold\":") != std::string::npos, "gate threshold present");
     ok &= expect(payload_str.find("\"gate_outcomes\"") != std::string::npos, "gate outcomes present");
     ok &= expect(payload_str.find("\"gate_decision\":\"stop\"") != std::string::npos, "stop outcomes present");
-    ok &= expect(payload_str.find("\"gate_decision\":\"continue\"") != std::string::npos, "continue outcomes present");
 
     const std::size_t stop_count = count_occurrences(payload_str, "\"gate_decision\":\"stop\"");
-    const std::size_t continue_count = count_occurrences(payload_str, "\"gate_decision\":\"continue\"");
     ok &= expect(stop_count > 0U, "stop_count positive");
+
+    set_lower_threshold_env("0");
+    ok &= expect(store.build_lower_layer_clusters(11U).ok, "build_lower_layer_clusters threshold=0");
+    vector_db_v3::codec::CommonHeader hdr2{};
+    std::vector<std::uint8_t> payload2;
+    ok &= expect(
+        vector_db_v3::codec::read_cluster_manifest_file(lower_summary, &hdr2, &payload2).ok,
+        "read lower summary threshold=0");
+    const std::string payload_str2(payload2.begin(), payload2.end());
+    ok &= expect(payload_str2.find("\"gate_decision\":\"continue\"") != std::string::npos, "continue outcomes present");
+    const std::size_t continue_count = count_occurrences(payload_str2, "\"gate_decision\":\"continue\"");
     ok &= expect(continue_count > 0U, "continue_count positive");
+    set_lower_threshold_env("");
 
     ok &= expect(store.close().ok, "close");
     if (!ok) {

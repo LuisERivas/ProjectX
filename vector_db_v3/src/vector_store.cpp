@@ -1048,7 +1048,7 @@ Status emit_lower_layer_artifacts(
     if (const char* env = std::getenv("VECTOR_DB_V3_LOWER_GATE_THRESHOLD")) {
         try {
             const long long parsed = std::stoll(std::string(env));
-            if (parsed > 0 && parsed <= static_cast<long long>(std::numeric_limits<std::uint32_t>::max())) {
+            if (parsed >= 0 && parsed <= static_cast<long long>(std::numeric_limits<std::uint32_t>::max())) {
                 gate_threshold = static_cast<std::uint32_t>(parsed);
             }
         } catch (...) {
