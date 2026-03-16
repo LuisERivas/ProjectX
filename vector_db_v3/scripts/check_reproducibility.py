@@ -60,6 +60,7 @@ def collect_event_fingerprint(stdout: str) -> list[dict]:
         "previous_run_stage_elapsed_ms",
         "stage_elapsed_delta_ms",
         "stage_started_ts",
+        "artifact_path",
     }
     for line in stdout.splitlines():
         text = line.strip()
