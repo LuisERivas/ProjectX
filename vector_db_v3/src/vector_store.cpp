@@ -2066,41 +2066,7 @@ WalStats VectorStore::wal_stats() const {
     return out;
 }
 
-ClusterStats VectorStore::cluster_stats() const {
-    ClusterStats out{};
-    out.available = false;
-    const StageCompliance compliance = evaluate_stage_compliance("top");
-    out.cuda_required = compliance.cuda_required;
-    out.cuda_enabled = compliance.cuda_enabled;
-    out.tensor_core_required = compliance.tensor_core_required;
-    out.tensor_core_active = compliance.tensor_core_active;
-    out.gpu_arch_class = compliance.gpu_arch_class;
-    out.kernel_backend_path = compliance.kernel_backend_path;
-    out.hot_path_language = compliance.hot_path_language;
-    out.compliance_status = compliance.compliance_status;
-    out.fallback_reason = compliance.fallback_reason;
-    out.non_compliance_stage = compliance.non_compliance_stage;
-    return out;
-}
-
-ClusterHealth VectorStore::cluster_health() const {
-    ClusterHealth out{};
-    out.available = true;
-    out.passed = true;
-    out.status = "section2_scaffold";
-    return out;
-}
-
-bool env_truthy(const char* value) {
-    if (value == nullptr) {
-        return false;
-    }
-    std::string s(value);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s == "1" || s == "true" || s == "yes" || s == "on";
-}
+bool env_truthy(const char* value);
 
 struct StageCompliance {
     bool cuda_required = true;
@@ -2220,6 +2186,42 @@ void append_compliance_fields(
         extra->push_back({"fallback_reason", c.fallback_reason.empty() ? "none" : c.fallback_reason});
         extra->push_back({"non_compliance_stage", c.non_compliance_stage.empty() ? "none" : c.non_compliance_stage});
     }
+}
+
+ClusterStats VectorStore::cluster_stats() const {
+    ClusterStats out{};
+    out.available = false;
+    const StageCompliance compliance = evaluate_stage_compliance("top");
+    out.cuda_required = compliance.cuda_required;
+    out.cuda_enabled = compliance.cuda_enabled;
+    out.tensor_core_required = compliance.tensor_core_required;
+    out.tensor_core_active = compliance.tensor_core_active;
+    out.gpu_arch_class = compliance.gpu_arch_class;
+    out.kernel_backend_path = compliance.kernel_backend_path;
+    out.hot_path_language = compliance.hot_path_language;
+    out.compliance_status = compliance.compliance_status;
+    out.fallback_reason = compliance.fallback_reason;
+    out.non_compliance_stage = compliance.non_compliance_stage;
+    return out;
+}
+
+ClusterHealth VectorStore::cluster_health() const {
+    ClusterHealth out{};
+    out.available = true;
+    out.passed = true;
+    out.status = "section2_scaffold";
+    return out;
+}
+
+bool env_truthy(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s == "1" || s == "true" || s == "yes" || s == "on";
 }
 
 Status run_stage_with_telemetry(
