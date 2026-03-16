@@ -601,7 +601,9 @@ Status parse_lower_gate_outcomes(const std::string& payload, std::vector<LowerGa
     }
     out->clear();
     const std::regex row_re(
-        R"(\{"parent_top_centroid_numeric_id":([0-9]+),"mid_centroid_numeric_id":([0-9]+),"centroid_id":([0-9]+),"job_id":"([^"]*)","dataset_size":([0-9]+),"gate_decision":"(stop|continue)"\})");
+        "\\{\"parent_top_centroid_numeric_id\":([0-9]+),\"mid_centroid_numeric_id\":([0-9]+),"
+        "\"centroid_id\":([0-9]+),\"job_id\":\"([^\"]*)\",\"dataset_size\":([0-9]+),"
+        "\"gate_decision\":\"(stop|continue)\"\\}");
     auto it = std::sregex_iterator(payload.begin(), payload.end(), row_re);
     const auto end = std::sregex_iterator();
     for (; it != end; ++it) {
@@ -641,7 +643,8 @@ Status parse_mid_parent_jobs(const std::string& payload, std::vector<MidParentJo
     }
     out->clear();
     const std::regex row_re(
-        R"(\{"centroid_id":([0-9]+),"job_id":"([^"]*)","dataset_size":([0-9]+),"k_min":([0-9]+),"k_max":([0-9]+),"chosen_k":([0-9]+)\})");
+        "\\{\"centroid_id\":([0-9]+),\"job_id\":\"([^\"]*)\",\"dataset_size\":([0-9]+),"
+        "\"k_min\":([0-9]+),\"k_max\":([0-9]+),\"chosen_k\":([0-9]+)\\}");
     auto it = std::sregex_iterator(payload.begin(), payload.end(), row_re);
     const auto end = std::sregex_iterator();
     for (; it != end; ++it) {
