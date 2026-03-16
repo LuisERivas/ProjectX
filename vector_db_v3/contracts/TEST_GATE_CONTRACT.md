@@ -10,7 +10,8 @@ Define mandatory automated gates for M1 readiness.
 - **G2 Durability:** WAL/checkpoint/replay pass crash-recovery scenarios.
 - **G3 Contract Stability:** CLI/API/artifact schemas match contract docs.
 - **G4 Performance:** Throughput/latency within agreed M1 budget for target hardware.
-  - Section 13 wiring mode: `G4` runs as evidence-only soft gate (`pass_soft|warn|skipped_soft`) until hard thresholds are finalized.
+  - Section 14 wiring mode: `G4` is a mandatory hard gate in `full` profile, with Jetson Orin threshold enforcement using baseline-derived limits.
+  - Hard mode statuses: `pass`, `fail_threshold`, `fail_env`.
 - **G5 Compliance:** Required stages show `compliance_status=pass`.
 - **G6 Fail-Fast:** Non-compliant required stages fail explicitly (no silent downgrade).
 - **G7 Terminal Trace:** Required stage events are complete, ordered, and timing-valid.

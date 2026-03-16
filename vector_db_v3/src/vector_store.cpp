@@ -86,6 +86,15 @@ bool sync_file_descriptor(const fs::path& p) {
 #endif
 }
 
+std::size_t file_size_or_zero(const fs::path& p) {
+    std::error_code ec;
+    const auto sz = fs::file_size(p, ec);
+    if (ec) {
+        return 0U;
+    }
+    return static_cast<std::size_t>(sz);
+}
+
 Status write_manifest_json_atomic(const fs::path& path, const ManifestMeta& meta) {
     std::ostringstream out;
     out << "{\n"
@@ -682,17 +691,16 @@ Status emit_top_layer_artifacts(
     *records_processed_out = 0U;
 
     std::vector<std::uint64_t> ids;
-    std::vector<std::vector<float>> vectors;
+    std::vector<std::vector<float>> kmeans_vectors;
     ids.reserve(rows.size());
-    vectors.reserve(rows.size());
+    kmeans_vectors.reserve(rows.size());
     for (const auto& kv : rows) {
         if (kv.second.vector.size() != kVectorDim) {
             return Status::Error("top clustering: encountered non-1024D vector");
         }
         ids.push_back(kv.first);
-        vectors.push_back(kv.second.vector);
+        kmeans_vectors.push_back(kv.second.vector);
     }
-    std::vector<std::vector<float>> kmeans_vectors = vectors;
     if (kmeans_vectors.empty()) {
         kmeans_vectors.push_back(std::vector<float>(kVectorDim, 0.0f));
     }
@@ -825,15 +833,13 @@ Status emit_top_layer_artifacts(
     fs::create_directories(clusters_dir);
 
     auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written) {
-        std::vector<std::uint8_t> bytes;
-        codec::read_file_bytes(artifact_path, &bytes);
         emit_step(
             telemetry::EventType::ArtifactWrite,
             status.ok ? "completed" : "failed",
             {
                 {"artifact_path", artifact_path.generic_string()},
                 {"rows_written", std::to_string(rows_written)},
-                {"bytes_written", std::to_string(bytes.size())},
+                {"bytes_written", std::to_string(file_size_or_zero(artifact_path))},
                 {"status", status.ok ? "ok" : "error"},
             });
     };
@@ -940,7 +946,7 @@ Status emit_mid_layer_artifacts(
 
     struct ParentItem {
         std::uint64_t embedding_id = 0;
-        std::vector<float> vector;
+        const std::vector<float>* vector = nullptr;
     };
     std::map<std::uint32_t, std::vector<ParentItem>> parent_groups;
     parent_groups.clear();
@@ -952,7 +958,7 @@ Status emit_mid_layer_artifacts(
         if (it->second.vector.size() != kVectorDim) {
             return Status::Error("mid clustering: encountered non-1024D vector");
         }
-        parent_groups[row.top_centroid_numeric_id].push_back(ParentItem{row.embedding_id, it->second.vector});
+        parent_groups[row.top_centroid_numeric_id].push_back(ParentItem{row.embedding_id, &it->second.vector});
     }
 
     std::vector<codec::MidAssignmentRow> mid_rows;
@@ -988,7 +994,7 @@ Status emit_mid_layer_artifacts(
         std::vector<std::vector<float>> parent_vectors;
         parent_vectors.reserve(items.size());
         for (const auto& item : items) {
-            parent_vectors.push_back(item.vector);
+            parent_vectors.push_back(*item.vector);
         }
         if (parent_vectors.empty()) {
             continue;
@@ -1093,15 +1099,13 @@ Status emit_mid_layer_artifacts(
     fs::create_directories(mid_dir);
 
     auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written) {
-        std::vector<std::uint8_t> bytes;
-        codec::read_file_bytes(artifact_path, &bytes);
         emit_step(
             telemetry::EventType::ArtifactWrite,
             status.ok ? "completed" : "failed",
             {
                 {"artifact_path", artifact_path.generic_string()},
                 {"rows_written", std::to_string(rows_written)},
-                {"bytes_written", std::to_string(bytes.size())},
+                {"bytes_written", std::to_string(file_size_or_zero(artifact_path))},
                 {"status", status.ok ? "ok" : "error"},
             });
     };
@@ -1305,15 +1309,13 @@ Status emit_lower_layer_artifacts(
         return st;
     }
 
-    std::vector<std::uint8_t> lower_bytes;
-    codec::read_file_bytes(paths::lower_layer_clustering_bin(data_dir), &lower_bytes);
     emit_step(
         telemetry::EventType::ArtifactWrite,
         "completed",
         {
             {"artifact_path", paths::lower_layer_clustering_bin(data_dir).generic_string()},
             {"rows_written", std::to_string(branch_embedding_ids.size())},
-            {"bytes_written", std::to_string(lower_bytes.size())},
+            {"bytes_written", std::to_string(file_size_or_zero(paths::lower_layer_clustering_bin(data_dir)))},
             {"status", "ok"},
         });
 
@@ -1417,8 +1419,6 @@ Status finalize_k_search_bounds_batch(
         return write_st;
     }
 
-    std::vector<std::uint8_t> bytes;
-    codec::read_file_bytes(paths::k_search_bounds_batch_bin(data_dir), &bytes);
     std::size_t rows_top = 0U;
     std::size_t rows_mid = 0U;
     std::size_t rows_lower = 0U;
@@ -1441,7 +1441,7 @@ Status finalize_k_search_bounds_batch(
             {"rows_mid", std::to_string(rows_mid)},
             {"rows_lower", std::to_string(rows_lower)},
             {"pipeline_step_name", "finalize_k_search_bounds_batch"},
-            {"bytes_written", std::to_string(bytes.size())},
+            {"bytes_written", std::to_string(file_size_or_zero(paths::k_search_bounds_batch_bin(data_dir)))},
             {"status", "ok"},
         });
     return Status::Ok();
@@ -1551,15 +1551,13 @@ Status finalize_post_cluster_membership(
     if (!st.ok) {
         return st;
     }
-    std::vector<std::uint8_t> bytes;
-    codec::read_file_bytes(paths::post_cluster_membership_bin(data_dir), &bytes);
     emit_step(
         telemetry::EventType::ArtifactWrite,
         "completed",
         {
             {"artifact_path", paths::post_cluster_membership_bin(data_dir).generic_string()},
             {"rows_written", std::to_string(membership_rows.size())},
-            {"bytes_written", std::to_string(bytes.size())},
+            {"bytes_written", std::to_string(file_size_or_zero(paths::post_cluster_membership_bin(data_dir)))},
             {"status", "ok"},
         });
     return Status::Ok();
@@ -1619,15 +1617,13 @@ Status emit_final_layer_artifacts(
     std::uint32_t final_job_index = 0U;
 
     auto emit_artifact = [&](const fs::path& artifact_path, std::size_t rows_written) {
-        std::vector<std::uint8_t> bytes;
-        codec::read_file_bytes(artifact_path, &bytes);
         emit_step(
             telemetry::EventType::ArtifactWrite,
             "completed",
             {
                 {"artifact_path", artifact_path.generic_string()},
                 {"rows_written", std::to_string(rows_written)},
-                {"bytes_written", std::to_string(bytes.size())},
+                {"bytes_written", std::to_string(file_size_or_zero(artifact_path))},
                 {"status", "ok"},
             });
     };
@@ -2034,7 +2030,7 @@ std::vector<SearchResult> VectorStore::search_exact(const std::vector<float>& qu
         out.push_back(SearchResult{embedding_id, score});
     }
 
-    std::sort(out.begin(), out.end(), [](const SearchResult& a, const SearchResult& b) {
+    auto ranked_less = [](const SearchResult& a, const SearchResult& b) {
         if (a.score > b.score) {
             return true;
         }
@@ -2042,11 +2038,17 @@ std::vector<SearchResult> VectorStore::search_exact(const std::vector<float>& qu
             return false;
         }
         return a.embedding_id < b.embedding_id;
-    });
+    };
 
-    if (top_k < out.size()) {
-        out.resize(top_k);
+    if (top_k >= out.size()) {
+        std::sort(out.begin(), out.end(), ranked_less);
+        return out;
     }
+
+    auto nth = out.begin() + static_cast<std::ptrdiff_t>(top_k);
+    std::nth_element(out.begin(), nth, out.end(), ranked_less);
+    out.resize(top_k);
+    std::sort(out.begin(), out.end(), ranked_less);
     return out;
 }
 

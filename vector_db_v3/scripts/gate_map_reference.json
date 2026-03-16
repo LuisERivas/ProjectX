@@ -23,7 +23,7 @@
     ]
   },
   "G4": {
-    "mandatory": false,
+    "mandatory": true,
     "contract_refs": [
       "vector_db_v3/contracts/TEST_GATE_CONTRACT.md",
       "vector_db_v3/contracts/implementationplan.md"

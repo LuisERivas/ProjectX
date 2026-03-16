@@ -161,6 +161,28 @@ if(Python3_Interpreter_FOUND)
             --profile minimum
             --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest")
     add_test(
+        NAME vectordb_v3_perf_gate_baseline_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/perf_gate.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --mode baseline
+            --profile jetson_orin
+            --thresholds-file "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard/thresholds_jetson_orin.json"
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard/baseline")
+    add_test(
+        NAME vectordb_v3_perf_gate_hard_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/perf_gate.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --mode hard
+            --profile jetson_orin
+            --thresholds-file "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard/thresholds_jetson_orin.json"
+            --baseline-ref "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard/baseline/baseline_metrics.json"
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard")
+    set_tests_properties(vectordb_v3_perf_gate_hard_tests PROPERTIES DEPENDS vectordb_v3_perf_gate_baseline_tests)
+    add_test(
         NAME vectordb_v3_reproducibility_tests
         COMMAND
             ${Python3_EXECUTABLE}

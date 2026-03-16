@@ -100,7 +100,7 @@ def gate_definitions(build_dir: Path, repo_root: Path) -> dict[str, dict]:
             ],
         },
         "G4": {
-            "mandatory": False,
+            "mandatory": True,
             "contract_refs": [
                 "vector_db_v3/contracts/TEST_GATE_CONTRACT.md",
                 "vector_db_v3/contracts/implementationplan.md",
@@ -112,9 +112,27 @@ def gate_definitions(build_dir: Path, repo_root: Path) -> dict[str, dict]:
                     "--build-dir",
                     str(build_dir),
                     "--mode",
-                    "evidence",
+                    "baseline",
                     "--profile",
-                    "minimum",
+                    "jetson_orin",
+                    "--thresholds-file",
+                    "__GATE_DIR__/thresholds_jetson_orin.json",
+                    "--out-dir",
+                    "__GATE_DIR__/baseline",
+                ],
+                [
+                    sys.executable,
+                    str(repo_root / "scripts" / "perf_gate.py"),
+                    "--build-dir",
+                    str(build_dir),
+                    "--mode",
+                    "hard",
+                    "--profile",
+                    "jetson_orin",
+                    "--thresholds-file",
+                    "__GATE_DIR__/thresholds_jetson_orin.json",
+                    "--baseline-ref",
+                    "__GATE_DIR__/baseline/baseline_metrics.json",
                     "--out-dir",
                     "__GATE_DIR__",
                 ]
@@ -262,8 +280,6 @@ def main() -> int:
 
         elapsed_gate_ms = (time.perf_counter() - gate_start) * 1000.0
         status = "fail" if gate_failed else "pass"
-        if gate_id == "G4":
-            status = "warn" if gate_failed else "pass_soft"
 
         row = {
             "gate_id": gate_id,

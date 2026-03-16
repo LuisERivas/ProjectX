@@ -1,0 +1,21 @@
+{
+  "mode": "hard",
+  "profile": "jetson_orin",
+  "baseline_ref": "none",
+  "thresholds_file": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build\\gate_evidence\\perf_test\\thresholds_jetson_orin.json",
+  "measured": {
+    "median_ms": 6.4,
+    "p95_ms": 7.76,
+    "variance_ratio": 0.13105,
+    "samples_ms": [
+      5.746,
+      6.4,
+      7.76
+    ]
+  },
+  "harness": {
+    "warmup_runs": 1,
+    "measure_runs": 3,
+    "failures": 4
+  }
+}

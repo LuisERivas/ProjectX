@@ -24,7 +24,7 @@ Provide requirement-to-contract-to-test mapping for M1 implementation governance
 | CUDA/Tensor/Ampere compliance | `COMPLIANCE_CONTRACT.md` | G5, G6 |
 | C++/CUDA hot-path policy | `M1_SCOPE_CONTRACT.md`, `COMPLIANCE_CONTRACT.md` | G5 |
 | WAL/checkpoint/replay durability | `M1_SCOPE_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G2 |
-| Performance evidence harness and anti-flake reporting | `TEST_GATE_CONTRACT.md`, `implementationplan.md` | G4 |
+| Performance hard-gate thresholds (Jetson Orin profile) and anti-flake reporting | `TEST_GATE_CONTRACT.md`, `implementationplan.md` | G4 |
 | Contract backward compatibility | `CLI_CONTRACT.md`, `ARTIFACT_CONTRACT.md` | G3 |
 
 ## Usage Rule

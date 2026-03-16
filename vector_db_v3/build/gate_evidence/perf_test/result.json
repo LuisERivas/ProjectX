@@ -1,0 +1,17 @@
+{
+  "gate_id": "G4",
+  "status": "fail_env",
+  "mode": "hard",
+  "profile": "jetson_orin",
+  "failed_metrics": [],
+  "exit_code": 2,
+  "notes": [
+    "thresholds file missing: C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build\\gate_evidence\\perf_test\\thresholds_jetson_orin.json"
+  ],
+  "artifact_paths": [
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build\\gate_evidence\\perf_test\\perf_metrics.json",
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build\\gate_evidence\\perf_test\\raw_runs.json",
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build\\gate_evidence\\perf_test\\environment.json",
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build\\gate_evidence\\perf_test\\perf.log"
+  ]
+}

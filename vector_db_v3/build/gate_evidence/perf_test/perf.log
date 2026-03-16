@@ -1,0 +1,12 @@
+[warmup 1] exit=127 elapsed_ms=6.284
+--- stderr ---
+[WinError 2] The system cannot find the file specified
+[measure 1] exit=127 elapsed_ms=5.746
+--- stderr ---
+[WinError 2] The system cannot find the file specified
+[measure 2] exit=127 elapsed_ms=6.400
+--- stderr ---
+[WinError 2] The system cannot find the file specified
+[measure 3] exit=127 elapsed_ms=7.760
+--- stderr ---
+[WinError 2] The system cannot find the file specified

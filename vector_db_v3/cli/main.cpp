@@ -210,34 +210,6 @@ bool parse_jsonl_record(const std::string& line, vector_db_v3::Record& out, std:
     return true;
 }
 
-bool parse_jsonl_records(
-    const std::string& input_path,
-    std::vector<vector_db_v3::Record>& records,
-    std::string& error) {
-    std::ifstream in(input_path, std::ios::binary);
-    if (!in) {
-        error = "unable to open input jsonl file";
-        return false;
-    }
-    records.clear();
-    std::string line;
-    std::size_t line_no = 0;
-    while (std::getline(in, line)) {
-        ++line_no;
-        const std::string t = trim(line);
-        if (t.empty()) {
-            continue;
-        }
-        vector_db_v3::Record rec{};
-        if (!parse_jsonl_record(t, rec, error)) {
-            error += " at line " + std::to_string(line_no);
-            return false;
-        }
-        records.push_back(std::move(rec));
-    }
-    return true;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -309,17 +281,28 @@ int main(int argc, char** argv) {
             }
             batch_size = tmp;
         }
-        std::vector<vector_db_v3::Record> records;
-        std::string parse_error;
-        if (!parse_jsonl_records(input, records, parse_error)) {
-            return emit_usage_error(parse_error);
+        std::ifstream in(input, std::ios::binary);
+        if (!in) {
+            return emit_usage_error("unable to open input jsonl file");
         }
         std::size_t inserted = 0;
         std::size_t batches = 0;
         std::vector<vector_db_v3::Record> chunk;
         chunk.reserve(batch_size);
-        for (const auto& rec : records) {
-            chunk.push_back(rec);
+        std::string line;
+        std::size_t line_no = 0;
+        while (std::getline(in, line)) {
+            ++line_no;
+            const std::string t = trim(line);
+            if (t.empty()) {
+                continue;
+            }
+            vector_db_v3::Record rec{};
+            std::string parse_error;
+            if (!parse_jsonl_record(t, rec, parse_error)) {
+                return emit_usage_error(parse_error + " at line " + std::to_string(line_no));
+            }
+            chunk.push_back(std::move(rec));
             if (chunk.size() >= batch_size) {
                 const auto s = store.insert_batch(chunk);
                 if (!s.ok) {
