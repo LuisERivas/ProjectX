@@ -48,7 +48,18 @@ def parse_final_json(stdout: str) -> dict:
 
 def collect_event_fingerprint(stdout: str) -> list[dict]:
     out: list[dict] = []
-    volatile = {"start_ts", "end_ts", "elapsed_ms", "pipeline_elapsed_ms", "stage_elapsed_ms"}
+    # These fields are expected to vary across runs even when behavior is stable.
+    volatile = {
+        "start_ts",
+        "end_ts",
+        "elapsed_ms",
+        "pipeline_elapsed_ms",
+        "stage_elapsed_ms",
+        "previous_run_available",
+        "baseline_unavailable_reason",
+        "previous_run_stage_elapsed_ms",
+        "stage_elapsed_delta_ms",
+    }
     for line in stdout.splitlines():
         text = line.strip()
         if not text:
@@ -62,6 +73,33 @@ def collect_event_fingerprint(stdout: str) -> list[dict]:
         normalized = {k: v for k, v in obj.items() if k not in volatile}
         out.append(normalized)
     return out
+
+
+def first_event_mismatch(run1_events: list[dict], run2_events: list[dict]) -> dict:
+    if len(run1_events) != len(run2_events):
+        return {
+            "kind": "length_mismatch",
+            "run1_events": len(run1_events),
+            "run2_events": len(run2_events),
+        }
+
+    for idx, (e1, e2) in enumerate(zip(run1_events, run2_events)):
+        if e1 == e2:
+            continue
+        keys = sorted(set(e1.keys()) | set(e2.keys()))
+        differing_keys = [k for k in keys if e1.get(k) != e2.get(k)]
+        return {
+            "kind": "event_mismatch",
+            "index": idx,
+            "run1_event_type": e1.get("event_type"),
+            "run2_event_type": e2.get("event_type"),
+            "run1_stage_id": e1.get("stage_id"),
+            "run2_stage_id": e2.get("stage_id"),
+            "differing_keys": differing_keys[:32],
+            "run1_event": e1,
+            "run2_event": e2,
+        }
+    return {"kind": "none"}
 
 
 def write_seeded_jsonl(path: Path, count: int = 64, dim: int = 1024) -> None:
@@ -172,6 +210,7 @@ def main() -> int:
         bins_match = one.get("bin_hashes", {}) == two.get("bin_hashes", {})
 
     status = "pass" if events_match and bins_match else "fail"
+    first_mismatch = first_event_mismatch(one["event_fingerprints"], two["event_fingerprints"])
     diff_report = {
         "status": status,
         "events_match": events_match,
@@ -180,6 +219,7 @@ def main() -> int:
         "run2_events": len(two["event_fingerprints"]),
         "run1_hash_count": len(one.get("bin_hashes", {})),
         "run2_hash_count": len(two.get("bin_hashes", {})),
+        "first_event_mismatch": first_mismatch,
     }
     write_json(out_dir / "diff_report.json", diff_report)
     write_json(
