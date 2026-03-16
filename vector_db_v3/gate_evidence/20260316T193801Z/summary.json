@@ -1,0 +1,87 @@
+{
+  "run_id": "20260316T193801Z",
+  "timestamp_utc": "2026-03-16T19:38:02.083759+00:00",
+  "overall_status": "fail",
+  "profile": "minimal",
+  "traceability_status": "pass",
+  "gates": [
+    {
+      "gate_id": "G1",
+      "status": "fail",
+      "commands_run": [
+        "ctest --test-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build --output-on-failure -R vectordb_v3_tests|vectordb_v3_exact_search_tests|vectordb_v3_top_layer_artifacts_tests|vectordb_v3_mid_layer_artifacts_tests|vectordb_v3_lower_layer_gate_artifacts_tests|vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests"
+      ],
+      "artifact_paths": [
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\G1\\gate.log"
+      ],
+      "contract_refs": [
+        "vector_db_v3/contracts/TEST_GATE_CONTRACT.md",
+        "vector_db_v3/contracts/M1_SCOPE_CONTRACT.md"
+      ],
+      "duration_ms": 10.111
+    },
+    {
+      "gate_id": "G3",
+      "status": "fail",
+      "commands_run": [
+        "ctest --test-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build --output-on-failure -R vectordb_v3_codec_primitives_tests|vectordb_v3_codec_artifacts_tests|vectordb_v3_codec_corruption_tests|vectordb_v3_cli_contract_tests|vectordb_v3_top_layer_artifacts_tests|vectordb_v3_mid_layer_artifacts_tests|vectordb_v3_lower_layer_gate_artifacts_tests|vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests"
+      ],
+      "artifact_paths": [
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\G3\\gate.log"
+      ],
+      "contract_refs": [
+        "vector_db_v3/contracts/CLI_CONTRACT.md",
+        "vector_db_v3/contracts/ARTIFACT_CONTRACT.md",
+        "vector_db_v3/contracts/BINARY_FORMATS.md",
+        "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+      ],
+      "duration_ms": 10.497
+    },
+    {
+      "gate_id": "G5",
+      "status": "fail",
+      "commands_run": [
+        "ctest --test-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build --output-on-failure -R vectordb_v3_compliance_pass_tests|vectordb_v3_terminal_event_contract_tests|vectordb_v3_cli_contract_tests"
+      ],
+      "artifact_paths": [
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\G5\\gate.log"
+      ],
+      "contract_refs": [
+        "vector_db_v3/contracts/COMPLIANCE_CONTRACT.md",
+        "vector_db_v3/contracts/TRACEABILITY_MATRIX.md"
+      ],
+      "duration_ms": 7.366
+    },
+    {
+      "gate_id": "G6",
+      "status": "fail",
+      "commands_run": [
+        "ctest --test-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build --output-on-failure -R vectordb_v3_compliance_fail_fast_tests|vectordb_v3_terminal_event_contract_tests|vectordb_v3_cli_contract_tests"
+      ],
+      "artifact_paths": [
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\G6\\gate.log"
+      ],
+      "contract_refs": [
+        "vector_db_v3/contracts/COMPLIANCE_CONTRACT.md",
+        "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+      ],
+      "duration_ms": 10.076
+    },
+    {
+      "gate_id": "G7",
+      "status": "fail",
+      "commands_run": [
+        "ctest --test-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build --output-on-failure -R vectordb_v3_terminal_event_contract_tests",
+        "C:\\Users\\lucho\\AppData\\Local\\Programs\\Python\\Python312\\python.exe C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\scripts\\check_reproducibility.py --build-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build --events-only --out-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\G7/repro"
+      ],
+      "artifact_paths": [
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\G7\\gate.log"
+      ],
+      "contract_refs": [
+        "vector_db_v3/contracts/TERMINAL_EVENT_CONTRACT.md",
+        "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+      ],
+      "duration_ms": 171.474
+    }
+  ]
+}

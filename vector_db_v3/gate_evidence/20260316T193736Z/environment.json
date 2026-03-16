@@ -1,0 +1,10 @@
+{
+  "run_id": "20260316T193736Z",
+  "timestamp_utc": "2026-03-16T19:37:36.769757Z",
+  "os": "Windows-10-10.0.19045-SP0",
+  "python": "3.12.0",
+  "cmake": "unavailable",
+  "ctest": "unavailable",
+  "compiler_hint": "unknown",
+  "profile": "minimal"
+}

@@ -1,0 +1,17 @@
+{
+  "gate_id": "G3",
+  "status": "fail",
+  "commands_run": [
+    "ctest --test-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build --output-on-failure -R vectordb_v3_codec_primitives_tests|vectordb_v3_codec_artifacts_tests|vectordb_v3_codec_corruption_tests|vectordb_v3_cli_contract_tests|vectordb_v3_top_layer_artifacts_tests|vectordb_v3_mid_layer_artifacts_tests|vectordb_v3_lower_layer_gate_artifacts_tests|vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests"
+  ],
+  "artifact_paths": [
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\G3\\gate.log"
+  ],
+  "contract_refs": [
+    "vector_db_v3/contracts/CLI_CONTRACT.md",
+    "vector_db_v3/contracts/ARTIFACT_CONTRACT.md",
+    "vector_db_v3/contracts/BINARY_FORMATS.md",
+    "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+  ],
+  "duration_ms": 10.497
+}

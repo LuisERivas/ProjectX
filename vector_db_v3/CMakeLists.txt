@@ -140,4 +140,32 @@ if(Python3_Interpreter_FOUND)
     add_test(
         NAME vectordb_v3_terminal_event_contract_tests
         COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_terminal_event_contract.py")
+    add_test(
+        NAME vectordb_v3_smoke_scaffold_tests
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/smoke_scaffold.py")
+    add_test(
+        NAME vectordb_v3_traceability_verify_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_traceability.py"
+            --matrix "${CMAKE_CURRENT_SOURCE_DIR}/contracts/TRACEABILITY_MATRIX.md"
+            --gate-map "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gate_map_reference.json"
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/traceability_ctest")
+    add_test(
+        NAME vectordb_v3_perf_gate_soft_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/perf_gate.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --mode evidence
+            --profile minimum
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest")
+    add_test(
+        NAME vectordb_v3_reproducibility_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_reproducibility.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --events-only
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/repro_ctest")
 endif()

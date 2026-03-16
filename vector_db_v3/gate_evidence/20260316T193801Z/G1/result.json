@@ -1,0 +1,15 @@
+{
+  "gate_id": "G1",
+  "status": "fail",
+  "commands_run": [
+    "ctest --test-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build --output-on-failure -R vectordb_v3_tests|vectordb_v3_exact_search_tests|vectordb_v3_top_layer_artifacts_tests|vectordb_v3_mid_layer_artifacts_tests|vectordb_v3_lower_layer_gate_artifacts_tests|vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests"
+  ],
+  "artifact_paths": [
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\G1\\gate.log"
+  ],
+  "contract_refs": [
+    "vector_db_v3/contracts/TEST_GATE_CONTRACT.md",
+    "vector_db_v3/contracts/M1_SCOPE_CONTRACT.md"
+  ],
+  "duration_ms": 10.111
+}
