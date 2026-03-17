@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from pathlib import Path
 
 VECTOR_DIM = 1024
@@ -16,6 +17,7 @@ BIN_MAGIC_V3BI = 0x49423356
 BIN_VERSION = 1
 BIN_HEADER_BYTES = 18  # u32 magic + u16 version + u32 record_size + u64 record_count
 BIN_RECORD_BYTES = 8 + VECTOR_DIM * 4  # u64 embedding_id + 1024 * f32
+MANIFEST_HEADER_BYTES = 16
 
 
 @dataclass
@@ -118,6 +120,170 @@ def stage_result_row(stage_name: str, command: list[str], result: CommandResult)
         "latency_ms": round(result.elapsed_ms, 3),
         "command": " ".join(command),
     }
+
+
+def manifest_paths(data_dir: Path) -> dict[str, Path]:
+    clusters_current = data_dir / "clusters" / "current"
+    return {
+        "top": clusters_current / "cluster_manifest.bin",
+        "mid": clusters_current / "mid_layer_clustering" / "MID_LAYER_CLUSTERING.bin",
+        "lower": clusters_current / "lower_layer_clustering" / "LOWER_LAYER_CLUSTERING.bin",
+        "final": clusters_current / "final_layer_clustering" / "FINAL_LAYER_CLUSTERS.bin",
+    }
+
+
+def read_manifest_bin(path: Path, validate_crc: bool = False) -> tuple[dict[str, int], bytes]:
+    raw = path.read_bytes()
+    if len(raw) < MANIFEST_HEADER_BYTES:
+        raise ValueError(f"manifest too short: {path}")
+
+    header = {
+        "schema_version": int.from_bytes(raw[0:2], byteorder="little", signed=False),
+        "record_type": int.from_bytes(raw[2:4], byteorder="little", signed=False),
+        "record_count": int.from_bytes(raw[4:8], byteorder="little", signed=False),
+        "payload_bytes": int.from_bytes(raw[8:12], byteorder="little", signed=False),
+        "checksum_crc32": int.from_bytes(raw[12:16], byteorder="little", signed=False),
+    }
+    payload_end = MANIFEST_HEADER_BYTES + header["payload_bytes"]
+    if len(raw) < payload_end:
+        raise ValueError(f"manifest payload shorter than header declares: {path}")
+    payload = raw[MANIFEST_HEADER_BYTES:payload_end]
+
+    if validate_crc:
+        actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
+        if actual_crc != header["checksum_crc32"]:
+            raise ValueError(f"manifest crc mismatch: {path}")
+
+    return header, payload
+
+
+def parse_manifest_payload(path: Path, validate_crc: bool = False) -> tuple[dict[str, int], dict[str, object]]:
+    header, payload_bytes = read_manifest_bin(path=path, validate_crc=validate_crc)
+    try:
+        payload_text = payload_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"manifest payload is not valid utf-8: {path}") from exc
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"manifest payload is not valid json: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"manifest payload must be a json object: {path}")
+    return header, payload
+
+
+def _parse_ingest_inserted(ingest_result: CommandResult | None) -> int | None:
+    if ingest_result is None:
+        return None
+    text = ingest_result.stdout.strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    inserted = payload.get("inserted")
+    if isinstance(inserted, int) and inserted >= 0:
+        return inserted
+    return None
+
+
+def compute_step5_summary(
+    data_dir: Path,
+    rows_written: int,
+    pipeline_stage_results: list[dict[str, object]],
+    ingest_result: CommandResult | None,
+) -> tuple[dict[str, object], list[str]]:
+    warnings: list[str] = []
+    paths = manifest_paths(data_dir)
+
+    _, top_payload = parse_manifest_payload(paths["top"])
+    _, mid_payload = parse_manifest_payload(paths["mid"])
+    _, lower_payload = parse_manifest_payload(paths["lower"])
+    final_header, final_payload = parse_manifest_payload(paths["final"])
+
+    inserted = _parse_ingest_inserted(ingest_result)
+    if inserted is None:
+        inserted = int(rows_written)
+        warnings.append("ingest inserted count unavailable; using rows_written fallback")
+
+    top_cluster_count_obj = top_payload.get("chosen_k")
+    if isinstance(top_cluster_count_obj, int) and top_cluster_count_obj >= 0:
+        top_cluster_count = top_cluster_count_obj
+    else:
+        fallback = top_payload.get("record_count")
+        if isinstance(fallback, int) and fallback >= 0:
+            top_cluster_count = fallback
+            warnings.append("top chosen_k missing; using top payload record_count fallback")
+        else:
+            top_cluster_count = 0
+            warnings.append("top chosen_k missing and no top record_count fallback; using 0")
+
+    parent_jobs = mid_payload.get("parent_jobs")
+    mid_cluster_count = 0
+    if isinstance(parent_jobs, list):
+        if all(isinstance(j, dict) and isinstance(j.get("chosen_k"), int) and int(j.get("chosen_k")) >= 0 for j in parent_jobs):
+            mid_cluster_count = sum(int(j.get("chosen_k")) for j in parent_jobs if isinstance(j, dict))
+        else:
+            mid_cluster_count = len(parent_jobs)
+            warnings.append("mid parent_jobs chosen_k incomplete; using len(parent_jobs) fallback")
+    else:
+        warnings.append("mid parent_jobs missing; using 0")
+
+    lower_continue_obj = lower_payload.get("branches_continue")
+    lower_stop_obj = lower_payload.get("branches_stop")
+    if isinstance(lower_continue_obj, int) and lower_continue_obj >= 0:
+        lower_branches_continue = lower_continue_obj
+    else:
+        lower_branches_continue = 0
+        warnings.append("lower branches_continue missing; using 0")
+    if isinstance(lower_stop_obj, int) and lower_stop_obj >= 0:
+        lower_branches_stop = lower_stop_obj
+    else:
+        lower_branches_stop = 0
+        warnings.append("lower branches_stop missing; using 0")
+
+    final_record_count_obj = final_payload.get("record_count")
+    clusters_obj = final_payload.get("clusters")
+    clusters_len: int | None = len(clusters_obj) if isinstance(clusters_obj, list) else None
+    if isinstance(final_record_count_obj, int) and final_record_count_obj >= 0:
+        final_cluster_count = final_record_count_obj
+        if clusters_len is not None and clusters_len != final_cluster_count:
+            warnings.append("final record_count does not match len(clusters); using record_count")
+    elif clusters_len is not None:
+        final_cluster_count = clusters_len
+        warnings.append("final record_count missing; using len(clusters) fallback")
+    else:
+        final_cluster_count = int(final_header.get("record_count", 0))
+        warnings.append("final payload missing record_count and clusters; using header record_count fallback")
+
+    total_pipeline_latency_ms = 0.0
+    for row in pipeline_stage_results:
+        latency = row.get("latency_ms")
+        if isinstance(latency, (int, float)):
+            total_pipeline_latency_ms += float(latency)
+
+    summary = {
+        "total_embeddings_inserted": int(inserted),
+        "top_cluster_count": int(top_cluster_count),
+        "mid_cluster_count": int(mid_cluster_count),
+        "lower_branches_continue": int(lower_branches_continue),
+        "lower_branches_stop": int(lower_branches_stop),
+        "final_cluster_count": int(final_cluster_count),
+        "total_pipeline_latency_ms": round(total_pipeline_latency_ms, 3),
+    }
+    return summary, warnings
+
+
+def print_step5_summary(summary: dict[str, object]) -> None:
+    print("=== Cluster Summary ===")
+    print(f"total_embeddings_inserted: {summary['total_embeddings_inserted']}")
+    print(f"top_cluster_count: {summary['top_cluster_count']}")
+    print(f"mid_cluster_count: {summary['mid_cluster_count']}")
+    print(f"lower_branches_continue: {summary['lower_branches_continue']}")
+    print(f"lower_branches_stop: {summary['lower_branches_stop']}")
+    print(f"final_cluster_count: {summary['final_cluster_count']}")
+    print(f"total_pipeline_latency_ms: {float(summary['total_pipeline_latency_ms']):.3f}")
 
 
 def resolve_cli_binary(build_dir: Path) -> Path | None:
@@ -474,6 +640,9 @@ def main() -> int:
             smoke_stage_results.append(stage_result_row(stage_name, stage_command, stage_result))
 
     pipeline_stage_results: list[dict[str, object]] = []
+    ingest_stage_result: CommandResult | None = None
+    cluster_summary: dict[str, object] | None = None
+    cluster_summary_warnings: list[str] = []
     if args.run_full_pipeline:
         query_vec_path: Path | None = None
         if args.with_search_sanity:
@@ -501,6 +670,21 @@ def main() -> int:
             if stage_result is None:
                 return 1
             pipeline_stage_results.append(stage_result_row(stage_name, stage_command, stage_result))
+            if stage_name == "ingest":
+                ingest_stage_result = stage_result
+
+        try:
+            cluster_summary, cluster_summary_warnings = compute_step5_summary(
+                data_dir=data_dir,
+                rows_written=rows_written,
+                pipeline_stage_results=pipeline_stage_results,
+                ingest_result=ingest_stage_result,
+            )
+        except (OSError, ValueError) as exc:
+            return emit_runtime_error(f"failed to parse cluster summary manifests: {exc}")
+        for warning in cluster_summary_warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+        print_step5_summary(cluster_summary)
 
     payload = {
         "status": "ok",
@@ -520,6 +704,8 @@ def main() -> int:
         "with_search_sanity": bool(args.with_search_sanity),
         "with_cluster_stats": bool(args.with_cluster_stats),
         "pipeline_stage_results": pipeline_stage_results,
+        "cluster_summary": cluster_summary,
+        "cluster_summary_warnings": cluster_summary_warnings,
         "results_out": str(results_out),
         "keep_data": bool(args.keep_data),
     }
