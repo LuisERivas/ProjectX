@@ -1,0 +1,54 @@
+{
+  "G1": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md",
+      "vector_db_v3/contracts/M1_SCOPE_CONTRACT.md"
+    ]
+  },
+  "G2": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md",
+      "vector_db_v3/contracts/M1_SCOPE_CONTRACT.md"
+    ]
+  },
+  "G3": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/CLI_CONTRACT.md",
+      "vector_db_v3/contracts/ARTIFACT_CONTRACT.md",
+      "vector_db_v3/contracts/BINARY_FORMATS.md",
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+    ]
+  },
+  "G4": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md",
+      "vector_db_v3/contracts/implementationplan.md"
+    ]
+  },
+  "G5": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/COMPLIANCE_CONTRACT.md",
+      "vector_db_v3/contracts/TRACEABILITY_MATRIX.md"
+    ]
+  },
+  "G6": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/COMPLIANCE_CONTRACT.md",
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+    ]
+  },
+  "G7": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/TERMINAL_EVENT_CONTRACT.md",
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+    ]
+  }
+}
+

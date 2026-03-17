@@ -1,0 +1,18 @@
+{
+  "status": "pass",
+  "matrix_path": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\contracts\\TRACEABILITY_MATRIX.md",
+  "gate_map_path": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\gate_map.json",
+  "missing_links": [],
+  "warnings": [
+    "matrix references gate not active in this run: G2 (Single active clustering state)",
+    "matrix references gate not active in this run: G2 (WAL/checkpoint/replay durability)",
+    "matrix references gate not active in this run: G4 (Performance evidence harness and anti-flake reporting)"
+  ],
+  "active_gates": [
+    "G1",
+    "G3",
+    "G5",
+    "G6",
+    "G7"
+  ]
+}

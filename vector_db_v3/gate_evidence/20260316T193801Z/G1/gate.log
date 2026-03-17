@@ -1,0 +1,4 @@
+$ ctest --test-dir C:\Users\lucho\Desktop\Projects\ProjectX\vector_db_v3\build --output-on-failure -R vectordb_v3_tests|vectordb_v3_exact_search_tests|vectordb_v3_top_layer_artifacts_tests|vectordb_v3_mid_layer_artifacts_tests|vectordb_v3_lower_layer_gate_artifacts_tests|vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests
+exit_code=127 elapsed_ms=9.090
+--- stderr ---
+[WinError 2] The system cannot find the file specified

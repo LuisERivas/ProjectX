@@ -86,6 +86,15 @@ bool sync_file_descriptor(const fs::path& p) {
 #endif
 }
 
+std::size_t file_size_or_zero(const fs::path& p) {
+    std::error_code ec;
+    const auto sz = fs::file_size(p, ec);
+    if (ec) {
+        return 0U;
+    }
+    return static_cast<std::size_t>(sz);
+}
+
 Status write_manifest_json_atomic(const fs::path& path, const ManifestMeta& meta) {
     std::ostringstream out;
     out << "{\n"
@@ -540,6 +549,134 @@ std::uint32_t derive_k_max(std::size_t n, std::uint32_t k_min) {
     return std::max<std::uint32_t>(k_min, upper);
 }
 
+struct StageBranchKey {
+    std::uint32_t parent_top = 0;
+    std::uint32_t mid_centroid = 0;
+    bool operator<(const StageBranchKey& other) const {
+        if (parent_top != other.parent_top) {
+            return parent_top < other.parent_top;
+        }
+        return mid_centroid < other.mid_centroid;
+    }
+};
+
+struct LowerGateOutcome {
+    StageBranchKey branch;
+    std::uint32_t centroid_id = 0;
+    std::string job_id;
+    std::uint32_t dataset_size = 0;
+    codec::GateDecision gate_decision = codec::GateDecision::NotApplicable;
+};
+
+struct MidParentJob {
+    std::uint32_t centroid_id = 0;
+    std::string job_id;
+    std::uint32_t dataset_size = 0;
+    std::uint32_t k_min = 0;
+    std::uint32_t k_max = 0;
+    std::uint32_t chosen_k = 0;
+};
+
+Status read_manifest_payload_string(const fs::path& artifact_path, std::string* payload_out) {
+    if (payload_out == nullptr) {
+        return Status::Error("manifest payload read: invalid output pointer");
+    }
+    codec::CommonHeader header{};
+    std::vector<std::uint8_t> payload;
+    const Status st = codec::read_cluster_manifest_file(artifact_path, &header, &payload);
+    if (!st.ok) {
+        return st;
+    }
+    *payload_out = std::string(payload.begin(), payload.end());
+    return Status::Ok();
+}
+
+std::uint32_t parse_u32_or_default(const std::string& body, const std::string& key, std::uint32_t fallback) {
+    const std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
+    std::smatch m;
+    if (!std::regex_search(body, m, re) || m.size() < 2) {
+        return fallback;
+    }
+    try {
+        return static_cast<std::uint32_t>(std::stoul(m[1].str()));
+    } catch (...) {
+        return fallback;
+    }
+}
+
+Status parse_lower_gate_outcomes(const std::string& payload, std::vector<LowerGateOutcome>* out) {
+    if (out == nullptr) {
+        return Status::Error("lower gate parse: invalid output pointer");
+    }
+    out->clear();
+    const std::regex row_re(
+        "\\{\"parent_top_centroid_numeric_id\":([0-9]+),\"mid_centroid_numeric_id\":([0-9]+),"
+        "\"centroid_id\":([0-9]+),\"job_id\":\"([^\"]*)\",\"dataset_size\":([0-9]+),"
+        "\"gate_decision\":\"(stop|continue)\"\\}");
+    auto it = std::sregex_iterator(payload.begin(), payload.end(), row_re);
+    const auto end = std::sregex_iterator();
+    for (; it != end; ++it) {
+        const std::smatch& m = *it;
+        if (m.size() < 7) {
+            continue;
+        }
+        LowerGateOutcome row{};
+        try {
+            row.branch.parent_top = static_cast<std::uint32_t>(std::stoul(m[1].str()));
+            row.branch.mid_centroid = static_cast<std::uint32_t>(std::stoul(m[2].str()));
+            row.centroid_id = static_cast<std::uint32_t>(std::stoul(m[3].str()));
+            row.job_id = m[4].str();
+            row.dataset_size = static_cast<std::uint32_t>(std::stoul(m[5].str()));
+            row.gate_decision = m[6].str() == "stop" ? codec::GateDecision::Stop : codec::GateDecision::Continue;
+        } catch (...) {
+            return Status::Error("lower gate parse: malformed numeric field");
+        }
+        out->push_back(row);
+    }
+    const std::uint32_t expected_rows = parse_u32_or_default(payload, "record_count", 0U);
+    if (expected_rows != static_cast<std::uint32_t>(out->size())) {
+        return Status::Error("lower gate parse: record_count mismatch");
+    }
+    std::sort(out->begin(), out->end(), [](const LowerGateOutcome& a, const LowerGateOutcome& b) {
+        if (a.branch.parent_top != b.branch.parent_top) {
+            return a.branch.parent_top < b.branch.parent_top;
+        }
+        return a.branch.mid_centroid < b.branch.mid_centroid;
+    });
+    return Status::Ok();
+}
+
+Status parse_mid_parent_jobs(const std::string& payload, std::vector<MidParentJob>* out) {
+    if (out == nullptr) {
+        return Status::Error("mid parent parse: invalid output pointer");
+    }
+    out->clear();
+    const std::regex row_re(
+        "\\{\"centroid_id\":([0-9]+),\"job_id\":\"([^\"]*)\",\"dataset_size\":([0-9]+),"
+        "\"k_min\":([0-9]+),\"k_max\":([0-9]+),\"chosen_k\":([0-9]+)\\}");
+    auto it = std::sregex_iterator(payload.begin(), payload.end(), row_re);
+    const auto end = std::sregex_iterator();
+    for (; it != end; ++it) {
+        const std::smatch& m = *it;
+        if (m.size() < 7) {
+            continue;
+        }
+        MidParentJob row{};
+        try {
+            row.centroid_id = static_cast<std::uint32_t>(std::stoul(m[1].str()));
+            row.job_id = m[2].str();
+            row.dataset_size = static_cast<std::uint32_t>(std::stoul(m[3].str()));
+            row.k_min = static_cast<std::uint32_t>(std::stoul(m[4].str()));
+            row.k_max = static_cast<std::uint32_t>(std::stoul(m[5].str()));
+            row.chosen_k = static_cast<std::uint32_t>(std::stoul(m[6].str()));
+        } catch (...) {
+            return Status::Error("mid parent parse: malformed numeric field");
+        }
+        out->push_back(row);
+    }
+    return Status::Ok();
+}
+
 Status emit_top_layer_artifacts(
     const fs::path& data_dir,
     const std::map<std::uint64_t, Record>& rows,
@@ -554,17 +691,16 @@ Status emit_top_layer_artifacts(
     *records_processed_out = 0U;
 
     std::vector<std::uint64_t> ids;
-    std::vector<std::vector<float>> vectors;
+    std::vector<std::vector<float>> kmeans_vectors;
     ids.reserve(rows.size());
-    vectors.reserve(rows.size());
+    kmeans_vectors.reserve(rows.size());
     for (const auto& kv : rows) {
         if (kv.second.vector.size() != kVectorDim) {
             return Status::Error("top clustering: encountered non-1024D vector");
         }
         ids.push_back(kv.first);
-        vectors.push_back(kv.second.vector);
+        kmeans_vectors.push_back(kv.second.vector);
     }
-    std::vector<std::vector<float>> kmeans_vectors = vectors;
     if (kmeans_vectors.empty()) {
         kmeans_vectors.push_back(std::vector<float>(kVectorDim, 0.0f));
     }
@@ -697,15 +833,13 @@ Status emit_top_layer_artifacts(
     fs::create_directories(clusters_dir);
 
     auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written) {
-        std::vector<std::uint8_t> bytes;
-        codec::read_file_bytes(artifact_path, &bytes);
         emit_step(
             telemetry::EventType::ArtifactWrite,
             status.ok ? "completed" : "failed",
             {
                 {"artifact_path", artifact_path.generic_string()},
                 {"rows_written", std::to_string(rows_written)},
-                {"bytes_written", std::to_string(bytes.size())},
+                {"bytes_written", std::to_string(file_size_or_zero(artifact_path))},
                 {"status", status.ok ? "ok" : "error"},
             });
     };
@@ -812,7 +946,7 @@ Status emit_mid_layer_artifacts(
 
     struct ParentItem {
         std::uint64_t embedding_id = 0;
-        std::vector<float> vector;
+        const std::vector<float>* vector = nullptr;
     };
     std::map<std::uint32_t, std::vector<ParentItem>> parent_groups;
     parent_groups.clear();
@@ -824,7 +958,7 @@ Status emit_mid_layer_artifacts(
         if (it->second.vector.size() != kVectorDim) {
             return Status::Error("mid clustering: encountered non-1024D vector");
         }
-        parent_groups[row.top_centroid_numeric_id].push_back(ParentItem{row.embedding_id, it->second.vector});
+        parent_groups[row.top_centroid_numeric_id].push_back(ParentItem{row.embedding_id, &it->second.vector});
     }
 
     std::vector<codec::MidAssignmentRow> mid_rows;
@@ -860,7 +994,7 @@ Status emit_mid_layer_artifacts(
         std::vector<std::vector<float>> parent_vectors;
         parent_vectors.reserve(items.size());
         for (const auto& item : items) {
-            parent_vectors.push_back(item.vector);
+            parent_vectors.push_back(*item.vector);
         }
         if (parent_vectors.empty()) {
             continue;
@@ -965,15 +1099,13 @@ Status emit_mid_layer_artifacts(
     fs::create_directories(mid_dir);
 
     auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written) {
-        std::vector<std::uint8_t> bytes;
-        codec::read_file_bytes(artifact_path, &bytes);
         emit_step(
             telemetry::EventType::ArtifactWrite,
             status.ok ? "completed" : "failed",
             {
                 {"artifact_path", artifact_path.generic_string()},
                 {"rows_written", std::to_string(rows_written)},
-                {"bytes_written", std::to_string(bytes.size())},
+                {"bytes_written", std::to_string(file_size_or_zero(artifact_path))},
                 {"status", status.ok ? "ok" : "error"},
             });
     };
@@ -1048,7 +1180,7 @@ Status emit_lower_layer_artifacts(
     if (const char* env = std::getenv("VECTOR_DB_V3_LOWER_GATE_THRESHOLD")) {
         try {
             const long long parsed = std::stoll(std::string(env));
-            if (parsed > 0 && parsed <= static_cast<long long>(std::numeric_limits<std::uint32_t>::max())) {
+            if (parsed >= 0 && parsed <= static_cast<long long>(std::numeric_limits<std::uint32_t>::max())) {
                 gate_threshold = static_cast<std::uint32_t>(parsed);
             }
         } catch (...) {
@@ -1177,20 +1309,501 @@ Status emit_lower_layer_artifacts(
         return st;
     }
 
-    std::vector<std::uint8_t> lower_bytes;
-    codec::read_file_bytes(paths::lower_layer_clustering_bin(data_dir), &lower_bytes);
     emit_step(
         telemetry::EventType::ArtifactWrite,
         "completed",
         {
             {"artifact_path", paths::lower_layer_clustering_bin(data_dir).generic_string()},
             {"rows_written", std::to_string(branch_embedding_ids.size())},
-            {"bytes_written", std::to_string(lower_bytes.size())},
+            {"bytes_written", std::to_string(file_size_or_zero(paths::lower_layer_clustering_bin(data_dir)))},
             {"status", "ok"},
         });
 
     *chosen_k_out = static_cast<std::uint32_t>(continue_count + stop_count);
     *records_processed_out = processed_total;
+    (void)seed;
+    return Status::Ok();
+}
+
+Status finalize_k_search_bounds_batch(
+    const fs::path& data_dir,
+    const std::vector<LowerGateOutcome>& lower_outcomes,
+    const std::function<void(telemetry::EventType, const std::string&, const std::vector<std::pair<std::string, std::string>>&)>& emit_step) {
+    std::vector<codec::KSearchBoundsBatchRow> rows;
+
+    codec::IdEstimateRow top_estimate{};
+    const Status top_estimate_st = codec::read_id_estimate_file(paths::id_estimate_bin(data_dir), &top_estimate);
+    if (!top_estimate_st.ok) {
+        return Status::Error("finalization: failed reading id_estimate.bin");
+    }
+    const Status top_estimate_valid = codec::validate_id_estimate(top_estimate);
+    if (!top_estimate_valid.ok) {
+        return Status::Error("finalization: invalid id_estimate.bin");
+    }
+
+    std::vector<codec::TopAssignmentRow> top_assignments;
+    const Status top_assign_st = codec::read_top_assignments_file(paths::top_assignments_bin(data_dir), &top_assignments);
+    if (!top_assign_st.ok) {
+        return Status::Error("finalization: failed reading top assignments");
+    }
+    const Status top_assign_valid = codec::validate_top_assignments(top_assignments);
+    if (!top_assign_valid.ok) {
+        return Status::Error("finalization: invalid top assignments");
+    }
+
+    std::string top_manifest_payload;
+    const Status top_manifest_st = read_manifest_payload_string(paths::cluster_manifest_bin(data_dir), &top_manifest_payload);
+    if (!top_manifest_st.ok) {
+        return Status::Error("finalization: failed reading top cluster_manifest.bin");
+    }
+    const std::uint32_t top_chosen_k = parse_u32_or_default(top_manifest_payload, "chosen_k", top_estimate.k_min);
+    rows.push_back(codec::KSearchBoundsBatchRow{
+        codec::StageLevel::Top,
+        codec::GateDecision::NotApplicable,
+        0U,
+        0U,
+        top_estimate.k_min,
+        top_estimate.k_max,
+        std::max(top_estimate.k_min, std::min(top_chosen_k, top_estimate.k_max)),
+        static_cast<std::uint32_t>(top_assignments.size()),
+    });
+
+    std::string mid_manifest_payload;
+    const Status mid_manifest_st = read_manifest_payload_string(paths::mid_layer_clustering_bin(data_dir), &mid_manifest_payload);
+    if (!mid_manifest_st.ok) {
+        return Status::Error("finalization: failed reading MID_LAYER_CLUSTERING.bin");
+    }
+    std::vector<MidParentJob> mid_jobs;
+    const Status mid_jobs_st = parse_mid_parent_jobs(mid_manifest_payload, &mid_jobs);
+    if (!mid_jobs_st.ok) {
+        return Status::Error("finalization: failed parsing MID_LAYER_CLUSTERING.bin");
+    }
+    for (const auto& job : mid_jobs) {
+        rows.push_back(codec::KSearchBoundsBatchRow{
+            codec::StageLevel::Mid,
+            codec::GateDecision::NotApplicable,
+            0U,
+            job.centroid_id,
+            job.k_min,
+            job.k_max,
+            job.chosen_k,
+            job.dataset_size,
+        });
+    }
+
+    for (const auto& lower : lower_outcomes) {
+        rows.push_back(codec::KSearchBoundsBatchRow{
+            codec::StageLevel::Lower,
+            lower.gate_decision,
+            0U,
+            lower.centroid_id,
+            1U,
+            1U,
+            1U,
+            lower.dataset_size,
+        });
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const codec::KSearchBoundsBatchRow& a, const codec::KSearchBoundsBatchRow& b) {
+        if (a.stage_level != b.stage_level) {
+            return a.stage_level < b.stage_level;
+        }
+        return a.source_numeric_id < b.source_numeric_id;
+    });
+    const Status rows_valid = codec::validate_k_search_bounds_batch(rows);
+    if (!rows_valid.ok) {
+        return Status::Error("finalization: invalid k_search_bounds_batch rows: " + rows_valid.message);
+    }
+    const Status write_st = codec::write_k_search_bounds_batch_file(paths::k_search_bounds_batch_bin(data_dir), rows);
+    if (!write_st.ok) {
+        return write_st;
+    }
+
+    std::size_t rows_top = 0U;
+    std::size_t rows_mid = 0U;
+    std::size_t rows_lower = 0U;
+    for (const auto& row : rows) {
+        if (row.stage_level == codec::StageLevel::Top) {
+            ++rows_top;
+        } else if (row.stage_level == codec::StageLevel::Mid) {
+            ++rows_mid;
+        } else {
+            ++rows_lower;
+        }
+    }
+    emit_step(
+        telemetry::EventType::ArtifactWrite,
+        "completed",
+        {
+            {"artifact_path", paths::k_search_bounds_batch_bin(data_dir).generic_string()},
+            {"rows_written", std::to_string(rows.size())},
+            {"rows_top", std::to_string(rows_top)},
+            {"rows_mid", std::to_string(rows_mid)},
+            {"rows_lower", std::to_string(rows_lower)},
+            {"pipeline_step_name", "finalize_k_search_bounds_batch"},
+            {"bytes_written", std::to_string(file_size_or_zero(paths::k_search_bounds_batch_bin(data_dir)))},
+            {"status", "ok"},
+        });
+    return Status::Ok();
+}
+
+Status finalize_post_cluster_membership(
+    const fs::path& data_dir,
+    const std::map<std::uint64_t, Record>& rows,
+    const std::vector<LowerGateOutcome>& lower_outcomes,
+    const std::map<std::uint64_t, std::uint32_t>& final_assignment_map,
+    const std::function<void(telemetry::EventType, const std::string&, const std::vector<std::pair<std::string, std::string>>&)>& emit_step) {
+    std::vector<codec::TopAssignmentRow> top_assignments;
+    Status st = codec::read_top_assignments_file(paths::top_assignments_bin(data_dir), &top_assignments);
+    if (!st.ok) {
+        return Status::Error("finalization: failed reading top assignments");
+    }
+    st = codec::validate_top_assignments(top_assignments);
+    if (!st.ok) {
+        return Status::Error("finalization: invalid top assignments");
+    }
+
+    std::vector<codec::MidAssignmentRow> mid_assignments;
+    st = codec::read_mid_assignments_file(paths::mid_layer_assignments_bin(data_dir), &mid_assignments);
+    if (!st.ok) {
+        return Status::Error("finalization: failed reading mid assignments");
+    }
+    st = codec::validate_mid_assignments(mid_assignments);
+    if (!st.ok) {
+        return Status::Error("finalization: invalid mid assignments");
+    }
+
+    std::map<std::uint64_t, std::uint32_t> top_map;
+    for (const auto& row : top_assignments) {
+        top_map[row.embedding_id] = row.top_centroid_numeric_id;
+    }
+    struct MidInfo {
+        std::uint32_t mid = 0;
+        std::uint32_t parent_top = 0;
+    };
+    std::map<std::uint64_t, MidInfo> mid_map;
+    for (const auto& row : mid_assignments) {
+        mid_map[row.embedding_id] = MidInfo{row.mid_centroid_numeric_id, row.parent_top_centroid_numeric_id};
+    }
+
+    std::map<StageBranchKey, std::uint32_t> lower_centroid_map;
+    std::map<StageBranchKey, codec::GateDecision> lower_gate_map;
+    for (const auto& row : lower_outcomes) {
+        lower_centroid_map[row.branch] = row.centroid_id;
+        lower_gate_map[row.branch] = row.gate_decision;
+    }
+
+    std::vector<codec::PostClusterMembershipRow> membership_rows;
+    membership_rows.reserve(rows.size());
+    for (const auto& kv : rows) {
+        const std::uint64_t embedding_id = kv.first;
+        const auto top_it = top_map.find(embedding_id);
+        if (top_it == top_map.end()) {
+            return Status::Error("finalization: post membership missing top assignment");
+        }
+        const auto mid_it = mid_map.find(embedding_id);
+        if (mid_it == mid_map.end()) {
+            return Status::Error("finalization: post membership missing mid assignment");
+        }
+        if (mid_it->second.parent_top != top_it->second) {
+            return Status::Error("finalization: top/mid parent mismatch");
+        }
+
+        const StageBranchKey key{mid_it->second.parent_top, mid_it->second.mid};
+        std::uint32_t lower_centroid = std::numeric_limits<std::uint32_t>::max();
+        const auto lower_it = lower_centroid_map.find(key);
+        if (lower_it != lower_centroid_map.end()) {
+            lower_centroid = lower_it->second;
+        }
+
+        std::uint32_t final_cluster = std::numeric_limits<std::uint32_t>::max();
+        const auto final_it = final_assignment_map.find(embedding_id);
+        if (final_it != final_assignment_map.end()) {
+            final_cluster = final_it->second;
+        } else {
+            const auto gate_it = lower_gate_map.find(key);
+            if (gate_it != lower_gate_map.end() && gate_it->second == codec::GateDecision::Stop) {
+                return Status::Error("finalization: stop-eligible embedding missing final assignment");
+            }
+        }
+
+        membership_rows.push_back(codec::PostClusterMembershipRow{
+            embedding_id,
+            top_it->second,
+            mid_it->second.mid,
+            lower_centroid,
+            final_cluster,
+        });
+    }
+
+    std::sort(membership_rows.begin(), membership_rows.end(), [](const auto& a, const auto& b) {
+        return a.embedding_id < b.embedding_id;
+    });
+    st = codec::validate_post_cluster_membership(membership_rows, true);
+    if (!st.ok) {
+        return Status::Error("finalization: invalid post_cluster_membership rows: " + st.message);
+    }
+    if (membership_rows.size() != rows.size()) {
+        return Status::Error("finalization: post_cluster_membership row-count mismatch");
+    }
+
+    st = codec::write_post_cluster_membership_file(paths::post_cluster_membership_bin(data_dir), membership_rows);
+    if (!st.ok) {
+        return st;
+    }
+    emit_step(
+        telemetry::EventType::ArtifactWrite,
+        "completed",
+        {
+            {"artifact_path", paths::post_cluster_membership_bin(data_dir).generic_string()},
+            {"rows_written", std::to_string(membership_rows.size())},
+            {"bytes_written", std::to_string(file_size_or_zero(paths::post_cluster_membership_bin(data_dir)))},
+            {"status", "ok"},
+        });
+    return Status::Ok();
+}
+
+Status emit_final_layer_artifacts(
+    const fs::path& data_dir,
+    const std::map<std::uint64_t, Record>& rows,
+    std::uint32_t seed,
+    const std::function<void(telemetry::EventType, const std::string&, const std::vector<std::pair<std::string, std::string>>&)>& emit_step,
+    std::uint32_t* chosen_k_out,
+    std::size_t* records_processed_out) {
+    if (chosen_k_out == nullptr || records_processed_out == nullptr) {
+        return Status::Error("final clustering: invalid output pointers");
+    }
+    *chosen_k_out = 0U;
+    *records_processed_out = 0U;
+
+    std::vector<codec::MidAssignmentRow> mid_assignments;
+    Status st = codec::read_mid_assignments_file(paths::mid_layer_assignments_bin(data_dir), &mid_assignments);
+    if (!st.ok) {
+        return Status::Error("final clustering: failed reading mid assignments; run build-mid-layer-clusters first");
+    }
+    st = codec::validate_mid_assignments(mid_assignments);
+    if (!st.ok) {
+        return Status::Error("final clustering: invalid mid assignments input: " + st.message);
+    }
+
+    std::string lower_payload;
+    st = read_manifest_payload_string(paths::lower_layer_clustering_bin(data_dir), &lower_payload);
+    if (!st.ok) {
+        return Status::Error("final clustering: failed reading lower gate outcomes; run build-lower-layer-clusters first");
+    }
+    std::vector<LowerGateOutcome> lower_outcomes;
+    st = parse_lower_gate_outcomes(lower_payload, &lower_outcomes);
+    if (!st.ok) {
+        return Status::Error("final clustering: failed parsing lower gate outcomes: " + st.message);
+    }
+
+    std::map<StageBranchKey, std::vector<std::uint64_t>> branch_embedding_ids;
+    for (const auto& row : mid_assignments) {
+        branch_embedding_ids[StageBranchKey{row.parent_top_centroid_numeric_id, row.mid_centroid_numeric_id}]
+            .push_back(row.embedding_id);
+    }
+
+    struct FinalClusterMeta {
+        std::uint32_t final_cluster_numeric_id = 0;
+        StageBranchKey branch;
+        std::string job_id;
+        std::size_t dataset_size = 0U;
+        std::size_t rows_written = 0U;
+    };
+    std::vector<FinalClusterMeta> final_clusters;
+    std::map<std::uint64_t, std::uint32_t> final_assignment_map;
+    std::size_t total_final_rows = 0U;
+    std::uint32_t next_final_cluster_id = 0U;
+    std::uint32_t final_job_index = 0U;
+
+    auto emit_artifact = [&](const fs::path& artifact_path, std::size_t rows_written) {
+        emit_step(
+            telemetry::EventType::ArtifactWrite,
+            "completed",
+            {
+                {"artifact_path", artifact_path.generic_string()},
+                {"rows_written", std::to_string(rows_written)},
+                {"bytes_written", std::to_string(file_size_or_zero(artifact_path))},
+                {"status", "ok"},
+            });
+    };
+
+    const fs::path final_dir = paths::final_layer_dir(data_dir);
+    fs::create_directories(final_dir);
+
+    for (const auto& lower_row : lower_outcomes) {
+        if (lower_row.gate_decision != codec::GateDecision::Stop) {
+            continue;
+        }
+        const auto branch_it = branch_embedding_ids.find(lower_row.branch);
+        if (branch_it == branch_embedding_ids.end()) {
+            return Status::Error("final clustering: stop-eligible lower branch missing in mid assignments");
+        }
+        const std::vector<std::uint64_t>& ids = branch_it->second;
+        if (ids.empty()) {
+            return Status::Error("final clustering: stop-eligible lower branch is empty");
+        }
+
+        const std::uint32_t final_cluster_id = next_final_cluster_id++;
+        const std::string job_id = "final-branch-" + std::to_string(final_job_index++);
+        emit_step(
+            telemetry::EventType::StageProgress,
+            "running",
+            {
+                {"centroid_id", std::to_string(final_cluster_id)},
+                {"job_id", job_id},
+                {"job_phase", "start"},
+                {"dataset_size", std::to_string(ids.size())},
+                {"parent_top_centroid_numeric_id", std::to_string(lower_row.branch.parent_top)},
+                {"mid_centroid_numeric_id", std::to_string(lower_row.branch.mid_centroid)},
+            });
+
+        std::vector<codec::FinalAssignmentRow> final_rows;
+        final_rows.reserve(ids.size());
+        for (const std::uint64_t embedding_id : ids) {
+            if (rows.find(embedding_id) == rows.end()) {
+                return Status::Error("final clustering: mid assignment references missing live embedding_id");
+            }
+            final_rows.push_back(codec::FinalAssignmentRow{embedding_id, final_cluster_id});
+            final_assignment_map[embedding_id] = final_cluster_id;
+        }
+        std::sort(final_rows.begin(), final_rows.end(), [](const auto& a, const auto& b) {
+            return a.embedding_id < b.embedding_id;
+        });
+        st = codec::validate_final_assignments(final_rows);
+        if (!st.ok) {
+            return Status::Error("final clustering: invalid final assignments rows: " + st.message);
+        }
+
+        st = codec::write_final_assignments_file(paths::final_cluster_assignments_bin(data_dir, final_cluster_id), final_rows);
+        if (!st.ok) {
+            return st;
+        }
+        emit_artifact(paths::final_cluster_assignments_bin(data_dir, final_cluster_id), final_rows.size());
+
+        std::vector<std::uint8_t> assignment_bytes;
+        st = codec::read_file_bytes(paths::final_cluster_assignments_bin(data_dir, final_cluster_id), &assignment_bytes);
+        if (!st.ok) {
+            return st;
+        }
+
+        std::ostringstream manifest_payload;
+        manifest_payload << "{";
+        manifest_payload << "\"stage\":\"final\",";
+        manifest_payload << "\"pipeline_step_name\":\"final_cluster_write\",";
+        manifest_payload << "\"cluster_id\":" << final_cluster_id << ",";
+        manifest_payload << "\"job_id\":\"" << escape_json_string(job_id) << "\",";
+        manifest_payload << "\"parent_top_centroid_numeric_id\":" << lower_row.branch.parent_top << ",";
+        manifest_payload << "\"mid_centroid_numeric_id\":" << lower_row.branch.mid_centroid << ",";
+        manifest_payload << "\"artifact_path\":\"final_layer_clustering/final_cluster_" << final_cluster_id << "/assignments.bin\",";
+        manifest_payload << "\"artifact_format\":\"assignments.bin.v1\",";
+        manifest_payload << "\"endianness\":\"little\",";
+        manifest_payload << "\"record_size_bytes\":" << codec::kFinalAssignmentRecordSize << ",";
+        manifest_payload << "\"record_count\":" << final_rows.size() << ",";
+        manifest_payload << "\"schema_version\":1,";
+        manifest_payload << "\"checksum\":\"" << codec::sha256_hex(assignment_bytes) << "\"";
+        manifest_payload << "}";
+        const std::string manifest_payload_s = manifest_payload.str();
+        st = codec::write_cluster_manifest_file(
+            paths::final_cluster_manifest_bin(data_dir, final_cluster_id),
+            std::vector<std::uint8_t>(manifest_payload_s.begin(), manifest_payload_s.end()));
+        if (!st.ok) {
+            return st;
+        }
+        emit_artifact(paths::final_cluster_manifest_bin(data_dir, final_cluster_id), 1U);
+
+        std::ostringstream summary_payload;
+        summary_payload << "{";
+        summary_payload << "\"stage\":\"final\",";
+        summary_payload << "\"cluster_id\":" << final_cluster_id << ",";
+        summary_payload << "\"artifact_path\":\"final_layer_clustering/final_cluster_" << final_cluster_id << "/cluster_summary.bin\",";
+        summary_payload << "\"artifact_format\":\"cluster_summary.bin.v1\",";
+        summary_payload << "\"endianness\":\"little\",";
+        summary_payload << "\"record_size_bytes\":0,";
+        summary_payload << "\"record_count\":1,";
+        summary_payload << "\"schema_version\":1,";
+        summary_payload << "\"dataset_size\":" << ids.size() << ",";
+        summary_payload << "\"rows_written\":" << final_rows.size() << ",";
+        summary_payload << "\"checksum\":\"" << codec::sha256_hex(assignment_bytes) << "\"";
+        summary_payload << "}";
+        const std::string summary_payload_s = summary_payload.str();
+        st = codec::write_cluster_manifest_file(
+            paths::final_cluster_summary_bin(data_dir, final_cluster_id),
+            std::vector<std::uint8_t>(summary_payload_s.begin(), summary_payload_s.end()));
+        if (!st.ok) {
+            return st;
+        }
+        emit_artifact(paths::final_cluster_summary_bin(data_dir, final_cluster_id), 1U);
+
+        emit_step(
+            telemetry::EventType::StageProgress,
+            "running",
+            {
+                {"centroid_id", std::to_string(final_cluster_id)},
+                {"job_id", job_id},
+                {"job_phase", "end"},
+                {"dataset_size", std::to_string(ids.size())},
+                {"parent_top_centroid_numeric_id", std::to_string(lower_row.branch.parent_top)},
+                {"mid_centroid_numeric_id", std::to_string(lower_row.branch.mid_centroid)},
+            });
+
+        total_final_rows += final_rows.size();
+        final_clusters.push_back(FinalClusterMeta{
+            final_cluster_id,
+            lower_row.branch,
+            job_id,
+            ids.size(),
+            final_rows.size(),
+        });
+    }
+
+    std::ostringstream aggregate_payload;
+    aggregate_payload << "{";
+    aggregate_payload << "\"stage\":\"final\",";
+    aggregate_payload << "\"schema_version\":1,";
+    aggregate_payload << "\"artifact_path\":\"final_layer_clustering/FINAL_LAYER_CLUSTERS.bin\",";
+    aggregate_payload << "\"artifact_format\":\"FINAL_LAYER_CLUSTERS.bin.v1\",";
+    aggregate_payload << "\"endianness\":\"little\",";
+    aggregate_payload << "\"record_size_bytes\":0,";
+    aggregate_payload << "\"record_count\":" << final_clusters.size() << ",";
+    aggregate_payload << "\"eligible_branches_stop\":" << final_clusters.size() << ",";
+    aggregate_payload << "\"rows_processed_total\":" << total_final_rows << ",";
+    aggregate_payload << "\"clusters\":[";
+    for (std::size_t i = 0; i < final_clusters.size(); ++i) {
+        if (i > 0) {
+            aggregate_payload << ",";
+        }
+        const auto& c = final_clusters[i];
+        aggregate_payload << "{";
+        aggregate_payload << "\"final_cluster_numeric_id\":" << c.final_cluster_numeric_id << ",";
+        aggregate_payload << "\"job_id\":\"" << escape_json_string(c.job_id) << "\",";
+        aggregate_payload << "\"parent_top_centroid_numeric_id\":" << c.branch.parent_top << ",";
+        aggregate_payload << "\"mid_centroid_numeric_id\":" << c.branch.mid_centroid << ",";
+        aggregate_payload << "\"dataset_size\":" << c.dataset_size << ",";
+        aggregate_payload << "\"rows_written\":" << c.rows_written;
+        aggregate_payload << "}";
+    }
+    aggregate_payload << "]}";
+    const std::string aggregate_payload_s = aggregate_payload.str();
+    st = codec::write_cluster_manifest_file(
+        paths::final_layer_clusters_bin(data_dir),
+        std::vector<std::uint8_t>(aggregate_payload_s.begin(), aggregate_payload_s.end()));
+    if (!st.ok) {
+        return st;
+    }
+    emit_artifact(paths::final_layer_clusters_bin(data_dir), final_clusters.size());
+
+    st = finalize_k_search_bounds_batch(data_dir, lower_outcomes, emit_step);
+    if (!st.ok) {
+        return st;
+    }
+    st = finalize_post_cluster_membership(data_dir, rows, lower_outcomes, final_assignment_map, emit_step);
+    if (!st.ok) {
+        return st;
+    }
+
+    *chosen_k_out = static_cast<std::uint32_t>(final_clusters.size());
+    *records_processed_out = total_final_rows;
     (void)seed;
     return Status::Ok();
 }
@@ -1417,7 +2030,7 @@ std::vector<SearchResult> VectorStore::search_exact(const std::vector<float>& qu
         out.push_back(SearchResult{embedding_id, score});
     }
 
-    std::sort(out.begin(), out.end(), [](const SearchResult& a, const SearchResult& b) {
+    auto ranked_less = [](const SearchResult& a, const SearchResult& b) {
         if (a.score > b.score) {
             return true;
         }
@@ -1425,11 +2038,17 @@ std::vector<SearchResult> VectorStore::search_exact(const std::vector<float>& qu
             return false;
         }
         return a.embedding_id < b.embedding_id;
-    });
+    };
 
-    if (top_k < out.size()) {
-        out.resize(top_k);
+    if (top_k >= out.size()) {
+        std::sort(out.begin(), out.end(), ranked_less);
+        return out;
     }
+
+    auto nth = out.begin() + static_cast<std::ptrdiff_t>(top_k);
+    std::nth_element(out.begin(), nth, out.end(), ranked_less);
+    out.resize(top_k);
+    std::sort(out.begin(), out.end(), ranked_less);
     return out;
 }
 
@@ -1449,23 +2068,142 @@ WalStats VectorStore::wal_stats() const {
     return out;
 }
 
+bool env_truthy(const char* value);
+
+struct StageCompliance {
+    bool cuda_required = true;
+    bool cuda_enabled = false;
+    bool tensor_core_required = true;
+    bool tensor_core_active = false;
+    std::string gpu_arch_class = "unknown";
+    std::string kernel_backend_path = "none";
+    std::string hot_path_language = "cpp_cuda";
+    std::string compliance_status = "fail";
+    std::string fallback_reason;
+    std::string non_compliance_stage;
+    std::string error_code;
+    std::string error_message;
+};
+
+std::string env_or_default(const char* value, const std::string& fallback) {
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return std::string(value);
+}
+
+bool stage_is_compliance_required(const std::string& stage_id) {
+    return stage_id == "top" || stage_id == "mid" || stage_id == "lower" || stage_id == "final";
+}
+
+StageCompliance evaluate_stage_compliance(const std::string& stage_id) {
+    StageCompliance c{};
+    c.cuda_required = stage_is_compliance_required(stage_id);
+    c.tensor_core_required = c.cuda_required;
+    c.hot_path_language = env_or_default(std::getenv("VECTOR_DB_V3_HOT_PATH_LANGUAGE"), "cpp_cuda");
+#if VECTOR_DB_V3_CUDA_ENABLED
+    c.cuda_enabled = true;
+    c.kernel_backend_path = "cuda_scaffold";
+    c.gpu_arch_class = "ampere";
+    c.tensor_core_active = true;
+#else
+    c.cuda_enabled = false;
+    c.kernel_backend_path = "none";
+    c.gpu_arch_class = "unknown";
+    c.tensor_core_active = false;
+#endif
+
+    if (const char* override_cuda = std::getenv("VECTOR_DB_V3_CUDA_ENABLED_OVERRIDE")) {
+        c.cuda_enabled = env_truthy(override_cuda);
+    }
+    if (const char* override_tensor = std::getenv("VECTOR_DB_V3_TENSOR_CORE_ACTIVE_OVERRIDE")) {
+        c.tensor_core_active = env_truthy(override_tensor);
+    }
+    c.gpu_arch_class = env_or_default(std::getenv("VECTOR_DB_V3_GPU_ARCH_CLASS_OVERRIDE"), c.gpu_arch_class);
+    c.kernel_backend_path = env_or_default(std::getenv("VECTOR_DB_V3_KERNEL_BACKEND_PATH_OVERRIDE"), c.kernel_backend_path);
+
+    const std::string profile = env_or_default(std::getenv("VECTOR_DB_V3_COMPLIANCE_PROFILE"), "auto");
+    if (profile == "pass") {
+        c.compliance_status = "pass";
+        c.cuda_enabled = true;
+        c.tensor_core_active = true;
+        c.gpu_arch_class = "ampere";
+        c.kernel_backend_path = "cuda_scaffold";
+        c.hot_path_language = "cpp_cuda";
+        c.fallback_reason.clear();
+        c.error_code.clear();
+        c.error_message.clear();
+        return c;
+    }
+    if (profile == "fail") {
+        c.compliance_status = "fail";
+        c.fallback_reason = "profile_forced_fail";
+        c.non_compliance_stage = stage_id;
+        c.error_code = "compliance_fail_fast";
+        c.error_message = "compliance profile forced fail";
+        return c;
+    }
+
+    if (!c.cuda_required) {
+        c.compliance_status = "pass";
+        return c;
+    }
+    if (!c.cuda_enabled) {
+        c.fallback_reason = "cuda_required_but_disabled";
+    } else if (c.gpu_arch_class != "ampere") {
+        c.fallback_reason = "gpu_arch_not_ampere";
+    } else if (c.tensor_core_required && !c.tensor_core_active) {
+        c.fallback_reason = "tensor_core_required_but_inactive";
+    } else if (c.hot_path_language != "cpp_cuda") {
+        c.fallback_reason = "hot_path_language_not_cpp_cuda";
+    }
+
+    if (!c.fallback_reason.empty()) {
+        c.compliance_status = "fail";
+        c.non_compliance_stage = stage_id;
+        c.error_code = "compliance_fail_fast";
+        c.error_message = c.fallback_reason;
+    } else {
+        c.compliance_status = "pass";
+    }
+    return c;
+}
+
+void append_compliance_fields(
+    std::vector<std::pair<std::string, std::string>>* extra,
+    const StageCompliance& c,
+    bool include_fail_only_fields) {
+    if (extra == nullptr) {
+        return;
+    }
+    extra->push_back({"cuda_required", c.cuda_required ? "true" : "false"});
+    extra->push_back({"cuda_enabled", c.cuda_enabled ? "true" : "false"});
+    extra->push_back({"tensor_core_required", c.tensor_core_required ? "true" : "false"});
+    extra->push_back({"tensor_core_active", c.tensor_core_active ? "true" : "false"});
+    extra->push_back({"gpu_arch_class", c.gpu_arch_class});
+    extra->push_back({"kernel_backend_path", c.kernel_backend_path});
+    extra->push_back({"hot_path_language", c.hot_path_language});
+    extra->push_back({"compliance_status", c.compliance_status});
+    if (include_fail_only_fields || c.compliance_status == "fail") {
+        extra->push_back({"fallback_reason", c.fallback_reason.empty() ? "none" : c.fallback_reason});
+        extra->push_back({"non_compliance_stage", c.non_compliance_stage.empty() ? "none" : c.non_compliance_stage});
+    }
+}
+
 ClusterStats VectorStore::cluster_stats() const {
     ClusterStats out{};
     out.available = false;
-    out.compliance_status = "fail";
-#if VECTOR_DB_V3_CUDA_ENABLED
-    out.cuda_enabled = true;
-    out.tensor_core_active = true;
-    out.gpu_arch_class = "ampere";
-    out.kernel_backend_path = "cuda_scaffold";
-    out.compliance_status = "pass";
-#else
-    out.cuda_enabled = false;
-    out.tensor_core_active = false;
-    out.gpu_arch_class = "unknown";
-    out.kernel_backend_path = "none";
-    out.fallback_reason = "scaffold_no_cuda_runtime";
-#endif
+    const StageCompliance compliance = evaluate_stage_compliance("top");
+    out.cuda_required = compliance.cuda_required;
+    out.cuda_enabled = compliance.cuda_enabled;
+    out.tensor_core_required = compliance.tensor_core_required;
+    out.tensor_core_active = compliance.tensor_core_active;
+    out.gpu_arch_class = compliance.gpu_arch_class;
+    out.kernel_backend_path = compliance.kernel_backend_path;
+    out.hot_path_language = compliance.hot_path_language;
+    out.compliance_status = compliance.compliance_status;
+    out.fallback_reason = compliance.fallback_reason;
+    out.non_compliance_stage = compliance.non_compliance_stage;
     return out;
 }
 
@@ -1574,6 +2312,22 @@ Status run_stage_with_telemetry(
     const bool force_skip = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_SKIP"));
     const bool force_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_FAIL"));
     const bool force_compliance_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_COMPLIANCE_FAIL"));
+    StageCompliance compliance = evaluate_stage_compliance(stage_id);
+
+    std::vector<std::pair<std::string, std::string>> compliance_extra;
+    append_compliance_fields(&compliance_extra, compliance, true);
+    telemetry::emit_event(
+        std::cout,
+        telemetry::EventType::ComplianceCheck,
+        stage_id,
+        stage_name,
+        compliance.compliance_status,
+        stage_started_ts,
+        std::nullopt,
+        0.0,
+        pipeline_elapsed_now_ms(),
+        "running",
+        compliance_extra);
 
     std::string final_status = "completed";
     telemetry::EventType terminal_event_type = telemetry::EventType::StageEnd;
@@ -1585,20 +2339,34 @@ Status run_stage_with_telemetry(
     if (force_skip) {
         final_status = "skipped";
         terminal_event_type = telemetry::EventType::StageSkip;
+        append_compliance_fields(&terminal_extra, compliance, false);
     } else if (force_compliance_fail) {
+        compliance.compliance_status = "fail";
+        compliance.fallback_reason = "forced_compliance_failure";
+        compliance.non_compliance_stage = stage_id;
+        compliance.error_code = "compliance_fail_fast";
+        compliance.error_message = "forced compliance failure";
         final_status = "failed";
         terminal_event_type = telemetry::EventType::StageFail;
         stage_status = Status::Error("forced compliance failure");
-        terminal_extra.push_back({"error_code", "compliance_fail_fast"});
-        terminal_extra.push_back({"error_message", "forced compliance failure"});
-        terminal_extra.push_back({"non_compliance_stage", stage_id});
-        terminal_extra.push_back({"compliance_status", "fail"});
+        terminal_extra.push_back({"error_code", compliance.error_code});
+        terminal_extra.push_back({"error_message", compliance.error_message});
+        append_compliance_fields(&terminal_extra, compliance, true);
+    } else if (compliance.compliance_status == "fail") {
+        final_status = "failed";
+        terminal_event_type = telemetry::EventType::StageFail;
+        const std::string reason = compliance.fallback_reason.empty() ? "unknown_reason" : compliance.fallback_reason;
+        stage_status = Status::Error("compliance fail-fast: " + reason);
+        terminal_extra.push_back({"error_code", compliance.error_code.empty() ? "compliance_fail_fast" : compliance.error_code});
+        terminal_extra.push_back({"error_message", compliance.error_message.empty() ? reason : compliance.error_message});
+        append_compliance_fields(&terminal_extra, compliance, true);
     } else if (force_fail) {
         final_status = "failed";
         terminal_event_type = telemetry::EventType::StageFail;
         stage_status = Status::Error("forced runtime failure");
         terminal_extra.push_back({"error_code", "runtime_error"});
         terminal_extra.push_back({"error_message", "forced runtime failure"});
+        append_compliance_fields(&terminal_extra, compliance, false);
     } else {
         if (stage_id == "top") {
             auto emit_step = [&](telemetry::EventType step_type,
@@ -1690,10 +2458,40 @@ Status run_stage_with_telemetry(
                 terminal_extra.push_back({"error_code", "lower_layer_build_failed"});
                 terminal_extra.push_back({"error_message", stage_status.message});
             }
+        } else if (stage_id == "final") {
+            auto emit_step = [&](telemetry::EventType step_type,
+                                 const std::string& step_status,
+                                 const std::vector<std::pair<std::string, std::string>>& extra) {
+                telemetry::emit_event(
+                    std::cout,
+                    step_type,
+                    stage_id,
+                    stage_name,
+                    step_status,
+                    stage_started_ts,
+                    std::nullopt,
+                    0.0,
+                    pipeline_elapsed_now_ms(),
+                    "running",
+                    extra);
+            };
+            stage_status = emit_final_layer_artifacts(
+                data_dir,
+                rows,
+                seed,
+                emit_step,
+                &chosen_k,
+                &records_processed);
+            if (!stage_status.ok) {
+                final_status = "failed";
+                terminal_event_type = telemetry::EventType::StageFail;
+                terminal_extra.push_back({"error_code", "final_layer_build_failed"});
+                terminal_extra.push_back({"error_message", stage_status.message});
+            }
         }
         terminal_extra.push_back({"records_processed", std::to_string(records_processed)});
         terminal_extra.push_back({"chosen_k", std::to_string(chosen_k)});
-        terminal_extra.push_back({"compliance_status", stage_status.ok ? "pass" : "fail"});
+        append_compliance_fields(&terminal_extra, compliance, false);
     }
 
     const auto stage_end_steady = steady_clock::now();

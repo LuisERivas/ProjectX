@@ -92,6 +92,26 @@ add_executable(vectordb_v3_lower_layer_gate_artifacts_tests
 )
 target_link_libraries(vectordb_v3_lower_layer_gate_artifacts_tests PRIVATE vectordb_v3)
 
+add_executable(vectordb_v3_final_layer_artifacts_tests
+    tests/test_final_layer_artifacts.cpp
+)
+target_link_libraries(vectordb_v3_final_layer_artifacts_tests PRIVATE vectordb_v3)
+
+add_executable(vectordb_v3_final_layer_eligibility_reconciliation_tests
+    tests/test_final_layer_eligibility_reconciliation.cpp
+)
+target_link_libraries(vectordb_v3_final_layer_eligibility_reconciliation_tests PRIVATE vectordb_v3)
+
+add_executable(vectordb_v3_compliance_pass_tests
+    tests/test_compliance_pass.cpp
+)
+target_link_libraries(vectordb_v3_compliance_pass_tests PRIVATE vectordb_v3)
+
+add_executable(vectordb_v3_compliance_fail_fast_tests
+    tests/test_compliance_fail_fast.cpp
+)
+target_link_libraries(vectordb_v3_compliance_fail_fast_tests PRIVATE vectordb_v3)
+
 enable_testing()
 add_test(NAME vectordb_v3_tests COMMAND vectordb_v3_tests)
 add_test(NAME vectordb_v3_codec_primitives_tests COMMAND vectordb_v3_codec_primitives_tests)
@@ -105,6 +125,12 @@ add_test(NAME vectordb_v3_exact_search_tests COMMAND vectordb_v3_exact_search_te
 add_test(NAME vectordb_v3_top_layer_artifacts_tests COMMAND vectordb_v3_top_layer_artifacts_tests)
 add_test(NAME vectordb_v3_mid_layer_artifacts_tests COMMAND vectordb_v3_mid_layer_artifacts_tests)
 add_test(NAME vectordb_v3_lower_layer_gate_artifacts_tests COMMAND vectordb_v3_lower_layer_gate_artifacts_tests)
+add_test(NAME vectordb_v3_final_layer_artifacts_tests COMMAND vectordb_v3_final_layer_artifacts_tests)
+add_test(
+    NAME vectordb_v3_final_layer_eligibility_reconciliation_tests
+    COMMAND vectordb_v3_final_layer_eligibility_reconciliation_tests)
+add_test(NAME vectordb_v3_compliance_pass_tests COMMAND vectordb_v3_compliance_pass_tests)
+add_test(NAME vectordb_v3_compliance_fail_fast_tests COMMAND vectordb_v3_compliance_fail_fast_tests)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
@@ -114,4 +140,54 @@ if(Python3_Interpreter_FOUND)
     add_test(
         NAME vectordb_v3_terminal_event_contract_tests
         COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_terminal_event_contract.py")
+    add_test(
+        NAME vectordb_v3_smoke_scaffold_tests
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/smoke_scaffold.py")
+    add_test(
+        NAME vectordb_v3_traceability_verify_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_traceability.py"
+            --matrix "${CMAKE_CURRENT_SOURCE_DIR}/contracts/TRACEABILITY_MATRIX.md"
+            --gate-map "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gate_map_reference.json"
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/traceability_ctest")
+    add_test(
+        NAME vectordb_v3_perf_gate_soft_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/perf_gate.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --mode evidence
+            --profile minimum
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest")
+    add_test(
+        NAME vectordb_v3_perf_gate_baseline_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/perf_gate.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --mode baseline
+            --profile jetson_orin
+            --thresholds-file "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard/thresholds_jetson_orin.json"
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard/baseline")
+    add_test(
+        NAME vectordb_v3_perf_gate_hard_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/perf_gate.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --mode hard
+            --profile jetson_orin
+            --thresholds-file "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard/thresholds_jetson_orin.json"
+            --baseline-ref "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard/baseline/baseline_metrics.json"
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/perf_ctest_hard")
+    set_tests_properties(vectordb_v3_perf_gate_hard_tests PROPERTIES DEPENDS vectordb_v3_perf_gate_baseline_tests)
+    add_test(
+        NAME vectordb_v3_reproducibility_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_reproducibility.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --events-only
+            --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/repro_ctest")
 endif()

@@ -1,0 +1,15 @@
+{
+  "gate_id": "G6",
+  "status": "fail",
+  "commands_run": [
+    "ctest --test-dir C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build --output-on-failure -R vectordb_v3_compliance_fail_fast_tests|vectordb_v3_terminal_event_contract_tests|vectordb_v3_cli_contract_tests"
+  ],
+  "artifact_paths": [
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\20260316T193801Z\\G6\\gate.log"
+  ],
+  "contract_refs": [
+    "vector_db_v3/contracts/COMPLIANCE_CONTRACT.md",
+    "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+  ],
+  "duration_ms": 10.076
+}

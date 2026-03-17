@@ -1,0 +1,8 @@
+$ ctest --test-dir C:\Users\lucho\Desktop\Projects\ProjectX\vector_db_v3\build --output-on-failure -R vectordb_v3_terminal_event_contract_tests
+exit_code=127 elapsed_ms=6.518
+--- stderr ---
+[WinError 2] The system cannot find the file specified
+$ C:\Users\lucho\AppData\Local\Programs\Python\Python312\python.exe C:\Users\lucho\Desktop\Projects\ProjectX\vector_db_v3\scripts\check_reproducibility.py --build-dir C:\Users\lucho\Desktop\Projects\ProjectX\vector_db_v3\build --events-only --out-dir C:\Users\lucho\Desktop\Projects\ProjectX\vector_db_v3\gate_evidence\20260316T193801Z\G7/repro
+exit_code=2 elapsed_ms=163.633
+--- stderr ---
+error: missing vectordb_v3_cli binary

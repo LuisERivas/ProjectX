@@ -1,0 +1,98 @@
+{
+  "G1": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md",
+      "vector_db_v3/contracts/M1_SCOPE_CONTRACT.md"
+    ],
+    "commands": [
+      [
+        "ctest",
+        "--test-dir",
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build",
+        "--output-on-failure",
+        "-R",
+        "vectordb_v3_tests|vectordb_v3_exact_search_tests|vectordb_v3_top_layer_artifacts_tests|vectordb_v3_mid_layer_artifacts_tests|vectordb_v3_lower_layer_gate_artifacts_tests|vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests"
+      ]
+    ]
+  },
+  "G3": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/CLI_CONTRACT.md",
+      "vector_db_v3/contracts/ARTIFACT_CONTRACT.md",
+      "vector_db_v3/contracts/BINARY_FORMATS.md",
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+    ],
+    "commands": [
+      [
+        "ctest",
+        "--test-dir",
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build",
+        "--output-on-failure",
+        "-R",
+        "vectordb_v3_codec_primitives_tests|vectordb_v3_codec_artifacts_tests|vectordb_v3_codec_corruption_tests|vectordb_v3_cli_contract_tests|vectordb_v3_top_layer_artifacts_tests|vectordb_v3_mid_layer_artifacts_tests|vectordb_v3_lower_layer_gate_artifacts_tests|vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests"
+      ]
+    ]
+  },
+  "G5": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/COMPLIANCE_CONTRACT.md",
+      "vector_db_v3/contracts/TRACEABILITY_MATRIX.md"
+    ],
+    "commands": [
+      [
+        "ctest",
+        "--test-dir",
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build",
+        "--output-on-failure",
+        "-R",
+        "vectordb_v3_compliance_pass_tests|vectordb_v3_terminal_event_contract_tests|vectordb_v3_cli_contract_tests"
+      ]
+    ]
+  },
+  "G6": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/COMPLIANCE_CONTRACT.md",
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+    ],
+    "commands": [
+      [
+        "ctest",
+        "--test-dir",
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build",
+        "--output-on-failure",
+        "-R",
+        "vectordb_v3_compliance_fail_fast_tests|vectordb_v3_terminal_event_contract_tests|vectordb_v3_cli_contract_tests"
+      ]
+    ]
+  },
+  "G7": {
+    "mandatory": true,
+    "contract_refs": [
+      "vector_db_v3/contracts/TERMINAL_EVENT_CONTRACT.md",
+      "vector_db_v3/contracts/TEST_GATE_CONTRACT.md"
+    ],
+    "commands": [
+      [
+        "ctest",
+        "--test-dir",
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build",
+        "--output-on-failure",
+        "-R",
+        "vectordb_v3_terminal_event_contract_tests"
+      ],
+      [
+        "C:\\Users\\lucho\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\scripts\\check_reproducibility.py",
+        "--build-dir",
+        "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build",
+        "--events-only",
+        "--out-dir",
+        "__GATE_DIR__/repro"
+      ]
+    ]
+  }
+}
