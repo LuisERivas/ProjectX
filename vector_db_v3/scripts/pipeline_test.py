@@ -111,6 +111,15 @@ def run_stage_or_fail(
     return result
 
 
+def stage_result_row(stage_name: str, command: list[str], result: CommandResult) -> dict[str, object]:
+    return {
+        "stage": stage_name,
+        "exit_code": int(result.exit_code),
+        "latency_ms": round(result.elapsed_ms, 3),
+        "command": " ".join(command),
+    }
+
+
 def resolve_cli_binary(build_dir: Path) -> Path | None:
     candidates = [build_dir / "vectordb_v3_cli.exe", build_dir / "vectordb_v3_cli"]
     for candidate in candidates:
@@ -172,6 +181,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run Step-3 smoke command stages (init, stats) with lifecycle latency logging.",
     )
+    parser.add_argument(
+        "--run-full-pipeline",
+        action="store_true",
+        help="Run full Step-4 ordered pipeline stages after dataset generation.",
+    )
+    parser.add_argument(
+        "--with-search-sanity",
+        action="store_true",
+        help="Append optional search sanity stage when --run-full-pipeline is enabled.",
+    )
+    parser.add_argument(
+        "--with-cluster-stats",
+        action="store_true",
+        help="Append optional cluster-stats stage when --run-full-pipeline is enabled.",
+    )
     return parser
 
 
@@ -186,6 +210,11 @@ def resolve_dataset_path(data_dir: Path, input_format: str) -> Path:
 def random_vector(dim: int, rng: random.Random) -> list[float]:
     # Use float32-friendly range [0,1) and keep values stable for downstream parsing.
     return [rng.random() for _ in range(dim)]
+
+
+def write_query_vec_file(path: Path, dim: int = VECTOR_DIM) -> None:
+    values = ",".join("0.0" for _ in range(dim))
+    path.write_text(values, encoding="utf-8")
 
 
 def write_synthetic_jsonl(path: Path, embedding_count: int, dim: int = VECTOR_DIM, seed: int | None = None) -> int:
@@ -297,6 +326,74 @@ def validate_generated_file(
     return False, "unsupported input format for validation"
 
 
+def build_pipeline_stages(
+    cli_binary: Path,
+    data_dir: Path,
+    dataset_path: Path,
+    input_format: str,
+    batch_size: int,
+    with_search_sanity: bool,
+    with_cluster_stats: bool,
+    query_vec_path: Path | None,
+) -> list[tuple[str, list[str]]]:
+    if input_format == "jsonl":
+        ingest_cmd = [
+            str(cli_binary),
+            "bulk-insert",
+            "--path",
+            str(data_dir),
+            "--input",
+            str(dataset_path),
+            "--batch-size",
+            str(batch_size),
+        ]
+    elif input_format == "bin":
+        ingest_cmd = [
+            str(cli_binary),
+            "bulk-insert-bin",
+            "--path",
+            str(data_dir),
+            "--input",
+            str(dataset_path),
+            "--batch-size",
+            str(batch_size),
+        ]
+    else:
+        raise ValueError(f"unsupported input format: {input_format}")
+
+    stages: list[tuple[str, list[str]]] = [
+        ("init", [str(cli_binary), "init", "--path", str(data_dir)]),
+        ("ingest", ingest_cmd),
+        ("build-top-clusters", [str(cli_binary), "build-top-clusters", "--path", str(data_dir)]),
+        ("build-mid-layer-clusters", [str(cli_binary), "build-mid-layer-clusters", "--path", str(data_dir)]),
+        ("build-lower-layer-clusters", [str(cli_binary), "build-lower-layer-clusters", "--path", str(data_dir)]),
+        ("build-final-layer-clusters", [str(cli_binary), "build-final-layer-clusters", "--path", str(data_dir)]),
+    ]
+
+    if with_search_sanity:
+        if query_vec_path is None:
+            raise ValueError("query vector path is required when with_search_sanity is enabled")
+        stages.append(
+            (
+                "search",
+                [
+                    str(cli_binary),
+                    "search",
+                    "--path",
+                    str(data_dir),
+                    "--vec",
+                    str(query_vec_path),
+                    "--topk",
+                    "5",
+                ],
+            )
+        )
+    if with_cluster_stats:
+        stages.append(("cluster-stats", [str(cli_binary), "cluster-stats", "--path", str(data_dir)]))
+
+    return stages
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -305,6 +402,12 @@ def main() -> int:
         return emit_usage_error("--embedding-count must be > 0")
     if args.batch_size <= 0:
         return emit_usage_error("--batch-size must be > 0")
+    if args.runner_smoke and args.run_full_pipeline:
+        return emit_usage_error("--runner-smoke cannot be combined with --run-full-pipeline")
+    if (args.with_search_sanity or args.with_cluster_stats) and not args.run_full_pipeline:
+        return emit_usage_error(
+            "--with-search-sanity/--with-cluster-stats require --run-full-pipeline"
+        )
 
     build_dir = Path(args.build_dir).resolve()
     cli_binary = resolve_cli_binary(build_dir)
@@ -368,13 +471,36 @@ def main() -> int:
             stage_result = run_stage_or_fail(stage_name=stage_name, command=stage_command)
             if stage_result is None:
                 return 1
-            smoke_stage_results.append(
-                {
-                    "stage": stage_name,
-                    "exit_code": stage_result.exit_code,
-                    "latency_ms": round(stage_result.elapsed_ms, 3),
-                }
+            smoke_stage_results.append(stage_result_row(stage_name, stage_command, stage_result))
+
+    pipeline_stage_results: list[dict[str, object]] = []
+    if args.run_full_pipeline:
+        query_vec_path: Path | None = None
+        if args.with_search_sanity:
+            query_vec_path = data_dir / "search_query.vec"
+            try:
+                write_query_vec_file(query_vec_path, dim=VECTOR_DIM)
+            except OSError as exc:
+                return emit_runtime_error(f"failed to write search sanity vector: {exc}")
+        try:
+            full_stages = build_pipeline_stages(
+                cli_binary=cli_binary,
+                data_dir=data_dir,
+                dataset_path=dataset_path,
+                input_format=args.input_format,
+                batch_size=int(args.batch_size),
+                with_search_sanity=bool(args.with_search_sanity),
+                with_cluster_stats=bool(args.with_cluster_stats),
+                query_vec_path=query_vec_path,
             )
+        except ValueError as exc:
+            return emit_usage_error(str(exc))
+
+        for stage_name, stage_command in full_stages:
+            stage_result = run_stage_or_fail(stage_name=stage_name, command=stage_command)
+            if stage_result is None:
+                return 1
+            pipeline_stage_results.append(stage_result_row(stage_name, stage_command, stage_result))
 
     payload = {
         "status": "ok",
@@ -390,6 +516,10 @@ def main() -> int:
         "rows_written": rows_written,
         "runner_smoke": bool(args.runner_smoke),
         "runner_smoke_stage_results": smoke_stage_results,
+        "run_full_pipeline": bool(args.run_full_pipeline),
+        "with_search_sanity": bool(args.with_search_sanity),
+        "with_cluster_stats": bool(args.with_cluster_stats),
+        "pipeline_stage_results": pipeline_stage_results,
         "results_out": str(results_out),
         "keep_data": bool(args.keep_data),
     }
