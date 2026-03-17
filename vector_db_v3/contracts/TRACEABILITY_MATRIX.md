@@ -25,6 +25,7 @@ Provide requirement-to-contract-to-test mapping for M1 implementation governance
 | C++/CUDA hot-path policy | `M1_SCOPE_CONTRACT.md`, `COMPLIANCE_CONTRACT.md` | G5 |
 | WAL/checkpoint/replay durability | `M1_SCOPE_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G2 |
 | Performance hard-gate thresholds (Jetson Orin profile) and anti-flake reporting | `TEST_GATE_CONTRACT.md`, `implementationplan.md` | G4 |
+| Binary FP32 ingest command and format validation (`bulk-insert-bin`) | `CLI_CONTRACT.md`, `M1_SCOPE_CONTRACT.md` | G1, G3, G4 |
 | Contract backward compatibility | `CLI_CONTRACT.md`, `ARTIFACT_CONTRACT.md` | G3 |
 
 ## Usage Rule

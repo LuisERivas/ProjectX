@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,26 @@ def vec_csv(value: float) -> str:
 
 def vec_const_csv(value: float) -> str:
     return ",".join(f"{value:.6f}" for _ in range(1024))
+
+
+def write_bulk_bin(path: Path, rows: list[tuple[int, float]]) -> None:
+    # Header: magic(u32), version(u16), record_size(u32), record_count(u64)
+    dim = 1024
+    record_size = 8 + dim * 4
+    header = bytearray(18)
+    header[0:4] = (0x49423356).to_bytes(4, "little", signed=False)
+    header[4:6] = (1).to_bytes(2, "little", signed=False)
+    header[6:10] = record_size.to_bytes(4, "little", signed=False)
+    header[10:18] = len(rows).to_bytes(8, "little", signed=False)
+    with path.open("wb") as f:
+        f.write(header)
+        for embedding_id, value in rows:
+            row = bytearray(record_size)
+            row[0:8] = int(embedding_id).to_bytes(8, "little", signed=False)
+            packed = struct.pack("<f", float(value))
+            for i in range(dim):
+                row[8 + i * 4 : 12 + i * 4] = packed
+            f.write(row)
 
 
 def main() -> int:
@@ -108,6 +129,31 @@ def main() -> int:
     payload = parse_json(out)
     if payload.get("inserted") != 2:
         return fail("bulk-insert inserted count mismatch", out, err)
+
+    bulk_bin = data_dir / "bulk.bin"
+    write_bulk_bin(bulk_bin, [(20, 0.2), (21, 0.3)])
+    code, out, err = run(
+        [str(cli), "bulk-insert-bin", "--path", str(data_dir), "--input", str(bulk_bin), "--batch-size", "1"],
+        root,
+        env=env_pass,
+    )
+    if code != 0:
+        return fail("bulk-insert-bin should succeed", out, err)
+    payload = parse_json(out)
+    if payload.get("command") != "bulk-insert-bin" or payload.get("inserted") != 2:
+        return fail("bulk-insert-bin payload mismatch", out, err)
+
+    bad_bin = data_dir / "bulk_bad.bin"
+    bad_bin.write_bytes(b"\x00\x00\x00\x00")
+    code, out, err = run(
+        [str(cli), "bulk-insert-bin", "--path", str(data_dir), "--input", str(bad_bin), "--batch-size", "1"],
+        root,
+        env=env_pass,
+    )
+    if code != 2:
+        return fail("bulk-insert-bin malformed header should be usage error (2)", out, err)
+    if not err.startswith("error: "):
+        return fail("bulk-insert-bin malformed header stderr format", out, err)
 
     code, out, err = run([str(cli), "search", "--path", str(data_dir), "--vec", vec_csv(1.0), "--topk", "2"], root, env=env_pass)
     if code != 0:

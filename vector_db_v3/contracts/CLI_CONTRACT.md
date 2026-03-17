@@ -9,6 +9,7 @@ Define stable CLI commands, output behavior, and failure semantics for M1.
 - `init --path <data_dir>`
 - `insert --path ... --id <u64> --vec <file_or_csv>`
 - `bulk-insert --path ... --input <jsonl> [--batch-size <u32>]`
+- `bulk-insert-bin --path ... --input <bin> [--batch-size <u32>]`
 - `delete --path ... --id <u64>`
 - `get --path ... --id <u64>`
 - `search --path ... --vec <file_or_csv> [--topk <u32>]`
@@ -47,4 +48,16 @@ Define stable CLI commands, output behavior, and failure semantics for M1.
 - Existing output keys must not silently change meaning.
 - New keys must be additive.
 - Breaking changes require explicit migration note and version bump.
+
+## Binary Ingest Feed (M1 additive)
+
+- `bulk-insert-bin` reads a little-endian FP32 feed with fixed records.
+- Header layout:
+  - `magic: u32` (`V3BI`)
+  - `version: u16` (`1`)
+  - `record_size_bytes: u32` (`4104`)
+  - `record_count: u64`
+- Record layout:
+  - `embedding_id: u64`
+  - `vector: 1024 x f32` (FP32 ingest boundary)
 

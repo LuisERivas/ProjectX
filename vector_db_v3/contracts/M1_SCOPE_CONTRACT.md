@@ -14,6 +14,7 @@ Freeze M1 feature boundaries and non-negotiable runtime behavior for Vector DB v
 - CUDA-required runtime policy for critical stages.
 - CUDA kernel/runtime best-practice compliance for critical paths (parallelism, minimized host-device transfers, tuned launch config, coalesced memory access, reduced redundant global accesses, divergence-aware kernels).
 - Binary-first artifact storage 
+- Binary FP32 ingest feed is allowed for synthetic/perf workloads, with unchanged command and stage semantics.
 - End-of-pipeline batch finalization step that writes consolidated k-search bounds across clustering stages.
 - End-of-pipeline consolidated post-cluster membership artifact with one row per live embedding.
 

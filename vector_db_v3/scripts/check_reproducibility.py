@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import struct
 from pathlib import Path
 
 
@@ -112,6 +113,43 @@ def write_seeded_jsonl(path: Path, count: int = 64, dim: int = 1024) -> None:
             f.write(json.dumps({"embedding_id": embedding_id, "vector": vec}) + "\n")
 
 
+def store_le_u16(buf: bytearray, offset: int, value: int) -> None:
+    buf[offset : offset + 2] = value.to_bytes(2, byteorder="little", signed=False)
+
+
+def store_le_u32(buf: bytearray, offset: int, value: int) -> None:
+    buf[offset : offset + 4] = value.to_bytes(4, byteorder="little", signed=False)
+
+
+def store_le_u64(buf: bytearray, offset: int, value: int) -> None:
+    buf[offset : offset + 8] = value.to_bytes(8, byteorder="little", signed=False)
+
+
+def store_le_f32(buf: bytearray, offset: int, value: float) -> None:
+    buf[offset : offset + 4] = struct.pack("<f", value)
+
+
+def write_seeded_bin(path: Path, count: int = 64, dim: int = 1024) -> None:
+    if dim != 1024:
+        raise ValueError("binary generator expects dim=1024")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = bytearray(18)
+    # V3BI as little-endian u32
+    store_le_u32(header, 0, 0x49423356)
+    store_le_u16(header, 4, 1)
+    store_le_u32(header, 6, 8 + dim * 4)
+    store_le_u64(header, 10, count)
+    with path.open("wb") as f:
+        f.write(header)
+        for embedding_id in range(1, count + 1):
+            row = bytearray(8 + dim * 4)
+            store_le_u64(row, 0, embedding_id)
+            for j in range(dim):
+                value = round(((embedding_id * 31 + j * 17) % 1000) / 1000.0, 6)
+                store_le_f32(row, 8 + j * 4, float(value))
+            f.write(row)
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -131,15 +169,28 @@ def collect_bin_hashes(root: Path) -> dict[str, str]:
     return hashes
 
 
-def run_pipeline(cli: Path, repo_root: Path, data_dir: Path, events_only: bool, env: dict[str, str]) -> tuple[bool, dict]:
+def run_pipeline(
+    cli: Path,
+    repo_root: Path,
+    data_dir: Path,
+    events_only: bool,
+    env: dict[str, str],
+    input_format: str,
+) -> tuple[bool, dict]:
     if data_dir.exists():
         shutil.rmtree(data_dir)
     bulk_jsonl = data_dir / "bulk.jsonl"
-    write_seeded_jsonl(bulk_jsonl)
+    bulk_bin = data_dir / "bulk.bin"
+    if input_format == "jsonl":
+        write_seeded_jsonl(bulk_jsonl)
+        ingest_step = [str(cli), "bulk-insert", "--path", str(data_dir), "--input", str(bulk_jsonl), "--batch-size", "16"]
+    else:
+        write_seeded_bin(bulk_bin)
+        ingest_step = [str(cli), "bulk-insert-bin", "--path", str(data_dir), "--input", str(bulk_bin), "--batch-size", "16"]
 
     steps = [
         [str(cli), "init", "--path", str(data_dir)],
-        [str(cli), "bulk-insert", "--path", str(data_dir), "--input", str(bulk_jsonl), "--batch-size", "16"],
+        ingest_step,
         [str(cli), "build-top-clusters", "--path", str(data_dir), "--seed", "7"],
         [str(cli), "build-mid-layer-clusters", "--path", str(data_dir), "--seed", "7"],
         [str(cli), "build-lower-layer-clusters", "--path", str(data_dir), "--seed", "7"],
@@ -168,6 +219,7 @@ def main() -> int:
     parser.add_argument("--build-dir", default="vector_db_v3/build")
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--events-only", action="store_true")
+    parser.add_argument("--input-format", choices=["bin", "jsonl"], default="bin")
     args = parser.parse_args()
 
     module_root = Path(__file__).resolve().parents[1]
@@ -197,8 +249,8 @@ def main() -> int:
     env = dict(os.environ)
     env["VECTOR_DB_V3_COMPLIANCE_PROFILE"] = "pass"
 
-    ok1, one = run_pipeline(cli, repo_root, run1_dir, args.events_only, env)
-    ok2, two = run_pipeline(cli, repo_root, run2_dir, args.events_only, env)
+    ok1, one = run_pipeline(cli, repo_root, run1_dir, args.events_only, env, args.input_format)
+    ok2, two = run_pipeline(cli, repo_root, run2_dir, args.events_only, env, args.input_format)
     if not ok1 or not ok2:
         diff = {"status": "fail", "reason": "pipeline command failed", "run1": one, "run2": two}
         write_json(out_dir / "diff_report.json", diff)
