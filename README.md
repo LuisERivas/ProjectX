@@ -64,7 +64,7 @@ Communications flow (dedicated worker):
 
 Reference: `BOUNDARY_MATRIX.md`
 
-## Current behavior notes
+## Current behavior notess
 
 - Worker business logic is currently an echo placeholder in `worker/worker_main.py`.
 - Idempotency is supported via `Idempotency-Key` header.
