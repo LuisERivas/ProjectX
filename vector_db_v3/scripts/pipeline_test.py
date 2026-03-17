@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import random
 import struct
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 VECTOR_DIM = 1024
@@ -13,6 +16,15 @@ BIN_MAGIC_V3BI = 0x49423356
 BIN_VERSION = 1
 BIN_HEADER_BYTES = 18  # u32 magic + u16 version + u32 record_size + u64 record_count
 BIN_RECORD_BYTES = 8 + VECTOR_DIM * 4  # u64 embedding_id + 1024 * f32
+
+
+@dataclass
+class CommandResult:
+    command: list[str]
+    exit_code: int
+    stdout: str
+    stderr: str
+    elapsed_ms: float
 
 
 def emit_usage_error(message: str) -> int:
@@ -23,6 +35,80 @@ def emit_usage_error(message: str) -> int:
 def emit_runtime_error(message: str) -> int:
     print(f"error: {message}", file=sys.stderr)
     return 1
+
+
+def log_stage_start(stage_name: str) -> None:
+    print(f"[START] {stage_name}")
+
+
+def log_stage_end(stage_name: str, result: CommandResult) -> None:
+    if result.exit_code == 0:
+        print(f"[OK] {stage_name} | latency_ms={result.elapsed_ms:.3f}")
+    else:
+        print(f"[FAIL] {stage_name} | latency_ms={result.elapsed_ms:.3f} | exit={result.exit_code}")
+
+
+def run_command_timed(
+    command: list[str],
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> CommandResult:
+    start = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        end = time.perf_counter()
+        return CommandResult(
+            command=command,
+            exit_code=int(completed.returncode),
+            stdout=completed.stdout or "",
+            stderr=completed.stderr or "",
+            elapsed_ms=(end - start) * 1000.0,
+        )
+    except OSError as exc:
+        end = time.perf_counter()
+        return CommandResult(
+            command=command,
+            exit_code=127,
+            stdout="",
+            stderr=str(exc),
+            elapsed_ms=(end - start) * 1000.0,
+        )
+
+
+def summarize_failure(result: CommandResult, max_lines: int = 3, max_chars: int = 400) -> str:
+    source = result.stderr.strip() if result.stderr.strip() else result.stdout.strip()
+    if not source:
+        return "no command output"
+    lines = source.splitlines()
+    summary = " | ".join(lines[:max_lines]).strip()
+    if len(summary) > max_chars:
+        return summary[: max_chars - 3] + "..."
+    return summary
+
+
+def run_stage_or_fail(
+    stage_name: str,
+    command: list[str],
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> CommandResult | None:
+    log_stage_start(stage_name)
+    result = run_command_timed(command=command, cwd=cwd, env=env)
+    log_stage_end(stage_name, result)
+    if result.exit_code != 0:
+        print(
+            f"error: stage '{stage_name}' failed: {summarize_failure(result)}",
+            file=sys.stderr,
+        )
+        return None
+    return result
 
 
 def resolve_cli_binary(build_dir: Path) -> Path | None:
@@ -80,6 +166,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-data",
         action="store_true",
         help="Preserve test data directory after future pipeline runs.",
+    )
+    parser.add_argument(
+        "--runner-smoke",
+        action="store_true",
+        help="Run Step-3 smoke command stages (init, stats) with lifecycle latency logging.",
     )
     return parser
 
@@ -267,6 +358,24 @@ def main() -> int:
     if not ok:
         return emit_runtime_error(f"generated dataset validation failed: {message}")
 
+    smoke_stage_results: list[dict[str, object]] = []
+    if args.runner_smoke:
+        smoke_stages = [
+            ("init", [str(cli_binary), "init", "--path", str(data_dir)]),
+            ("stats", [str(cli_binary), "stats", "--path", str(data_dir)]),
+        ]
+        for stage_name, stage_command in smoke_stages:
+            stage_result = run_stage_or_fail(stage_name=stage_name, command=stage_command)
+            if stage_result is None:
+                return 1
+            smoke_stage_results.append(
+                {
+                    "stage": stage_name,
+                    "exit_code": stage_result.exit_code,
+                    "latency_ms": round(stage_result.elapsed_ms, 3),
+                }
+            )
+
     payload = {
         "status": "ok",
         "command": "pipeline-test-generate",
@@ -279,6 +388,8 @@ def main() -> int:
         "seed_mode": "deterministic" if args.seed is not None else "entropy",
         "dataset_path": str(dataset_path),
         "rows_written": rows_written,
+        "runner_smoke": bool(args.runner_smoke),
+        "runner_smoke_stage_results": smoke_stage_results,
         "results_out": str(results_out),
         "keep_data": bool(args.keep_data),
     }
