@@ -1,0 +1,49 @@
+{
+  "status": "pass",
+  "failure_detail": null,
+  "timestamp_utc": "2026-03-17T22:07:50.210255+00:00",
+  "args": {
+    "build_dir": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_test_build",
+    "data_dir": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_success",
+    "embedding_count": 8,
+    "batch_size": 1000,
+    "input_format": "bin",
+    "run_full_pipeline": false,
+    "runner_smoke": false,
+    "with_search_sanity": false,
+    "with_cluster_stats": false,
+    "seed": null,
+    "results_out": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_success\\result.json",
+    "keep_data": false
+  },
+  "seed_mode": "entropy",
+  "stage_results": {
+    "runner_smoke": [],
+    "full_pipeline": []
+  },
+  "cluster_summary": null,
+  "cluster_summary_warnings": [],
+  "counts_summary": {
+    "inserted": 8,
+    "top": null,
+    "mid": null,
+    "lower_continue": null,
+    "lower_stop": null,
+    "final": null
+  },
+  "artifacts": {
+    "build_dir": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_test_build",
+    "cli_binary": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_test_build\\vectordb_v3_cli",
+    "data_dir": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_success",
+    "dataset_path": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_success\\bulk.bin",
+    "results_out": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_success\\result.json"
+  },
+  "exit_code": 0,
+  "command": "pipeline-test-generate",
+  "input_format": "bin",
+  "rows_written": 8,
+  "run_full_pipeline": false,
+  "with_search_sanity": false,
+  "with_cluster_stats": false,
+  "keep_data": false
+}

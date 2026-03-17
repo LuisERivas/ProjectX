@@ -1,0 +1,56 @@
+{
+  "status": "fail",
+  "failure_detail": {
+    "kind": "stage_failure",
+    "message": "stage 'init' failed",
+    "stage": "init",
+    "command": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_test_build\\vectordb_v3_cli init --path C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_fail_stage",
+    "exit_code": 127,
+    "summary": "[WinError 193] %1 is not a valid Win32 application"
+  },
+  "timestamp_utc": "2026-03-17T22:08:33.337647+00:00",
+  "args": {
+    "build_dir": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_test_build",
+    "data_dir": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_fail_stage",
+    "embedding_count": 8,
+    "batch_size": 1000,
+    "input_format": "bin",
+    "run_full_pipeline": true,
+    "runner_smoke": false,
+    "with_search_sanity": false,
+    "with_cluster_stats": false,
+    "seed": null,
+    "results_out": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_fail_stage\\result.json",
+    "keep_data": false
+  },
+  "seed_mode": "entropy",
+  "stage_results": {
+    "runner_smoke": [],
+    "full_pipeline": []
+  },
+  "cluster_summary": null,
+  "cluster_summary_warnings": [],
+  "counts_summary": {
+    "inserted": 8,
+    "top": null,
+    "mid": null,
+    "lower_continue": null,
+    "lower_stop": null,
+    "final": null
+  },
+  "artifacts": {
+    "build_dir": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_test_build",
+    "cli_binary": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_test_build\\vectordb_v3_cli",
+    "data_dir": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_fail_stage",
+    "dataset_path": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_fail_stage\\bulk.bin",
+    "results_out": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\.tmp_step6_fail_stage\\result.json"
+  },
+  "exit_code": 1,
+  "command": "pipeline-test-generate",
+  "input_format": "bin",
+  "rows_written": 8,
+  "run_full_pipeline": true,
+  "with_search_sanity": false,
+  "with_cluster_stats": false,
+  "keep_data": false
+}

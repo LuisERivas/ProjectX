@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import datetime as dt
 import json
 import random
 import struct
@@ -100,13 +101,18 @@ def run_stage_or_fail(
     command: list[str],
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    failure_out: dict[str, object] | None = None,
 ) -> CommandResult | None:
     log_stage_start(stage_name)
     result = run_command_timed(command=command, cwd=cwd, env=env)
     log_stage_end(stage_name, result)
     if result.exit_code != 0:
+        summary = summarize_failure(result)
+        if failure_out is not None:
+            failure_out["exit_code"] = int(result.exit_code)
+            failure_out["summary"] = summary
         print(
-            f"error: stage '{stage_name}' failed: {summarize_failure(result)}",
+            f"error: stage '{stage_name}' failed: {summary}",
             file=sys.stderr,
         )
         return None
@@ -284,6 +290,80 @@ def print_step5_summary(summary: dict[str, object]) -> None:
     print(f"lower_branches_stop: {summary['lower_branches_stop']}")
     print(f"final_cluster_count: {summary['final_cluster_count']}")
     print(f"total_pipeline_latency_ms: {float(summary['total_pipeline_latency_ms']):.3f}")
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def build_counts_summary(rows_written: int | None, cluster_summary: dict[str, object] | None, ingest_result: CommandResult | None) -> dict[str, int | None]:
+    inserted = _parse_ingest_inserted(ingest_result)
+    if inserted is None and rows_written is not None:
+        inserted = int(rows_written)
+    return {
+        "inserted": int(inserted) if inserted is not None else None,
+        "top": int(cluster_summary["top_cluster_count"]) if cluster_summary and "top_cluster_count" in cluster_summary else None,
+        "mid": int(cluster_summary["mid_cluster_count"]) if cluster_summary and "mid_cluster_count" in cluster_summary else None,
+        "lower_continue": int(cluster_summary["lower_branches_continue"]) if cluster_summary and "lower_branches_continue" in cluster_summary else None,
+        "lower_stop": int(cluster_summary["lower_branches_stop"]) if cluster_summary and "lower_branches_stop" in cluster_summary else None,
+        "final": int(cluster_summary["final_cluster_count"]) if cluster_summary and "final_cluster_count" in cluster_summary else None,
+    }
+
+
+def build_result_payload(
+    *,
+    status: str,
+    failure_detail: dict[str, object] | None,
+    exit_code: int,
+    args_snapshot: dict[str, object],
+    seed_mode: str,
+    runner_smoke_stage_results: list[dict[str, object]],
+    pipeline_stage_results: list[dict[str, object]],
+    cluster_summary: dict[str, object] | None,
+    cluster_summary_warnings: list[str],
+    counts_summary: dict[str, int | None],
+    build_dir: Path | None,
+    cli_binary: Path | None,
+    data_dir: Path | None,
+    dataset_path: Path | None,
+    results_out: Path | None,
+    rows_written: int | None,
+    run_full_pipeline: bool,
+    with_search_sanity: bool,
+    with_cluster_stats: bool,
+    keep_data: bool,
+    input_format: str | None,
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "failure_detail": failure_detail,
+        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "args": args_snapshot,
+        "seed_mode": seed_mode,
+        "stage_results": {
+            "runner_smoke": runner_smoke_stage_results,
+            "full_pipeline": pipeline_stage_results,
+        },
+        "cluster_summary": cluster_summary,
+        "cluster_summary_warnings": cluster_summary_warnings,
+        "counts_summary": counts_summary,
+        "artifacts": {
+            "build_dir": str(build_dir) if build_dir is not None else None,
+            "cli_binary": str(cli_binary) if cli_binary is not None else None,
+            "data_dir": str(data_dir) if data_dir is not None else None,
+            "dataset_path": str(dataset_path) if dataset_path is not None else None,
+            "results_out": str(results_out) if results_out is not None else None,
+        },
+        "exit_code": int(exit_code),
+        "command": "pipeline-test-generate",
+        "input_format": input_format,
+        "rows_written": rows_written,
+        "run_full_pipeline": run_full_pipeline,
+        "with_search_sanity": with_search_sanity,
+        "with_cluster_stats": with_cluster_stats,
+        "keep_data": keep_data,
+    }
 
 
 def resolve_cli_binary(build_dir: Path) -> Path | None:
@@ -563,154 +643,293 @@ def build_pipeline_stages(
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    status = "pass"
+    exit_code = 0
+    failure_detail: dict[str, object] | None = None
 
-    if args.embedding_count <= 0:
-        return emit_usage_error("--embedding-count must be > 0")
-    if args.batch_size <= 0:
-        return emit_usage_error("--batch-size must be > 0")
-    if args.runner_smoke and args.run_full_pipeline:
-        return emit_usage_error("--runner-smoke cannot be combined with --run-full-pipeline")
-    if (args.with_search_sanity or args.with_cluster_stats) and not args.run_full_pipeline:
-        return emit_usage_error(
-            "--with-search-sanity/--with-cluster-stats require --run-full-pipeline"
-        )
-
-    build_dir = Path(args.build_dir).resolve()
-    cli_binary = resolve_cli_binary(build_dir)
-    if cli_binary is None:
-        return emit_usage_error(f"missing vectordb_v3_cli binary in --build-dir: {build_dir}")
-
+    build_dir: Path | None = Path(args.build_dir).resolve() if args.build_dir else None
+    cli_binary: Path | None = None
     if args.data_dir:
-        data_dir = Path(args.data_dir).resolve()
+        data_dir: Path | None = Path(args.data_dir).resolve()
     else:
         data_dir = Path(tempfile.gettempdir()) / "vectordb_v3_pipeline_test"
-
     if args.results_out:
-        results_out = Path(args.results_out).resolve()
+        results_out: Path | None = Path(args.results_out).resolve()
     else:
-        results_out = data_dir / "pipeline_test_results.json"
-
-    try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return emit_runtime_error(f"failed to create data directory: {exc}")
-
-    try:
-        dataset_path = resolve_dataset_path(data_dir, args.input_format)
-    except ValueError as exc:
-        return emit_usage_error(str(exc))
-
-    try:
-        if args.input_format == "jsonl":
-            rows_written = write_synthetic_jsonl(
-                path=dataset_path,
-                embedding_count=args.embedding_count,
-                dim=VECTOR_DIM,
-                seed=args.seed,
-            )
-        else:
-            rows_written = write_synthetic_bin(
-                path=dataset_path,
-                embedding_count=args.embedding_count,
-                dim=VECTOR_DIM,
-                seed=args.seed,
-            )
-    except (OSError, ValueError) as exc:
-        return emit_runtime_error(f"failed to generate synthetic dataset: {exc}")
-
-    ok, message = validate_generated_file(
-        path=dataset_path,
-        input_format=args.input_format,
-        expected_count=args.embedding_count,
-        dim=VECTOR_DIM,
-    )
-    if not ok:
-        return emit_runtime_error(f"generated dataset validation failed: {message}")
+        results_out = (data_dir / "pipeline_test_results.json") if data_dir is not None else None
+    dataset_path: Path | None = None
+    rows_written: int | None = None
 
     smoke_stage_results: list[dict[str, object]] = []
-    if args.runner_smoke:
+    pipeline_stage_results: list[dict[str, object]] = []
+    ingest_stage_result: CommandResult | None = None
+    cluster_summary: dict[str, object] | None = None
+    cluster_summary_warnings: list[str] = []
+    stage_failure_ctx: dict[str, object] | None = None
+
+    def set_failure(
+        *,
+        kind: str,
+        message: str,
+        code: int,
+        stage: str | None = None,
+        command: str | None = None,
+        stage_exit_code: int | None = None,
+        summary: str | None = None,
+    ) -> None:
+        nonlocal status, exit_code, failure_detail
+        if failure_detail is not None:
+            return
+        status = "fail"
+        exit_code = code
+        failure_detail = {
+            "kind": kind,
+            "message": message,
+            "stage": stage,
+            "command": command,
+            "exit_code": stage_exit_code,
+            "summary": summary,
+        }
+        print(f"error: {message}", file=sys.stderr)
+
+    if args.embedding_count <= 0:
+        set_failure(kind="usage", message="--embedding-count must be > 0", code=2)
+    if failure_detail is None and args.batch_size <= 0:
+        set_failure(kind="usage", message="--batch-size must be > 0", code=2)
+    if failure_detail is None and args.runner_smoke and args.run_full_pipeline:
+        set_failure(kind="usage", message="--runner-smoke cannot be combined with --run-full-pipeline", code=2)
+    if failure_detail is None and (args.with_search_sanity or args.with_cluster_stats) and not args.run_full_pipeline:
+        set_failure(
+            kind="usage",
+            message="--with-search-sanity/--with-cluster-stats require --run-full-pipeline",
+            code=2,
+        )
+
+    if failure_detail is None:
+        cli_binary = resolve_cli_binary(build_dir) if build_dir is not None else None
+        if cli_binary is None:
+            set_failure(
+                kind="usage",
+                message=f"missing vectordb_v3_cli binary in --build-dir: {build_dir}",
+                code=2,
+            )
+
+    if failure_detail is None and data_dir is not None:
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            set_failure(kind="runtime", message=f"failed to create data directory: {exc}", code=1)
+
+    if failure_detail is None and data_dir is not None:
+        try:
+            dataset_path = resolve_dataset_path(data_dir, args.input_format)
+        except ValueError as exc:
+            set_failure(kind="usage", message=str(exc), code=2)
+
+    if failure_detail is None and dataset_path is not None:
+        try:
+            if args.input_format == "jsonl":
+                rows_written = write_synthetic_jsonl(
+                    path=dataset_path,
+                    embedding_count=args.embedding_count,
+                    dim=VECTOR_DIM,
+                    seed=args.seed,
+                )
+            else:
+                rows_written = write_synthetic_bin(
+                    path=dataset_path,
+                    embedding_count=args.embedding_count,
+                    dim=VECTOR_DIM,
+                    seed=args.seed,
+                )
+        except (OSError, ValueError) as exc:
+            set_failure(kind="runtime", message=f"failed to generate synthetic dataset: {exc}", code=1)
+
+    if failure_detail is None and dataset_path is not None:
+        ok, message = validate_generated_file(
+            path=dataset_path,
+            input_format=args.input_format,
+            expected_count=args.embedding_count,
+            dim=VECTOR_DIM,
+        )
+        if not ok:
+            set_failure(kind="runtime", message=f"generated dataset validation failed: {message}", code=1)
+
+    if failure_detail is None and args.runner_smoke and cli_binary is not None and data_dir is not None:
         smoke_stages = [
             ("init", [str(cli_binary), "init", "--path", str(data_dir)]),
             ("stats", [str(cli_binary), "stats", "--path", str(data_dir)]),
         ]
         for stage_name, stage_command in smoke_stages:
-            stage_result = run_stage_or_fail(stage_name=stage_name, command=stage_command)
+            stage_failure_ctx = {}
+            stage_result = run_stage_or_fail(
+                stage_name=stage_name,
+                command=stage_command,
+                failure_out=stage_failure_ctx,
+            )
             if stage_result is None:
-                return 1
+                set_failure(
+                    kind="stage_failure",
+                    message=f"stage '{stage_name}' failed",
+                    code=1,
+                    stage=stage_name,
+                    command=" ".join(stage_command),
+                    stage_exit_code=stage_failure_ctx.get("exit_code") if isinstance(stage_failure_ctx.get("exit_code"), int) else None,
+                    summary=stage_failure_ctx.get("summary") if isinstance(stage_failure_ctx.get("summary"), str) else None,
+                )
+                break
             smoke_stage_results.append(stage_result_row(stage_name, stage_command, stage_result))
 
-    pipeline_stage_results: list[dict[str, object]] = []
-    ingest_stage_result: CommandResult | None = None
-    cluster_summary: dict[str, object] | None = None
-    cluster_summary_warnings: list[str] = []
-    if args.run_full_pipeline:
+    if failure_detail is None and args.run_full_pipeline and cli_binary is not None and data_dir is not None and dataset_path is not None:
         query_vec_path: Path | None = None
         if args.with_search_sanity:
             query_vec_path = data_dir / "search_query.vec"
             try:
                 write_query_vec_file(query_vec_path, dim=VECTOR_DIM)
             except OSError as exc:
-                return emit_runtime_error(f"failed to write search sanity vector: {exc}")
-        try:
-            full_stages = build_pipeline_stages(
-                cli_binary=cli_binary,
-                data_dir=data_dir,
-                dataset_path=dataset_path,
-                input_format=args.input_format,
-                batch_size=int(args.batch_size),
-                with_search_sanity=bool(args.with_search_sanity),
-                with_cluster_stats=bool(args.with_cluster_stats),
-                query_vec_path=query_vec_path,
-            )
-        except ValueError as exc:
-            return emit_usage_error(str(exc))
+                set_failure(kind="runtime", message=f"failed to write search sanity vector: {exc}", code=1)
+        if failure_detail is None:
+            try:
+                full_stages = build_pipeline_stages(
+                    cli_binary=cli_binary,
+                    data_dir=data_dir,
+                    dataset_path=dataset_path,
+                    input_format=args.input_format,
+                    batch_size=int(args.batch_size),
+                    with_search_sanity=bool(args.with_search_sanity),
+                    with_cluster_stats=bool(args.with_cluster_stats),
+                    query_vec_path=query_vec_path,
+                )
+            except ValueError as exc:
+                set_failure(kind="usage", message=str(exc), code=2)
+                full_stages = []
 
-        for stage_name, stage_command in full_stages:
-            stage_result = run_stage_or_fail(stage_name=stage_name, command=stage_command)
-            if stage_result is None:
-                return 1
-            pipeline_stage_results.append(stage_result_row(stage_name, stage_command, stage_result))
-            if stage_name == "ingest":
-                ingest_stage_result = stage_result
+            for stage_name, stage_command in full_stages:
+                if failure_detail is not None:
+                    break
+                stage_failure_ctx = {}
+                stage_result = run_stage_or_fail(
+                    stage_name=stage_name,
+                    command=stage_command,
+                    failure_out=stage_failure_ctx,
+                )
+                if stage_result is None:
+                    set_failure(
+                        kind="stage_failure",
+                        message=f"stage '{stage_name}' failed",
+                        code=1,
+                        stage=stage_name,
+                        command=" ".join(stage_command),
+                        stage_exit_code=stage_failure_ctx.get("exit_code") if isinstance(stage_failure_ctx.get("exit_code"), int) else None,
+                        summary=stage_failure_ctx.get("summary") if isinstance(stage_failure_ctx.get("summary"), str) else None,
+                    )
+                    break
+                pipeline_stage_results.append(stage_result_row(stage_name, stage_command, stage_result))
+                if stage_name == "ingest":
+                    ingest_stage_result = stage_result
 
-        try:
-            cluster_summary, cluster_summary_warnings = compute_step5_summary(
-                data_dir=data_dir,
-                rows_written=rows_written,
-                pipeline_stage_results=pipeline_stage_results,
-                ingest_result=ingest_stage_result,
-            )
-        except (OSError, ValueError) as exc:
-            return emit_runtime_error(f"failed to parse cluster summary manifests: {exc}")
-        for warning in cluster_summary_warnings:
-            print(f"warning: {warning}", file=sys.stderr)
-        print_step5_summary(cluster_summary)
+        if failure_detail is None:
+            try:
+                cluster_summary, cluster_summary_warnings = compute_step5_summary(
+                    data_dir=data_dir,
+                    rows_written=rows_written or 0,
+                    pipeline_stage_results=pipeline_stage_results,
+                    ingest_result=ingest_stage_result,
+                )
+            except (OSError, ValueError) as exc:
+                set_failure(
+                    kind="runtime",
+                    message=f"failed to parse cluster summary manifests: {exc}",
+                    code=1,
+                )
+            if failure_detail is None and cluster_summary is not None:
+                for warning in cluster_summary_warnings:
+                    print(f"warning: {warning}", file=sys.stderr)
+                print_step5_summary(cluster_summary)
 
-    payload = {
-        "status": "ok",
-        "command": "pipeline-test-generate",
-        "build_dir": str(build_dir),
-        "cli_binary": str(cli_binary),
-        "data_dir": str(data_dir),
+    counts_summary = build_counts_summary(rows_written, cluster_summary, ingest_stage_result)
+    args_snapshot = {
+        "build_dir": str(build_dir) if build_dir is not None else None,
+        "data_dir": str(data_dir) if data_dir is not None else None,
         "embedding_count": int(args.embedding_count),
         "batch_size": int(args.batch_size),
         "input_format": args.input_format,
-        "seed_mode": "deterministic" if args.seed is not None else "entropy",
-        "dataset_path": str(dataset_path),
-        "rows_written": rows_written,
-        "runner_smoke": bool(args.runner_smoke),
-        "runner_smoke_stage_results": smoke_stage_results,
         "run_full_pipeline": bool(args.run_full_pipeline),
+        "runner_smoke": bool(args.runner_smoke),
         "with_search_sanity": bool(args.with_search_sanity),
         "with_cluster_stats": bool(args.with_cluster_stats),
-        "pipeline_stage_results": pipeline_stage_results,
-        "cluster_summary": cluster_summary,
-        "cluster_summary_warnings": cluster_summary_warnings,
-        "results_out": str(results_out),
+        "seed": args.seed,
+        "results_out": str(results_out) if results_out is not None else None,
         "keep_data": bool(args.keep_data),
     }
+    seed_mode = "deterministic" if args.seed is not None else "entropy"
+
+    payload = build_result_payload(
+        status=status,
+        failure_detail=failure_detail,
+        exit_code=exit_code,
+        args_snapshot=args_snapshot,
+        seed_mode=seed_mode,
+        runner_smoke_stage_results=smoke_stage_results,
+        pipeline_stage_results=pipeline_stage_results,
+        cluster_summary=cluster_summary,
+        cluster_summary_warnings=cluster_summary_warnings,
+        counts_summary=counts_summary,
+        build_dir=build_dir,
+        cli_binary=cli_binary,
+        data_dir=data_dir,
+        dataset_path=dataset_path,
+        results_out=results_out,
+        rows_written=rows_written,
+        run_full_pipeline=bool(args.run_full_pipeline),
+        with_search_sanity=bool(args.with_search_sanity),
+        with_cluster_stats=bool(args.with_cluster_stats),
+        keep_data=bool(args.keep_data),
+        input_format=args.input_format,
+    )
+
+    if results_out is not None:
+        try:
+            write_json(results_out, payload)
+        except OSError as exc:
+            print(f"error: failed to write results json: {exc}", file=sys.stderr)
+            if failure_detail is None:
+                status = "fail"
+                exit_code = 1
+                failure_detail = {
+                    "kind": "write_failure",
+                    "message": f"failed to write results json: {exc}",
+                    "stage": None,
+                    "command": None,
+                    "exit_code": None,
+                    "summary": None,
+                }
+                payload = build_result_payload(
+                    status=status,
+                    failure_detail=failure_detail,
+                    exit_code=exit_code,
+                    args_snapshot=args_snapshot,
+                    seed_mode=seed_mode,
+                    runner_smoke_stage_results=smoke_stage_results,
+                    pipeline_stage_results=pipeline_stage_results,
+                    cluster_summary=cluster_summary,
+                    cluster_summary_warnings=cluster_summary_warnings,
+                    counts_summary=counts_summary,
+                    build_dir=build_dir,
+                    cli_binary=cli_binary,
+                    data_dir=data_dir,
+                    dataset_path=dataset_path,
+                    results_out=results_out,
+                    rows_written=rows_written,
+                    run_full_pipeline=bool(args.run_full_pipeline),
+                    with_search_sanity=bool(args.with_search_sanity),
+                    with_cluster_stats=bool(args.with_cluster_stats),
+                    keep_data=bool(args.keep_data),
+                    input_format=args.input_format,
+                )
+
     print(json.dumps(payload, indent=2))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
