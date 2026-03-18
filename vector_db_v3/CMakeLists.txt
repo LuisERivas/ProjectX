@@ -44,6 +44,7 @@ set(VECTOR_DB_V3_CORE_SOURCES
     src/telemetry.cpp
     src/kmeans_backend_cpu.cpp
     src/cuda/kmeans_runtime.cpp
+    src/cuda/pipeline_context.cpp
     src/codec/checksum.cpp
     src/codec/io.cpp
     src/codec/artifacts.cpp
@@ -183,6 +184,11 @@ add_executable(vectordb_v3_kmeans_backend_selection_tests
 )
 target_link_libraries(vectordb_v3_kmeans_backend_selection_tests PRIVATE vectordb_v3)
 
+add_executable(vectordb_v3_gpu_residency_tests
+    tests/test_gpu_residency.cpp
+)
+target_link_libraries(vectordb_v3_gpu_residency_tests PRIVATE vectordb_v3)
+
 enable_testing()
 add_test(NAME vectordb_v3_tests COMMAND vectordb_v3_tests)
 add_test(NAME vectordb_v3_codec_primitives_tests COMMAND vectordb_v3_codec_primitives_tests)
@@ -207,6 +213,7 @@ add_test(
     NAME vectordb_v3_kmeans_tie_break_determinism_tests
     COMMAND vectordb_v3_kmeans_tie_break_determinism_tests)
 add_test(NAME vectordb_v3_kmeans_backend_selection_tests COMMAND vectordb_v3_kmeans_backend_selection_tests)
+add_test(NAME vectordb_v3_gpu_residency_tests COMMAND vectordb_v3_gpu_residency_tests)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

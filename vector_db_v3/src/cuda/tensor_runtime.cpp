@@ -148,6 +148,7 @@ Status run_kmeans_cuda_tensor(
     const std::vector<std::vector<float>>& vectors,
     std::uint32_t k,
     std::uint32_t max_iterations,
+    CudaPipelineContext* pipeline_context,
     KMeansResult* out) {
 #if VECTOR_DB_V3_CUDA_ENABLED
 #if VECTOR_DB_V3_TENSOR_ENABLED
@@ -200,91 +201,172 @@ Status run_kmeans_cuda_tensor(
     DeviceBuffer d_sums;
     DeviceBuffer d_counts;
 
-    Status st = d_vectors_f32.alloc(h_vectors.size() * sizeof(float));
+    void* d_vectors_f32_ptr = nullptr;
+    void* d_centroids_f32_ptr = nullptr;
+    void* d_vectors_fp16_col_ptr = nullptr;
+    void* d_centroids_fp16_col_ptr = nullptr;
+    void* d_dot_kn_ptr = nullptr;
+    void* d_vector_norms_ptr = nullptr;
+    void* d_centroid_norms_ptr = nullptr;
+    void* d_assignments_ptr = nullptr;
+    void* d_min_dists_ptr = nullptr;
+    void* d_sums_ptr = nullptr;
+    void* d_counts_ptr = nullptr;
+
+    const bool residency_enabled = pipeline_context != nullptr && pipeline_context->enabled();
+    const std::uint64_t vectors_token =
+        vectors.empty() ? 0ULL : (reinterpret_cast<std::uint64_t>(vectors.data()) ^
+                                  (reinterpret_cast<std::uint64_t>(vectors.front().data()) << 1U) ^
+                                  (static_cast<std::uint64_t>(vectors.size()) << 32U));
+
+    auto acquire = [&](const char* key, std::size_t bytes, DeviceBuffer* local, void** out_ptr) -> Status {
+        if (residency_enabled) {
+            bool reused = false;
+            return pipeline_context->acquire_buffer(key, bytes, out_ptr, &reused);
+        }
+        Status st_local = local->alloc(bytes);
+        if (!st_local.ok) {
+            return st_local;
+        }
+        *out_ptr = local->get();
+        return Status::Ok();
+    };
+    auto copy_h2d = [&](void* dst, const void* src, std::size_t bytes, const char* label) -> Status {
+        if (residency_enabled) {
+            return pipeline_context->copy_h2d(dst, src, bytes, label);
+        }
+        return checked_copy_h2d(dst, src, bytes, label);
+    };
+    auto copy_d2h = [&](void* dst, const void* src, std::size_t bytes, const char* label) -> Status {
+        if (residency_enabled) {
+            return pipeline_context->copy_d2h(dst, src, bytes, label);
+        }
+        return checked_copy_d2h(dst, src, bytes, label);
+    };
+    auto memset_dev = [&](void* ptr, int value, std::size_t bytes, const char* label) -> Status {
+        if (residency_enabled) {
+            return pipeline_context->memset(ptr, value, bytes, label);
+        }
+        return checked_memset(ptr, value, bytes, label);
+    };
+    auto sync_dev = [&](const char* label) -> Status {
+        if (residency_enabled) {
+            return pipeline_context->sync(label);
+        }
+        return checked_sync(label);
+    };
+
+    Status st = acquire("tensor_vectors_f32", h_vectors.size() * sizeof(float), &d_vectors_f32, &d_vectors_f32_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_centroids_f32.alloc(h_centroids.size() * sizeof(float));
+    st = acquire("tensor_centroids_f32", h_centroids.size() * sizeof(float), &d_centroids_f32, &d_centroids_f32_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_vectors_fp16_col.alloc(h_vectors.size() * sizeof(std::uint16_t));
+    st = acquire(
+        "tensor_vectors_fp16_col",
+        h_vectors.size() * sizeof(std::uint16_t),
+        &d_vectors_fp16_col,
+        &d_vectors_fp16_col_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_centroids_fp16_col.alloc(h_centroids.size() * sizeof(std::uint16_t));
+    st = acquire(
+        "tensor_centroids_fp16_col",
+        h_centroids.size() * sizeof(std::uint16_t),
+        &d_centroids_fp16_col,
+        &d_centroids_fp16_col_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_dot_kn.alloc(static_cast<std::size_t>(k) * n * sizeof(float));
+    st = acquire("tensor_dot_kn", static_cast<std::size_t>(k) * n * sizeof(float), &d_dot_kn, &d_dot_kn_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_vector_norms.alloc(n * sizeof(float));
+    st = acquire("tensor_vector_norms", n * sizeof(float), &d_vector_norms, &d_vector_norms_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_centroid_norms.alloc(k * sizeof(float));
+    st = acquire("tensor_centroid_norms", k * sizeof(float), &d_centroid_norms, &d_centroid_norms_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_assignments.alloc(n * sizeof(std::uint32_t));
+    st = acquire("tensor_assignments", n * sizeof(std::uint32_t), &d_assignments, &d_assignments_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_min_dists.alloc(n * sizeof(float));
+    st = acquire("tensor_min_dists", n * sizeof(float), &d_min_dists, &d_min_dists_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_sums.alloc(h_centroids.size() * sizeof(float));
+    st = acquire("tensor_sums", h_centroids.size() * sizeof(float), &d_sums, &d_sums_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = d_counts.alloc(k * sizeof(std::uint32_t));
+    st = acquire("tensor_counts", k * sizeof(std::uint32_t), &d_counts, &d_counts_ptr);
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
 
-    st = checked_copy_h2d(d_vectors_f32.get(), h_vectors.data(), h_vectors.size() * sizeof(float), "vectors");
+    bool vectors_h2d_skipped = false;
+    if (residency_enabled) {
+        st = pipeline_context->copy_h2d_if_changed(
+            "tensor_vectors_f32",
+            vectors_token,
+            d_vectors_f32_ptr,
+            h_vectors.data(),
+            h_vectors.size() * sizeof(float),
+            "vectors",
+            &vectors_h2d_skipped);
+    } else {
+        st = copy_h2d(d_vectors_f32_ptr, h_vectors.data(), h_vectors.size() * sizeof(float), "vectors");
+    }
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = checked_copy_h2d(d_centroids_f32.get(), h_centroids.data(), h_centroids.size() * sizeof(float), "centroids");
+    st = copy_h2d(d_centroids_f32_ptr, h_centroids.data(), h_centroids.size() * sizeof(float), "centroids");
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
 
-    if (!cuda::launch_pack_rowmajor_to_colmajor_half(
-            static_cast<const float*>(d_vectors_f32.get()),
-            static_cast<__half*>(d_vectors_fp16_col.get()),
+    if (!vectors_h2d_skipped) {
+        if (!cuda::launch_pack_rowmajor_to_colmajor_half(
+                static_cast<const float*>(d_vectors_f32_ptr),
+                static_cast<__half*>(d_vectors_fp16_col_ptr),
+                n,
+                dim)) {
+            cublasDestroy(handle);
+            return Status::Error("kmeans tensor: vectors fp16 pack launch failed");
+        }
+        st = sync_dev("pack_vectors");
+        if (!st.ok) {
+            cublasDestroy(handle);
+            return st;
+        }
+    }
+    if (!cuda::launch_row_norms_f32(
+            static_cast<const float*>(d_vectors_f32_ptr),
+            static_cast<float*>(d_vector_norms_ptr),
             n,
             dim)) {
         cublasDestroy(handle);
-        return Status::Error("kmeans tensor: vectors fp16 pack launch failed");
-    }
-    st = checked_sync("pack_vectors");
-    if (!st.ok) {
-        cublasDestroy(handle);
-        return st;
-    }
-    if (!cuda::launch_row_norms_f32(static_cast<const float*>(d_vectors_f32.get()), static_cast<float*>(d_vector_norms.get()), n, dim)) {
-        cublasDestroy(handle);
         return Status::Error("kmeans tensor: vector norms launch failed");
     }
-    st = checked_sync("vector_norms");
+    st = sync_dev("vector_norms");
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
@@ -295,27 +377,27 @@ Status run_kmeans_cuda_tensor(
     const std::uint32_t iters = std::max<std::uint32_t>(1U, max_iterations);
     for (std::uint32_t iter = 0; iter < iters; ++iter) {
         if (!cuda::launch_pack_rowmajor_to_colmajor_half(
-                static_cast<const float*>(d_centroids_f32.get()),
-                static_cast<__half*>(d_centroids_fp16_col.get()),
+                static_cast<const float*>(d_centroids_f32_ptr),
+                static_cast<__half*>(d_centroids_fp16_col_ptr),
                 k,
                 dim)) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: centroids fp16 pack launch failed");
         }
-        st = checked_sync("pack_centroids");
+        st = sync_dev("pack_centroids");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
         }
         if (!cuda::launch_row_norms_f32(
-                static_cast<const float*>(d_centroids_f32.get()),
-                static_cast<float*>(d_centroid_norms.get()),
+                static_cast<const float*>(d_centroids_f32_ptr),
+                static_cast<float*>(d_centroid_norms_ptr),
                 k,
                 dim)) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: centroid norms launch failed");
         }
-        st = checked_sync("centroid_norms");
+        st = sync_dev("centroid_norms");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
@@ -329,14 +411,14 @@ Status run_kmeans_cuda_tensor(
             static_cast<int>(n),
             static_cast<int>(dim),
             &alpha,
-            d_centroids_fp16_col.get(),
+            d_centroids_fp16_col_ptr,
             CUDA_R_16F,
             static_cast<int>(dim),
-            d_vectors_fp16_col.get(),
+            d_vectors_fp16_col_ptr,
             CUDA_R_16F,
             static_cast<int>(dim),
             &beta,
-            d_dot_kn.get(),
+            d_dot_kn_ptr,
             CUDA_R_32F,
             static_cast<int>(k),
             CUBLAS_COMPUTE_32F_FAST_16F,
@@ -345,35 +427,35 @@ Status run_kmeans_cuda_tensor(
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: cublasGemmEx failed");
         }
-        st = checked_sync("gemm_dot");
+        st = sync_dev("gemm_dot");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
         }
 
         if (!cuda::launch_argmin_from_dot_kn(
-                static_cast<const float*>(d_dot_kn.get()),
-                static_cast<const float*>(d_vector_norms.get()),
-                static_cast<const float*>(d_centroid_norms.get()),
-                static_cast<std::uint32_t*>(d_assignments.get()),
-                static_cast<float*>(d_min_dists.get()),
+                static_cast<const float*>(d_dot_kn_ptr),
+                static_cast<const float*>(d_vector_norms_ptr),
+                static_cast<const float*>(d_centroid_norms_ptr),
+                static_cast<std::uint32_t*>(d_assignments_ptr),
+                static_cast<float*>(d_min_dists_ptr),
                 n,
                 k)) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: argmin launch failed");
         }
-        st = checked_sync("argmin");
+        st = sync_dev("argmin");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
         }
 
-        st = checked_copy_d2h(h_assignments.data(), d_assignments.get(), n * sizeof(std::uint32_t), "assignments");
+        st = copy_d2h(h_assignments.data(), d_assignments_ptr, n * sizeof(std::uint32_t), "assignments");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
         }
-        st = checked_copy_d2h(h_min_dists.data(), d_min_dists.get(), n * sizeof(float), "min_dists");
+        st = copy_d2h(h_min_dists.data(), d_min_dists_ptr, n * sizeof(float), "min_dists");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
@@ -390,34 +472,34 @@ Status run_kmeans_cuda_tensor(
         }
         prev_assignments = h_assignments;
 
-        st = checked_memset(d_sums.get(), 0, h_centroids.size() * sizeof(float), "sums");
+        st = memset_dev(d_sums_ptr, 0, h_centroids.size() * sizeof(float), "sums");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
         }
-        st = checked_memset(d_counts.get(), 0, k * sizeof(std::uint32_t), "counts");
+        st = memset_dev(d_counts_ptr, 0, k * sizeof(std::uint32_t), "counts");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
         }
         if (!cuda::launch_accumulate_kernel(
-                static_cast<const float*>(d_vectors_f32.get()),
-                static_cast<const std::uint32_t*>(d_assignments.get()),
-                static_cast<float*>(d_sums.get()),
-                static_cast<std::uint32_t*>(d_counts.get()),
+                static_cast<const float*>(d_vectors_f32_ptr),
+                static_cast<const std::uint32_t*>(d_assignments_ptr),
+                static_cast<float*>(d_sums_ptr),
+                static_cast<std::uint32_t*>(d_counts_ptr),
                 n,
                 k,
                 dim)) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: accumulate launch failed");
         }
-        st = checked_sync("accumulate");
+        st = sync_dev("accumulate");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
         }
 
-        st = checked_copy_d2h(h_counts.data(), d_counts.get(), k * sizeof(std::uint32_t), "counts");
+        st = copy_d2h(h_counts.data(), d_counts_ptr, k * sizeof(std::uint32_t), "counts");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
@@ -441,33 +523,33 @@ Status run_kmeans_cuda_tensor(
             changed = true;
         }
         if (repaired) {
-            st = checked_copy_h2d(d_assignments.get(), h_assignments.data(), n * sizeof(std::uint32_t), "repaired_assignments");
+            st = copy_h2d(d_assignments_ptr, h_assignments.data(), n * sizeof(std::uint32_t), "repaired_assignments");
             if (!st.ok) {
                 cublasDestroy(handle);
                 return st;
             }
-            st = checked_memset(d_sums.get(), 0, h_centroids.size() * sizeof(float), "sums_repair");
+            st = memset_dev(d_sums_ptr, 0, h_centroids.size() * sizeof(float), "sums_repair");
             if (!st.ok) {
                 cublasDestroy(handle);
                 return st;
             }
-            st = checked_memset(d_counts.get(), 0, k * sizeof(std::uint32_t), "counts_repair");
+            st = memset_dev(d_counts_ptr, 0, k * sizeof(std::uint32_t), "counts_repair");
             if (!st.ok) {
                 cublasDestroy(handle);
                 return st;
             }
             if (!cuda::launch_accumulate_kernel(
-                    static_cast<const float*>(d_vectors_f32.get()),
-                    static_cast<const std::uint32_t*>(d_assignments.get()),
-                    static_cast<float*>(d_sums.get()),
-                    static_cast<std::uint32_t*>(d_counts.get()),
+                    static_cast<const float*>(d_vectors_f32_ptr),
+                    static_cast<const std::uint32_t*>(d_assignments_ptr),
+                    static_cast<float*>(d_sums_ptr),
+                    static_cast<std::uint32_t*>(d_counts_ptr),
                     n,
                     k,
                     dim)) {
                 cublasDestroy(handle);
                 return Status::Error("kmeans tensor: accumulate relaunch failed");
             }
-            st = checked_sync("accumulate_repair");
+            st = sync_dev("accumulate_repair");
             if (!st.ok) {
                 cublasDestroy(handle);
                 return st;
@@ -475,15 +557,15 @@ Status run_kmeans_cuda_tensor(
         }
 
         if (!cuda::launch_update_kernel(
-                static_cast<float*>(d_centroids_f32.get()),
-                static_cast<const float*>(d_sums.get()),
-                static_cast<const std::uint32_t*>(d_counts.get()),
+                static_cast<float*>(d_centroids_f32_ptr),
+                static_cast<const float*>(d_sums_ptr),
+                static_cast<const std::uint32_t*>(d_counts_ptr),
                 k,
                 dim)) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: update launch failed");
         }
-        st = checked_sync("update");
+        st = sync_dev("update");
         if (!st.ok) {
             cublasDestroy(handle);
             return st;
@@ -494,17 +576,17 @@ Status run_kmeans_cuda_tensor(
         }
     }
 
-    st = checked_copy_d2h(h_centroids.data(), d_centroids_f32.get(), h_centroids.size() * sizeof(float), "centroids_out");
+    st = copy_d2h(h_centroids.data(), d_centroids_f32_ptr, h_centroids.size() * sizeof(float), "centroids_out");
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = checked_copy_d2h(h_assignments.data(), d_assignments.get(), n * sizeof(std::uint32_t), "assignments_out");
+    st = copy_d2h(h_assignments.data(), d_assignments_ptr, n * sizeof(std::uint32_t), "assignments_out");
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
     }
-    st = checked_copy_d2h(h_min_dists.data(), d_min_dists.get(), n * sizeof(float), "min_dists_out");
+    st = copy_d2h(h_min_dists.data(), d_min_dists_ptr, n * sizeof(float), "min_dists_out");
     if (!st.ok) {
         cublasDestroy(handle);
         return st;
@@ -529,6 +611,7 @@ Status run_kmeans_cuda_tensor(
     (void)vectors;
     (void)k;
     (void)max_iterations;
+    (void)pipeline_context;
     (void)out;
     return Status::Error("kmeans tensor unavailable: tensor_backend_not_compiled");
 #endif
@@ -536,6 +619,7 @@ Status run_kmeans_cuda_tensor(
     (void)vectors;
     (void)k;
     (void)max_iterations;
+    (void)pipeline_context;
     (void)out;
     return Status::Error("kmeans tensor unavailable: cuda_not_compiled");
 #endif

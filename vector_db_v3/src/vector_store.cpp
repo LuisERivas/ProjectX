@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <map>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -453,7 +454,8 @@ bool tensor_policy_required() {
 KMeansResult run_deterministic_kmeans(
     const std::vector<std::vector<float>>& vectors,
     std::uint32_t k,
-    std::uint32_t max_iterations) {
+    std::uint32_t max_iterations,
+    kmeans::CudaPipelineContext* pipeline_context) {
     KMeansResult out{};
     std::string backend_used;
     Status st = kmeans::run_kmeans(
@@ -462,7 +464,8 @@ KMeansResult run_deterministic_kmeans(
         max_iterations,
         parse_kmeans_backend_preference(),
         &out,
-        &backend_used);
+        &backend_used,
+        pipeline_context);
     if (!st.ok) {
         const kmeans::BackendPreference pref = parse_kmeans_backend_preference();
         const bool allow_cpu_fallback = pref == kmeans::BackendPreference::Auto && !tensor_policy_required();
@@ -473,7 +476,8 @@ KMeansResult run_deterministic_kmeans(
                 max_iterations,
                 kmeans::BackendPreference::Cpu,
                 &out,
-                &backend_used);
+                &backend_used,
+                nullptr);
             if (cpu_st.ok) {
                 return out;
             }
@@ -672,6 +676,7 @@ Status emit_top_layer_artifacts(
     const fs::path& data_dir,
     const std::map<std::uint64_t, Record>& rows,
     std::uint32_t seed,
+    kmeans::CudaPipelineContext* pipeline_context,
     const std::function<void(telemetry::EventType, const std::string&, const std::vector<std::pair<std::string, std::string>>&)>& emit_step,
     std::uint32_t* chosen_k_out,
     std::size_t* records_processed_out) {
@@ -715,7 +720,7 @@ Status emit_top_layer_artifacts(
     tested_ks.reserve(coarse.size() + 3U);
 
     for (const std::uint32_t k : coarse) {
-        const KMeansResult probe = run_deterministic_kmeans(kmeans_vectors, k, 4U);
+        const KMeansResult probe = run_deterministic_kmeans(kmeans_vectors, k, 4U, pipeline_context);
         codec::ElbowTraceRow row{};
         row.k_value = k;
         row.objective_value = static_cast<float>(probe.objective);
@@ -735,7 +740,7 @@ Status emit_top_layer_artifacts(
         if (std::find(tested_ks.begin(), tested_ks.end(), k) != tested_ks.end()) {
             continue;
         }
-        const KMeansResult probe = run_deterministic_kmeans(kmeans_vectors, k, 4U);
+        const KMeansResult probe = run_deterministic_kmeans(kmeans_vectors, k, 4U, pipeline_context);
         codec::ElbowTraceRow row{};
         row.k_value = k;
         row.objective_value = static_cast<float>(probe.objective);
@@ -776,7 +781,7 @@ Status emit_top_layer_artifacts(
             });
     }
 
-    const KMeansResult final_kmeans = run_deterministic_kmeans(kmeans_vectors, best_k, 12U);
+    const KMeansResult final_kmeans = run_deterministic_kmeans(kmeans_vectors, best_k, 12U, pipeline_context);
     if (!validate_kmeans_result_shape(final_kmeans, ids.size())) {
         return Status::Error("top clustering: kmeans backend returned invalid result shape");
     }
@@ -919,6 +924,7 @@ Status emit_mid_layer_artifacts(
     const fs::path& data_dir,
     const std::map<std::uint64_t, Record>& rows,
     std::uint32_t seed,
+    kmeans::CudaPipelineContext* pipeline_context,
     const std::function<void(telemetry::EventType, const std::string&, const std::vector<std::pair<std::string, std::string>>&)>& emit_step,
     std::uint32_t* chosen_k_out,
     std::size_t* records_processed_out) {
@@ -1004,7 +1010,7 @@ Status emit_mid_layer_artifacts(
         tested_ks.reserve(coarse.size() + 3U);
 
         for (const std::uint32_t k : coarse) {
-            const KMeansResult probe = run_deterministic_kmeans(parent_vectors, k, 4U);
+            const KMeansResult probe = run_deterministic_kmeans(parent_vectors, k, 4U, pipeline_context);
             tested_ks.push_back(k);
             if (probe.objective < best_objective ||
                 (probe.objective == best_objective && k < best_k)) {
@@ -1018,7 +1024,7 @@ Status emit_mid_layer_artifacts(
             if (std::find(tested_ks.begin(), tested_ks.end(), k) != tested_ks.end()) {
                 continue;
             }
-            const KMeansResult probe = run_deterministic_kmeans(parent_vectors, k, 4U);
+            const KMeansResult probe = run_deterministic_kmeans(parent_vectors, k, 4U, pipeline_context);
             tested_ks.push_back(k);
             if (probe.objective < best_objective ||
                 (probe.objective == best_objective && k < best_k)) {
@@ -1048,7 +1054,7 @@ Status emit_mid_layer_artifacts(
                 {"tested_ks", tested_ks_json.str()},
             });
 
-        const KMeansResult final_kmeans = run_deterministic_kmeans(parent_vectors, best_k, 12U);
+        const KMeansResult final_kmeans = run_deterministic_kmeans(parent_vectors, best_k, 12U, pipeline_context);
         if (!validate_kmeans_result_shape(final_kmeans, items.size())) {
             return Status::Error("mid clustering: kmeans backend returned invalid result shape");
         }
@@ -2217,6 +2223,20 @@ void append_compliance_fields(
     }
 }
 
+void append_residency_fields(
+    std::vector<std::pair<std::string, std::string>>* extra,
+    const kmeans::RuntimeInfo& info) {
+    if (extra == nullptr) {
+        return;
+    }
+    extra->push_back({"residency_mode", info.residency.residency_mode});
+    extra->push_back({"gpu_residency_cache_hits", std::to_string(info.residency.cache_hits)});
+    extra->push_back({"gpu_residency_cache_misses", std::to_string(info.residency.cache_misses)});
+    extra->push_back({"gpu_residency_bytes_reused", std::to_string(info.residency.bytes_reused)});
+    extra->push_back({"gpu_residency_bytes_h2d_saved_est", std::to_string(info.residency.bytes_h2d_saved_est)});
+    extra->push_back({"gpu_residency_alloc_calls", std::to_string(info.residency.alloc_calls)});
+}
+
 ClusterStats VectorStore::cluster_stats() const {
     ClusterStats out{};
     out.available = false;
@@ -2344,6 +2364,13 @@ Status run_stage_with_telemetry(
     const bool force_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_FAIL"));
     const bool force_compliance_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_COMPLIANCE_FAIL"));
     StageCompliance compliance = evaluate_stage_compliance(stage_id);
+    std::shared_ptr<kmeans::CudaPipelineContext> pipeline_context;
+    if (stage_id == "top" || stage_id == "mid") {
+        pipeline_context = kmeans::CudaPipelineContext::create_from_env();
+        if (pipeline_context != nullptr) {
+            pipeline_context->reset_stage();
+        }
+    }
 
     std::vector<std::pair<std::string, std::string>> compliance_extra;
     append_compliance_fields(&compliance_extra, compliance, true);
@@ -2420,6 +2447,7 @@ Status run_stage_with_telemetry(
                 data_dir,
                 rows,
                 seed,
+                pipeline_context.get(),
                 emit_step,
                 &chosen_k,
                 &records_processed);
@@ -2450,6 +2478,7 @@ Status run_stage_with_telemetry(
                 data_dir,
                 rows,
                 seed,
+                pipeline_context.get(),
                 emit_step,
                 &chosen_k,
                 &records_processed);
@@ -2533,6 +2562,7 @@ Status run_stage_with_telemetry(
         }
         terminal_extra.push_back({"records_processed", std::to_string(records_processed)});
         terminal_extra.push_back({"chosen_k", std::to_string(chosen_k)});
+        append_residency_fields(&terminal_extra, kmeans::last_runtime_info());
         append_compliance_fields(&terminal_extra, compliance, false);
     }
 

@@ -14,6 +14,7 @@ Status run_kmeans_cuda(
     std::uint32_t max_iterations,
     PrecisionPreference precision_preference,
     bool tensor_required,
+    CudaPipelineContext* pipeline_context,
     KMeansResult* out);
 
 namespace {
@@ -157,7 +158,8 @@ Status run_kmeans(
     std::uint32_t max_iterations,
     BackendPreference preference,
     KMeansResult* out,
-    std::string* backend_used) {
+    std::string* backend_used,
+    CudaPipelineContext* pipeline_context) {
     if (out == nullptr) {
         return Status::Error("kmeans run: out is null");
     }
@@ -178,7 +180,8 @@ Status run_kmeans(
     const bool tensor_required = force_tensor || tensor_required_by_policy();
 
     if (preference == BackendPreference::Cuda) {
-        const Status cuda_st = run_kmeans_cuda(vectors, k, max_iterations, precision_pref, tensor_required, out);
+        const Status cuda_st =
+            run_kmeans_cuda(vectors, k, max_iterations, precision_pref, tensor_required, pipeline_context, out);
         if (cuda_st.ok) {
             if (backend_used != nullptr) {
                 *backend_used = last_runtime_info().backend_path;
@@ -189,7 +192,8 @@ Status run_kmeans(
     }
 
     // Auto: try CUDA first, fallback to CPU.
-    const Status cuda_st = run_kmeans_cuda(vectors, k, max_iterations, precision_pref, tensor_required, out);
+    const Status cuda_st =
+        run_kmeans_cuda(vectors, k, max_iterations, precision_pref, tensor_required, pipeline_context, out);
     if (cuda_st.ok) {
         if (backend_used != nullptr) {
             *backend_used = last_runtime_info().backend_path;

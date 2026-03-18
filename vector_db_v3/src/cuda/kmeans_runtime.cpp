@@ -86,10 +86,21 @@ Status checked_memset(void* ptr, int value, std::size_t bytes, const char* label
     return Status::Ok();
 }
 
+std::uint64_t host_token_for_vectors(const std::vector<std::vector<float>>& vectors) {
+    const std::uint64_t n = static_cast<std::uint64_t>(vectors.size());
+    if (vectors.empty()) {
+        return (n << 32U) ^ 0x9e3779b97f4a7c15ULL;
+    }
+    const std::uint64_t p0 = reinterpret_cast<std::uint64_t>(vectors.data());
+    const std::uint64_t p1 = reinterpret_cast<std::uint64_t>(vectors.front().data());
+    return p0 ^ (p1 << 1U) ^ (n << 32U);
+}
+
 Status run_kmeans_cuda_impl(
     const std::vector<std::vector<float>>& vectors,
     std::uint32_t k,
     std::uint32_t max_iterations,
+    CudaPipelineContext* pipeline_context,
     KMeansResult* out) {
     if (out == nullptr) {
         return Status::Error("kmeans cuda: out is null");
@@ -133,40 +144,96 @@ Status run_kmeans_cuda_impl(
     DeviceBuffer d_counts;
     DeviceBuffer d_objective_terms;
 
-    Status st = d_vectors.alloc(h_vectors.size() * sizeof(float));
+    void* d_vectors_ptr = nullptr;
+    void* d_centroids_ptr = nullptr;
+    void* d_assignments_ptr = nullptr;
+    void* d_min_dists_ptr = nullptr;
+    void* d_sums_ptr = nullptr;
+    void* d_counts_ptr = nullptr;
+    void* d_objective_terms_ptr = nullptr;
+    const bool residency_enabled = pipeline_context != nullptr && pipeline_context->enabled();
+
+    auto acquire = [&](const char* key, std::size_t bytes, DeviceBuffer* local, void** out_ptr) -> Status {
+        if (residency_enabled) {
+            bool reused = false;
+            return pipeline_context->acquire_buffer(key, bytes, out_ptr, &reused);
+        }
+        Status st = local->alloc(bytes);
+        if (!st.ok) {
+            return st;
+        }
+        *out_ptr = local->get();
+        return Status::Ok();
+    };
+    auto copy_h2d = [&](void* dst, const void* src, std::size_t bytes, const char* label) -> Status {
+        if (residency_enabled) {
+            return pipeline_context->copy_h2d(dst, src, bytes, label);
+        }
+        return checked_copy_h2d(dst, src, bytes, label);
+    };
+    auto copy_d2h = [&](void* dst, const void* src, std::size_t bytes, const char* label) -> Status {
+        if (residency_enabled) {
+            return pipeline_context->copy_d2h(dst, src, bytes, label);
+        }
+        return checked_copy_d2h(dst, src, bytes, label);
+    };
+    auto memset_dev = [&](void* ptr, int value, std::size_t bytes, const char* label) -> Status {
+        if (residency_enabled) {
+            return pipeline_context->memset(ptr, value, bytes, label);
+        }
+        return checked_memset(ptr, value, bytes, label);
+    };
+
+    Status st = acquire("kmeans_vectors_f32", h_vectors.size() * sizeof(float), &d_vectors, &d_vectors_ptr);
     if (!st.ok) {
         return st;
     }
-    st = d_centroids.alloc(h_centroids.size() * sizeof(float));
+    st = acquire("kmeans_centroids_f32", h_centroids.size() * sizeof(float), &d_centroids, &d_centroids_ptr);
     if (!st.ok) {
         return st;
     }
-    st = d_assignments.alloc(h_assignments.size() * sizeof(std::uint32_t));
+    st = acquire("kmeans_assignments", h_assignments.size() * sizeof(std::uint32_t), &d_assignments, &d_assignments_ptr);
     if (!st.ok) {
         return st;
     }
-    st = d_min_dists.alloc(h_min_dists.size() * sizeof(float));
+    st = acquire("kmeans_min_dists", h_min_dists.size() * sizeof(float), &d_min_dists, &d_min_dists_ptr);
     if (!st.ok) {
         return st;
     }
-    st = d_sums.alloc(h_centroids.size() * sizeof(float));
+    st = acquire("kmeans_sums", h_centroids.size() * sizeof(float), &d_sums, &d_sums_ptr);
     if (!st.ok) {
         return st;
     }
-    st = d_counts.alloc(h_counts.size() * sizeof(std::uint32_t));
+    st = acquire("kmeans_counts", h_counts.size() * sizeof(std::uint32_t), &d_counts, &d_counts_ptr);
     if (!st.ok) {
         return st;
     }
-    st = d_objective_terms.alloc(h_objective_terms.size() * sizeof(float));
+    st = acquire(
+        "kmeans_objective_terms",
+        h_objective_terms.size() * sizeof(float),
+        &d_objective_terms,
+        &d_objective_terms_ptr);
     if (!st.ok) {
         return st;
     }
 
-    st = checked_copy_h2d(d_vectors.get(), h_vectors.data(), h_vectors.size() * sizeof(float), "vectors");
+    if (residency_enabled) {
+        bool skipped = false;
+        st = pipeline_context->copy_h2d_if_changed(
+            "kmeans_vectors_f32",
+            host_token_for_vectors(vectors),
+            d_vectors_ptr,
+            h_vectors.data(),
+            h_vectors.size() * sizeof(float),
+            "vectors",
+            &skipped);
+    } else {
+        st = copy_h2d(d_vectors_ptr, h_vectors.data(), h_vectors.size() * sizeof(float), "vectors");
+    }
     if (!st.ok) {
         return st;
     }
-    st = checked_copy_h2d(d_centroids.get(), h_centroids.data(), h_centroids.size() * sizeof(float), "centroids");
+    st = copy_h2d(d_centroids_ptr, h_centroids.data(), h_centroids.size() * sizeof(float), "centroids");
     if (!st.ok) {
         return st;
     }
@@ -174,20 +241,20 @@ Status run_kmeans_cuda_impl(
     const std::uint32_t iters = std::max<std::uint32_t>(1U, max_iterations);
     for (std::uint32_t iter = 0; iter < iters; ++iter) {
         if (!cuda::launch_assignment_kernel(
-                static_cast<const float*>(d_vectors.get()),
-                static_cast<const float*>(d_centroids.get()),
-                static_cast<std::uint32_t*>(d_assignments.get()),
-                static_cast<float*>(d_min_dists.get()),
+                static_cast<const float*>(d_vectors_ptr),
+                static_cast<const float*>(d_centroids_ptr),
+                static_cast<std::uint32_t*>(d_assignments_ptr),
+                static_cast<float*>(d_min_dists_ptr),
                 n,
                 k,
                 dim)) {
             return Status::Error("kmeans cuda: assignment kernel launch failed");
         }
-        st = checked_copy_d2h(h_assignments.data(), d_assignments.get(), h_assignments.size() * sizeof(std::uint32_t), "assignments");
+        st = copy_d2h(h_assignments.data(), d_assignments_ptr, h_assignments.size() * sizeof(std::uint32_t), "assignments");
         if (!st.ok) {
             return st;
         }
-        st = checked_copy_d2h(h_min_dists.data(), d_min_dists.get(), h_min_dists.size() * sizeof(float), "min_dists");
+        st = copy_d2h(h_min_dists.data(), d_min_dists_ptr, h_min_dists.size() * sizeof(float), "min_dists");
         if (!st.ok) {
             return st;
         }
@@ -203,26 +270,26 @@ Status run_kmeans_cuda_impl(
         }
         prev_assignments = h_assignments;
 
-        st = checked_memset(d_sums.get(), 0, h_centroids.size() * sizeof(float), "sums");
+        st = memset_dev(d_sums_ptr, 0, h_centroids.size() * sizeof(float), "sums");
         if (!st.ok) {
             return st;
         }
-        st = checked_memset(d_counts.get(), 0, h_counts.size() * sizeof(std::uint32_t), "counts");
+        st = memset_dev(d_counts_ptr, 0, h_counts.size() * sizeof(std::uint32_t), "counts");
         if (!st.ok) {
             return st;
         }
         if (!cuda::launch_accumulate_kernel(
-                static_cast<const float*>(d_vectors.get()),
-                static_cast<const std::uint32_t*>(d_assignments.get()),
-                static_cast<float*>(d_sums.get()),
-                static_cast<std::uint32_t*>(d_counts.get()),
+                static_cast<const float*>(d_vectors_ptr),
+                static_cast<const std::uint32_t*>(d_assignments_ptr),
+                static_cast<float*>(d_sums_ptr),
+                static_cast<std::uint32_t*>(d_counts_ptr),
                 n,
                 k,
                 dim)) {
             return Status::Error("kmeans cuda: accumulate kernel launch failed");
         }
 
-        st = checked_copy_d2h(h_counts.data(), d_counts.get(), h_counts.size() * sizeof(std::uint32_t), "counts");
+        st = copy_d2h(h_counts.data(), d_counts_ptr, h_counts.size() * sizeof(std::uint32_t), "counts");
         if (!st.ok) {
             return st;
         }
@@ -246,23 +313,27 @@ Status run_kmeans_cuda_impl(
         }
 
         if (repaired) {
-            st = checked_copy_h2d(d_assignments.get(), h_assignments.data(), h_assignments.size() * sizeof(std::uint32_t), "repaired_assignments");
+            st = copy_h2d(
+                d_assignments_ptr,
+                h_assignments.data(),
+                h_assignments.size() * sizeof(std::uint32_t),
+                "repaired_assignments");
             if (!st.ok) {
                 return st;
             }
-            st = checked_memset(d_sums.get(), 0, h_centroids.size() * sizeof(float), "sums_repair");
+            st = memset_dev(d_sums_ptr, 0, h_centroids.size() * sizeof(float), "sums_repair");
             if (!st.ok) {
                 return st;
             }
-            st = checked_memset(d_counts.get(), 0, h_counts.size() * sizeof(std::uint32_t), "counts_repair");
+            st = memset_dev(d_counts_ptr, 0, h_counts.size() * sizeof(std::uint32_t), "counts_repair");
             if (!st.ok) {
                 return st;
             }
             if (!cuda::launch_accumulate_kernel(
-                    static_cast<const float*>(d_vectors.get()),
-                    static_cast<const std::uint32_t*>(d_assignments.get()),
-                    static_cast<float*>(d_sums.get()),
-                    static_cast<std::uint32_t*>(d_counts.get()),
+                    static_cast<const float*>(d_vectors_ptr),
+                    static_cast<const std::uint32_t*>(d_assignments_ptr),
+                    static_cast<float*>(d_sums_ptr),
+                    static_cast<std::uint32_t*>(d_counts_ptr),
                     n,
                     k,
                     dim)) {
@@ -271,9 +342,9 @@ Status run_kmeans_cuda_impl(
         }
 
         if (!cuda::launch_update_kernel(
-                static_cast<float*>(d_centroids.get()),
-                static_cast<const float*>(d_sums.get()),
-                static_cast<const std::uint32_t*>(d_counts.get()),
+                static_cast<float*>(d_centroids_ptr),
+                static_cast<const float*>(d_sums_ptr),
+                static_cast<const std::uint32_t*>(d_counts_ptr),
                 k,
                 dim)) {
             return Status::Error("kmeans cuda: update kernel launch failed");
@@ -285,24 +356,28 @@ Status run_kmeans_cuda_impl(
     }
 
     if (!cuda::launch_objective_kernel(
-            static_cast<const float*>(d_vectors.get()),
-            static_cast<const float*>(d_centroids.get()),
-            static_cast<const std::uint32_t*>(d_assignments.get()),
-            static_cast<float*>(d_objective_terms.get()),
+            static_cast<const float*>(d_vectors_ptr),
+            static_cast<const float*>(d_centroids_ptr),
+            static_cast<const std::uint32_t*>(d_assignments_ptr),
+            static_cast<float*>(d_objective_terms_ptr),
             n,
             dim)) {
         return Status::Error("kmeans cuda: objective kernel launch failed");
     }
 
-    st = checked_copy_d2h(h_centroids.data(), d_centroids.get(), h_centroids.size() * sizeof(float), "centroids_out");
+    st = copy_d2h(h_centroids.data(), d_centroids_ptr, h_centroids.size() * sizeof(float), "centroids_out");
     if (!st.ok) {
         return st;
     }
-    st = checked_copy_d2h(h_assignments.data(), d_assignments.get(), h_assignments.size() * sizeof(std::uint32_t), "assignments_out");
+    st = copy_d2h(h_assignments.data(), d_assignments_ptr, h_assignments.size() * sizeof(std::uint32_t), "assignments_out");
     if (!st.ok) {
         return st;
     }
-    st = checked_copy_d2h(h_objective_terms.data(), d_objective_terms.get(), h_objective_terms.size() * sizeof(float), "objective_out");
+    st = copy_d2h(
+        h_objective_terms.data(),
+        d_objective_terms_ptr,
+        h_objective_terms.size() * sizeof(float),
+        "objective_out");
     if (!st.ok) {
         return st;
     }
@@ -404,6 +479,7 @@ Status run_kmeans_cuda(
     std::uint32_t max_iterations,
     PrecisionPreference precision_preference,
     bool tensor_required,
+    CudaPipelineContext* pipeline_context,
     KMeansResult* out) {
 #if VECTOR_DB_V3_CUDA_ENABLED
     RuntimeInfo info{};
@@ -412,6 +488,9 @@ Status run_kmeans_cuda(
     info.tensor_compiled = tensor_backend_compiled();
     info.backend_path = "cuda_fp32";
     info.gpu_arch_class = "unknown";
+    if (pipeline_context != nullptr) {
+        info.residency = pipeline_context->stats();
+    }
 
     std::string cuda_reason;
     info.cuda_available = cuda_backend_available(&cuda_reason);
@@ -470,14 +549,17 @@ Status run_kmeans_cuda(
     }
 
     if (use_tensor) {
-        Status tensor_st = run_kmeans_cuda_tensor(vectors, k, max_iterations, out);
+        Status tensor_st = run_kmeans_cuda_tensor(vectors, k, max_iterations, pipeline_context, out);
         if (!tensor_st.ok) {
             if (tensor_required) {
                 info.fallback_reason = "tensor_runtime_unavailable";
                 set_runtime_info_for_stage(info);
                 return tensor_st;
             }
-            Status fp32_st = run_kmeans_cuda_impl(vectors, k, max_iterations, out);
+            Status fp32_st = run_kmeans_cuda_impl(vectors, k, max_iterations, pipeline_context, out);
+            if (pipeline_context != nullptr) {
+                info.residency = pipeline_context->stats();
+            }
             info.tensor_active = false;
             info.backend_path = "cuda_fp32";
             info.fallback_reason = "tensor_runtime_unavailable";
@@ -487,13 +569,19 @@ Status run_kmeans_cuda(
         info.tensor_active = true;
         info.backend_path = "cuda_tensor_fp16";
         info.fallback_reason.clear();
+        if (pipeline_context != nullptr) {
+            info.residency = pipeline_context->stats();
+        }
         set_runtime_info_for_stage(info);
         return tensor_st;
     }
 
-    Status fp32_st = run_kmeans_cuda_impl(vectors, k, max_iterations, out);
+    Status fp32_st = run_kmeans_cuda_impl(vectors, k, max_iterations, pipeline_context, out);
     info.tensor_active = false;
     info.backend_path = "cuda_fp32";
+    if (pipeline_context != nullptr) {
+        info.residency = pipeline_context->stats();
+    }
     if (fp32_st.ok) {
         set_runtime_info_for_stage(info);
     } else {
@@ -507,6 +595,7 @@ Status run_kmeans_cuda(
     (void)max_iterations;
     (void)precision_preference;
     (void)tensor_required;
+    (void)pipeline_context;
     (void)out;
     return Status::Error("kmeans cuda unavailable: cuda_not_compiled");
 #endif

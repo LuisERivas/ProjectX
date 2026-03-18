@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "vector_db_v3/cuda_pipeline_context.hpp"
 #include "vector_db_v3/status.hpp"
 #include "vector_db_v3/vector_store.hpp"
 
@@ -32,6 +33,7 @@ struct RuntimeInfo {
     std::string backend_path = "cpu";
     std::string gpu_arch_class = "unknown";
     std::string fallback_reason;
+    ResidencyStats residency{};
 };
 
 struct KMeansResult {
@@ -46,7 +48,8 @@ Status run_kmeans(
     std::uint32_t max_iterations,
     BackendPreference preference,
     KMeansResult* out,
-    std::string* backend_used);
+    std::string* backend_used,
+    CudaPipelineContext* pipeline_context = nullptr);
 
 bool cuda_backend_compiled();
 bool cuda_backend_available(std::string* reason);

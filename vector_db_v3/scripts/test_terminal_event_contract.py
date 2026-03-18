@@ -119,6 +119,26 @@ def assert_compliance_fields(events: list[dict], expect_status: str) -> None:
                 raise AssertionError(f"missing fail compliance field: {key}")
 
 
+def assert_residency_fields(events: list[dict]) -> None:
+    terminal = None
+    for e in events:
+        if e.get("event_type") in {"stage_end", "stage_fail", "stage_skip"}:
+            terminal = e
+    if terminal is None:
+        raise AssertionError("missing terminal stage event")
+    required = [
+        "residency_mode",
+        "gpu_residency_cache_hits",
+        "gpu_residency_cache_misses",
+        "gpu_residency_bytes_reused",
+        "gpu_residency_bytes_h2d_saved_est",
+        "gpu_residency_alloc_calls",
+    ]
+    for key in required:
+        if key not in terminal:
+            raise AssertionError(f"missing residency field: {key}")
+
+
 def assert_top_stage_sub_events(events: list[dict]) -> None:
     k_selection = [e for e in events if e.get("event_type") == "k_selection"]
     if not k_selection:
@@ -235,6 +255,7 @@ def main() -> int:
 
     env_pass = dict(os.environ)
     env_pass["VECTOR_DB_V3_COMPLIANCE_PROFILE"] = "pass"
+    env_pass["VECTOR_DB_V3_GPU_RESIDENCY_MODE"] = "stage"
 
     code, out, err = run([str(cli), "init", "--path", str(data_dir)], root, env=env_pass)
     if code != 0:
@@ -251,6 +272,7 @@ def main() -> int:
         assert_monotonic_pipeline_elapsed(events)
         assert_top_stage_sub_events(events)
         assert_compliance_fields(events, "pass")
+        assert_residency_fields(events)
         stage_start = next(e for e in events if e["event_type"] == "stage_start")
         if "stage_started_ts" not in stage_start or "stage_elapsed_ms" not in stage_start:
             raise AssertionError("stage_start missing baseline lifecycle fields")
@@ -290,6 +312,7 @@ def main() -> int:
         assert_monotonic_pipeline_elapsed(events)
         assert_mid_stage_sub_events(events)
         assert_compliance_fields(events, "pass")
+        assert_residency_fields(events)
     except Exception as exc:
         return fail(f"mid run telemetry contract mismatch: {exc}", out, err)
     if not cmd or cmd.get("status") != "ok":
@@ -306,6 +329,7 @@ def main() -> int:
         assert_monotonic_pipeline_elapsed(events)
         assert_lower_stage_sub_events(events)
         assert_compliance_fields(events, "pass")
+        assert_residency_fields(events)
     except Exception as exc:
         return fail(f"lower run telemetry contract mismatch: {exc}", out, err)
     if not cmd or cmd.get("status") != "ok":
@@ -322,6 +346,7 @@ def main() -> int:
         assert_monotonic_pipeline_elapsed(events)
         assert_final_stage_sub_events(events)
         assert_compliance_fields(events, "pass")
+        assert_residency_fields(events)
     except Exception as exc:
         return fail(f"final run telemetry contract mismatch: {exc}", out, err)
     if not cmd or cmd.get("status") != "ok":
