@@ -22,6 +22,7 @@ Provide requirement-to-contract-to-test mapping for M1 implementation governance
 | Terminal JSONL lifecycle events | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | Active pipeline terminal reporting and previous-run timing baseline | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | CUDA/Tensor/Ampere compliance | `COMPLIANCE_CONTRACT.md` | G5, G6 |
+| Tensor Core FP16 distance-path selection truthfulness and fallback evidence (`cuda_tensor_fp16` vs `cuda_fp32`) | `COMPLIANCE_CONTRACT.md`, `TERMINAL_EVENT_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G1, G5, G6, G7 |
 | C++/CUDA hot-path policy | `M1_SCOPE_CONTRACT.md`, `COMPLIANCE_CONTRACT.md` | G5 |
 | WAL/checkpoint/replay durability | `M1_SCOPE_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G2 |
 | Performance hard-gate thresholds (Jetson Orin profile) and anti-flake reporting | `TEST_GATE_CONTRACT.md`, `implementationplan.md` | G4 |

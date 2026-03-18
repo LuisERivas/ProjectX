@@ -56,6 +56,9 @@ int main() {
     ok &= expect(stats.tensor_core_required, "tensor_core_required true");
     ok &= expect(stats.tensor_core_active, "tensor_core_active true");
     ok &= expect(stats.gpu_arch_class == "ampere", "gpu_arch_class ampere");
+    ok &= expect(
+        stats.kernel_backend_path == "cuda_tensor_fp16" || stats.kernel_backend_path == "cuda_fp32",
+        "kernel_backend_path should report concrete cuda backend");
     ok &= expect(stats.hot_path_language == "cpp_cuda", "hot_path_language cpp_cuda");
     ok &= expect(store.close().ok, "close");
     set_env("VECTOR_DB_V3_COMPLIANCE_PROFILE", "");

@@ -1,6 +1,8 @@
 #include "vector_db_v3/kmeans_backend.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <limits>
 #include <string>
 
@@ -10,9 +12,51 @@ Status run_kmeans_cuda(
     const std::vector<std::vector<float>>& vectors,
     std::uint32_t k,
     std::uint32_t max_iterations,
+    PrecisionPreference precision_preference,
+    bool tensor_required,
     KMeansResult* out);
 
 namespace {
+
+RuntimeInfo g_last_runtime_info{};
+
+std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+PrecisionPreference parse_precision_preference() {
+    const char* value = std::getenv("VECTOR_DB_V3_KMEANS_PRECISION");
+    if (value == nullptr || *value == '\0') {
+        return PrecisionPreference::Auto;
+    }
+    const std::string pref = lowercase(std::string(value));
+    if (pref == "fp32" || pref == "cuda_fp32") {
+        return PrecisionPreference::FP32;
+    }
+    if (pref == "tensor" || pref == "fp16" || pref == "tensor_fp16") {
+        return PrecisionPreference::TensorFP16;
+    }
+    return PrecisionPreference::Auto;
+}
+
+bool env_truthy(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string v = lowercase(std::string(value));
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+bool tensor_required_by_policy() {
+    const char* policy = std::getenv("VECTOR_DB_V3_TENSOR_POLICY");
+    if (policy == nullptr || *policy == '\0') {
+        return false;
+    }
+    return lowercase(std::string(policy)) == "required";
+}
 
 double squared_l2(const std::vector<float>& a, const std::vector<float>& b) {
     double out = 0.0;
@@ -122,14 +166,21 @@ Status run_kmeans(
         if (backend_used != nullptr) {
             *backend_used = "cpu";
         }
+        RuntimeInfo info{};
+        info.backend_path = "cpu";
+        set_runtime_info_for_stage(info);
         return run_kmeans_cpu(vectors, k, max_iterations, out);
     }
 
+    const PrecisionPreference precision_pref = parse_precision_preference();
+    const bool force_tensor = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_TENSOR_PATH"));
+    const bool tensor_required = force_tensor || tensor_required_by_policy();
+
     if (preference == BackendPreference::Cuda) {
-        const Status cuda_st = run_kmeans_cuda(vectors, k, max_iterations, out);
+        const Status cuda_st = run_kmeans_cuda(vectors, k, max_iterations, precision_pref, tensor_required, out);
         if (cuda_st.ok) {
             if (backend_used != nullptr) {
-                *backend_used = "cuda";
+                *backend_used = last_runtime_info().backend_path;
             }
             return cuda_st;
         }
@@ -137,17 +188,29 @@ Status run_kmeans(
     }
 
     // Auto: try CUDA first, fallback to CPU.
-    const Status cuda_st = run_kmeans_cuda(vectors, k, max_iterations, out);
+    const Status cuda_st = run_kmeans_cuda(vectors, k, max_iterations, precision_pref, tensor_required, out);
     if (cuda_st.ok) {
         if (backend_used != nullptr) {
-            *backend_used = "cuda";
+            *backend_used = last_runtime_info().backend_path;
         }
         return cuda_st;
     }
     if (backend_used != nullptr) {
         *backend_used = "cpu";
     }
+    RuntimeInfo info{};
+    info.backend_path = "cpu";
+    info.fallback_reason = tensor_required ? "tensor_path_unavailable_or_not_effective" : "cuda_path_unavailable";
+    set_runtime_info_for_stage(info);
     return run_kmeans_cpu(vectors, k, max_iterations, out);
+}
+
+RuntimeInfo last_runtime_info() {
+    return g_last_runtime_info;
+}
+
+void set_runtime_info_for_stage(const RuntimeInfo& info) {
+    g_last_runtime_info = info;
 }
 
 }  // namespace vector_db_v3::kmeans

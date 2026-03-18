@@ -15,6 +15,24 @@ enum class BackendPreference {
     Cuda = 2,
 };
 
+enum class PrecisionPreference {
+    Auto = 0,
+    FP32 = 1,
+    TensorFP16 = 2,
+};
+
+struct RuntimeInfo {
+    bool cuda_compiled = false;
+    bool cuda_available = false;
+    bool tensor_compiled = false;
+    bool tensor_available = false;
+    bool tensor_effective = false;
+    bool tensor_active = false;
+    std::string backend_path = "cpu";
+    std::string gpu_arch_class = "unknown";
+    std::string fallback_reason;
+};
+
 struct KMeansResult {
     std::vector<std::vector<float>> centroids;
     std::vector<std::uint32_t> assignments;
@@ -31,5 +49,9 @@ Status run_kmeans(
 
 bool cuda_backend_compiled();
 bool cuda_backend_available(std::string* reason);
+bool tensor_backend_compiled();
+bool tensor_backend_available(std::string* reason);
+RuntimeInfo last_runtime_info();
+void set_runtime_info_for_stage(const RuntimeInfo& info);
 
 }  // namespace vector_db_v3::kmeans

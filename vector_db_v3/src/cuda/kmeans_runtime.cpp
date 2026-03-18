@@ -8,6 +8,7 @@
 #if VECTOR_DB_V3_CUDA_ENABLED
 #include <cuda_runtime_api.h>
 #include "kmeans_kernels.hpp"
+#include "tensor_runtime.hpp"
 #endif
 
 namespace vector_db_v3::kmeans {
@@ -368,21 +369,133 @@ bool cuda_backend_available(std::string* reason) {
 #endif
 }
 
+bool tensor_backend_compiled() {
+#if VECTOR_DB_V3_CUDA_ENABLED && VECTOR_DB_V3_TENSOR_ENABLED
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool tensor_backend_available(std::string* reason) {
+#if VECTOR_DB_V3_CUDA_ENABLED && VECTOR_DB_V3_TENSOR_ENABLED
+    std::string cuda_reason;
+    if (!cuda_backend_available(&cuda_reason)) {
+        if (reason != nullptr) {
+            *reason = cuda_reason;
+        }
+        return false;
+    }
+    if (reason != nullptr) {
+        *reason = "ok";
+    }
+    return true;
+#else
+    if (reason != nullptr) {
+        *reason = "tensor_backend_not_compiled";
+    }
+    return false;
+#endif
+}
+
 Status run_kmeans_cuda(
     const std::vector<std::vector<float>>& vectors,
     std::uint32_t k,
     std::uint32_t max_iterations,
+    PrecisionPreference precision_preference,
+    bool tensor_required,
     KMeansResult* out) {
 #if VECTOR_DB_V3_CUDA_ENABLED
-    std::string reason;
-    if (!cuda_backend_available(&reason)) {
-        return Status::Error("kmeans cuda unavailable: " + reason);
+    RuntimeInfo info{};
+    info.cuda_compiled = cuda_backend_compiled();
+    info.tensor_compiled = tensor_backend_compiled();
+    info.backend_path = "cuda_fp32";
+    info.gpu_arch_class = "unknown";
+
+    std::string cuda_reason;
+    info.cuda_available = cuda_backend_available(&cuda_reason);
+    if (!info.cuda_available) {
+        info.fallback_reason = cuda_reason;
+        set_runtime_info_for_stage(info);
+        return Status::Error("kmeans cuda unavailable: " + cuda_reason);
     }
-    return run_kmeans_cuda_impl(vectors, k, max_iterations, out);
+    info.gpu_arch_class = "ampere";
+
+    std::string tensor_reason;
+    info.tensor_available = tensor_backend_available(&tensor_reason);
+    bool use_tensor = false;
+
+    if (precision_preference == PrecisionPreference::TensorFP16) {
+        if (!info.tensor_available) {
+            info.fallback_reason = tensor_reason;
+            set_runtime_info_for_stage(info);
+            return Status::Error("kmeans tensor unavailable: " + tensor_reason);
+        }
+        std::string effective_reason;
+        info.tensor_effective = tensor_path_effective(static_cast<std::uint32_t>(vectors.size()), k, kVectorDim, &effective_reason);
+        if (!info.tensor_effective) {
+            info.fallback_reason = effective_reason;
+            set_runtime_info_for_stage(info);
+            return Status::Error("kmeans tensor unavailable: " + effective_reason);
+        }
+        use_tensor = true;
+    } else if (precision_preference == PrecisionPreference::Auto) {
+        if (info.tensor_available) {
+            std::string effective_reason;
+            info.tensor_effective = tensor_path_effective(static_cast<std::uint32_t>(vectors.size()), k, kVectorDim, &effective_reason);
+            use_tensor = info.tensor_effective;
+            if (!use_tensor) {
+                info.fallback_reason = effective_reason;
+            }
+        } else if (tensor_required) {
+            info.fallback_reason = tensor_reason.empty() ? "tensor_runtime_unavailable" : tensor_reason;
+            set_runtime_info_for_stage(info);
+            return Status::Error("kmeans tensor unavailable: " + info.fallback_reason);
+        }
+    } else if (precision_preference == PrecisionPreference::FP32 && tensor_required) {
+        info.fallback_reason = "tensor_required_but_fp32_requested";
+        set_runtime_info_for_stage(info);
+        return Status::Error("kmeans tensor unavailable: tensor_required_but_fp32_requested");
+    }
+
+    if (use_tensor) {
+        Status tensor_st = run_kmeans_cuda_tensor(vectors, k, max_iterations, out);
+        if (!tensor_st.ok) {
+            if (tensor_required) {
+                info.fallback_reason = "tensor_runtime_unavailable";
+                set_runtime_info_for_stage(info);
+                return tensor_st;
+            }
+            Status fp32_st = run_kmeans_cuda_impl(vectors, k, max_iterations, out);
+            info.tensor_active = false;
+            info.backend_path = "cuda_fp32";
+            info.fallback_reason = "tensor_runtime_unavailable";
+            set_runtime_info_for_stage(info);
+            return fp32_st;
+        }
+        info.tensor_active = true;
+        info.backend_path = "cuda_tensor_fp16";
+        info.fallback_reason.clear();
+        set_runtime_info_for_stage(info);
+        return tensor_st;
+    }
+
+    Status fp32_st = run_kmeans_cuda_impl(vectors, k, max_iterations, out);
+    info.tensor_active = false;
+    info.backend_path = "cuda_fp32";
+    if (fp32_st.ok) {
+        set_runtime_info_for_stage(info);
+    } else {
+        info.fallback_reason = "cuda_fp32_runtime_failed";
+        set_runtime_info_for_stage(info);
+    }
+    return fp32_st;
 #else
     (void)vectors;
     (void)k;
     (void)max_iterations;
+    (void)precision_preference;
+    (void)tensor_required;
     (void)out;
     return Status::Error("kmeans cuda unavailable: cuda_not_compiled");
 #endif

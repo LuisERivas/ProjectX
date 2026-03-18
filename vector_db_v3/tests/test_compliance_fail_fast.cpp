@@ -55,6 +55,7 @@ int main() {
     const auto stats = store.cluster_stats();
     ok &= expect(stats.compliance_status == "fail", "compliance_status fail");
     ok &= expect(!stats.fallback_reason.empty(), "fallback_reason populated");
+    ok &= expect(stats.fallback_reason == "profile_forced_fail", "fallback_reason profile_forced_fail");
     ok &= expect(!stats.non_compliance_stage.empty(), "non_compliance_stage populated");
     ok &= expect(store.close().ok, "close");
     set_env("VECTOR_DB_V3_COMPLIANCE_PROFILE", "");

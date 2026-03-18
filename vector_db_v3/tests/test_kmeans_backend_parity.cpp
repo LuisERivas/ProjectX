@@ -74,7 +74,7 @@ int main() {
 
     const double delta = std::fabs(cpu.objective - candidate.objective);
     const double rel = cpu.objective > 0.0 ? delta / cpu.objective : delta;
-    ok &= expect(rel <= 1e-4, "objective relative tolerance");
+    ok &= expect(rel <= 1e-3, "objective relative tolerance");
 
     if (!ok) {
         return 1;

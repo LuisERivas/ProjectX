@@ -42,7 +42,9 @@ int main() {
     ok &= expect(st.ok, "auto backend should succeed");
     const bool cuda_ready = kmeans::cuda_backend_available(nullptr);
     if (cuda_ready) {
-        ok &= expect(backend == "cuda", "auto backend should select cuda when available");
+        ok &= expect(
+            backend == "cuda_fp32" || backend == "cuda_tensor_fp16",
+            "auto backend should select a cuda backend path when available");
     } else {
         ok &= expect(backend == "cpu", "auto backend should fallback to cpu when cuda unavailable");
     }
@@ -54,7 +56,9 @@ int main() {
     st = kmeans::run_kmeans(vectors, 6U, 6U, kmeans::BackendPreference::Cuda, &out, &backend);
     if (cuda_ready) {
         ok &= expect(st.ok, "cuda preference should succeed when runtime is ready");
-        ok &= expect(backend == "cuda", "cuda preference should report cuda backend");
+        ok &= expect(
+            backend == "cuda_fp32" || backend == "cuda_tensor_fp16",
+            "cuda preference should report a concrete cuda backend path");
     } else {
         ok &= expect(!st.ok, "cuda preference should fail when cuda is unavailable");
     }

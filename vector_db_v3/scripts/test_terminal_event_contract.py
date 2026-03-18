@@ -109,6 +109,10 @@ def assert_compliance_fields(events: list[dict], expect_status: str) -> None:
         raise AssertionError(
             f"unexpected compliance_status: got={terminal.get('compliance_status')} expected={expect_status}"
         )
+    if expect_status == "pass":
+        backend_path = str(terminal.get("kernel_backend_path", ""))
+        if backend_path not in {"cuda_tensor_fp16", "cuda_fp32"}:
+            raise AssertionError(f"unexpected kernel_backend_path for pass: {backend_path}")
     if expect_status == "fail":
         for key in ["fallback_reason", "non_compliance_stage"]:
             if key not in terminal:

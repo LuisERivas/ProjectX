@@ -438,6 +438,18 @@ kmeans::BackendPreference parse_kmeans_backend_preference() {
     return kmeans::BackendPreference::Auto;
 }
 
+bool tensor_policy_required() {
+    const char* value = std::getenv("VECTOR_DB_V3_TENSOR_POLICY");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    std::string policy(value);
+    std::transform(policy.begin(), policy.end(), policy.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return policy == "required";
+}
+
 KMeansResult run_deterministic_kmeans(
     const std::vector<std::vector<float>>& vectors,
     std::uint32_t k,
@@ -452,18 +464,21 @@ KMeansResult run_deterministic_kmeans(
         &out,
         &backend_used);
     if (!st.ok) {
-        // Deterministic fallback preserves previous behavior in environments
-        // where CUDA is unavailable but pass-profile testing is active.
-        const Status cpu_st = kmeans::run_kmeans(
-            vectors,
-            k,
-            max_iterations,
-            kmeans::BackendPreference::Cpu,
-            &out,
-            &backend_used);
-        if (!cpu_st.ok) {
-            return KMeansResult{};
+        const kmeans::BackendPreference pref = parse_kmeans_backend_preference();
+        const bool allow_cpu_fallback = pref == kmeans::BackendPreference::Auto && !tensor_policy_required();
+        if (allow_cpu_fallback) {
+            const Status cpu_st = kmeans::run_kmeans(
+                vectors,
+                k,
+                max_iterations,
+                kmeans::BackendPreference::Cpu,
+                &out,
+                &backend_used);
+            if (cpu_st.ok) {
+                return out;
+            }
         }
+        return KMeansResult{};
     }
     return out;
 }
@@ -2054,18 +2069,43 @@ bool stage_is_compliance_required(const std::string& stage_id) {
     return stage_id == "top" || stage_id == "mid" || stage_id == "lower" || stage_id == "final";
 }
 
+bool tensor_required_for_stage(const std::string& stage_id) {
+    if (stage_id != "top" && stage_id != "mid") {
+        return false;
+    }
+    return tensor_policy_required();
+}
+
+void apply_runtime_info_to_compliance(const std::string& stage_id, StageCompliance* c) {
+    if (c == nullptr) {
+        return;
+    }
+    if (stage_id != "top" && stage_id != "mid") {
+        return;
+    }
+    const kmeans::RuntimeInfo info = kmeans::last_runtime_info();
+    c->cuda_enabled = info.cuda_available;
+    c->tensor_core_active = info.tensor_active;
+    c->gpu_arch_class = info.gpu_arch_class.empty() ? c->gpu_arch_class : info.gpu_arch_class;
+    c->kernel_backend_path = info.backend_path.empty() ? c->kernel_backend_path : info.backend_path;
+    c->tensor_core_required = tensor_required_for_stage(stage_id) || (info.tensor_available && info.tensor_effective);
+    if (!info.fallback_reason.empty()) {
+        c->fallback_reason = info.fallback_reason;
+    }
+}
+
 StageCompliance evaluate_stage_compliance(const std::string& stage_id) {
     StageCompliance c{};
     c.cuda_required = stage_is_compliance_required(stage_id);
-    c.tensor_core_required = c.cuda_required;
+    c.tensor_core_required = tensor_required_for_stage(stage_id);
     c.hot_path_language = env_or_default(std::getenv("VECTOR_DB_V3_HOT_PATH_LANGUAGE"), "cpp_cuda");
     std::string cuda_reason;
     const bool cuda_compiled = kmeans::cuda_backend_compiled();
     const bool cuda_available = kmeans::cuda_backend_available(&cuda_reason);
     c.cuda_enabled = cuda_compiled && cuda_available;
-    c.kernel_backend_path = c.cuda_enabled ? "cuda_kmeans" : (cuda_compiled ? "cuda_kmeans_unavailable" : "none");
+    c.kernel_backend_path = c.cuda_enabled ? "cuda_fp32" : (cuda_compiled ? "cuda_unavailable" : "none");
     c.gpu_arch_class = c.cuda_enabled ? "ampere" : "unknown";
-    c.tensor_core_active = c.cuda_enabled;
+    c.tensor_core_active = false;
     if (!c.cuda_enabled && c.cuda_required && !cuda_reason.empty()) {
         c.fallback_reason = cuda_reason;
     }
@@ -2084,8 +2124,9 @@ StageCompliance evaluate_stage_compliance(const std::string& stage_id) {
         c.compliance_status = "pass";
         c.cuda_enabled = true;
         c.tensor_core_active = true;
+        c.tensor_core_required = true;
         c.gpu_arch_class = "ampere";
-        c.kernel_backend_path = "cuda_kmeans";
+        c.kernel_backend_path = "cuda_tensor_fp16";
         c.hot_path_language = "cpp_cuda";
         c.fallback_reason.clear();
         c.error_code.clear();
@@ -2153,15 +2194,16 @@ ClusterStats VectorStore::cluster_stats() const {
     ClusterStats out{};
     out.available = false;
     const StageCompliance compliance = evaluate_stage_compliance("top");
+    const kmeans::RuntimeInfo runtime_info = kmeans::last_runtime_info();
     out.cuda_required = compliance.cuda_required;
-    out.cuda_enabled = compliance.cuda_enabled;
+    out.cuda_enabled = runtime_info.cuda_available || compliance.cuda_enabled;
     out.tensor_core_required = compliance.tensor_core_required;
-    out.tensor_core_active = compliance.tensor_core_active;
-    out.gpu_arch_class = compliance.gpu_arch_class;
-    out.kernel_backend_path = compliance.kernel_backend_path;
+    out.tensor_core_active = runtime_info.tensor_active || compliance.tensor_core_active;
+    out.gpu_arch_class = !runtime_info.gpu_arch_class.empty() ? runtime_info.gpu_arch_class : compliance.gpu_arch_class;
+    out.kernel_backend_path = !runtime_info.backend_path.empty() ? runtime_info.backend_path : compliance.kernel_backend_path;
     out.hot_path_language = compliance.hot_path_language;
     out.compliance_status = compliance.compliance_status;
-    out.fallback_reason = compliance.fallback_reason;
+    out.fallback_reason = !runtime_info.fallback_reason.empty() ? runtime_info.fallback_reason : compliance.fallback_reason;
     out.non_compliance_stage = compliance.non_compliance_stage;
     return out;
 }
@@ -2447,6 +2489,17 @@ Status run_stage_with_telemetry(
                 terminal_extra.push_back({"error_code", "final_layer_build_failed"});
                 terminal_extra.push_back({"error_message", stage_status.message});
             }
+        }
+        apply_runtime_info_to_compliance(stage_id, &compliance);
+        if (!stage_status.ok && compliance.compliance_status != "fail" && tensor_required_for_stage(stage_id) &&
+            !compliance.tensor_core_active) {
+            compliance.compliance_status = "fail";
+            compliance.error_code = "compliance_fail_fast";
+            if (compliance.fallback_reason.empty()) {
+                compliance.fallback_reason = "tensor_core_required_but_inactive";
+            }
+            compliance.error_message = compliance.fallback_reason;
+            compliance.non_compliance_stage = stage_id;
         }
         terminal_extra.push_back({"records_processed", std::to_string(records_processed)});
         terminal_extra.push_back({"chosen_k", std::to_string(chosen_k)});
