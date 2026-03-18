@@ -116,12 +116,13 @@ echo "[2/4] bulk-insert"
 "${CLI}" bulk-insert --path "${DATA_DIR}" --input "${BULK_JSONL}" --batch-size 256 >/dev/null
 
 echo "[3/4] build-top-clusters (forced tensor mode)"
+TOP_JSONL="${DATA_DIR}/build_top_tensor_proof.jsonl"
 env \
   VECTOR_DB_V3_KMEANS_BACKEND=cuda \
   VECTOR_DB_V3_KMEANS_PRECISION=tensor \
   VECTOR_DB_V3_FORCE_TENSOR_PATH=1 \
   VECTOR_DB_V3_TENSOR_MIN_OPS=1 \
-  "${CLI}" build-top-clusters --path "${DATA_DIR}" --seed 7 >/dev/null
+  "${CLI}" build-top-clusters --path "${DATA_DIR}" --seed 7 > "${TOP_JSONL}"
 
 echo "[4/4] cluster-stats verification"
 STATS_JSON="${DATA_DIR}/cluster_stats_tensor_proof.json"
@@ -137,6 +138,29 @@ import json
 import sys
 from pathlib import Path
 
+top_events_path = Path("${TOP_JSONL}")
+stage_end = None
+for raw in top_events_path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(obj, dict) and obj.get("event_type") == "stage_end" and obj.get("stage_id") == "top":
+        stage_end = obj
+        break
+
+if stage_end is None:
+    print("ERROR: missing top stage_end event in build-top output", file=sys.stderr)
+    sys.exit(1)
+
+event_backend = stage_end.get("kernel_backend_path")
+event_tensor_active = bool(stage_end.get("tensor_core_active"))
+event_compliance = stage_end.get("compliance_status")
+print(f"stage_end(top): backend={event_backend} tensor_active={event_tensor_active} compliance={event_compliance}")
+
 path = Path("${STATS_JSON}")
 stats = json.loads(path.read_text(encoding="utf-8"))
 backend = stats.get("kernel_backend_path")
@@ -145,15 +169,16 @@ compliance = stats.get("compliance_status")
 
 print(f"cluster-stats: backend={backend} tensor_active={tensor_active} compliance={compliance}")
 print(f"stats file: {path}")
+print(f"top stage events file: {top_events_path}")
 
-if backend != "cuda_tensor_fp16":
-    print("ERROR: kernel_backend_path is not cuda_tensor_fp16", file=sys.stderr)
+if event_backend != "cuda_tensor_fp16":
+    print("ERROR: top stage did not execute cuda_tensor_fp16", file=sys.stderr)
     sys.exit(1)
-if not tensor_active:
-    print("ERROR: tensor_core_active is not true", file=sys.stderr)
+if not event_tensor_active:
+    print("ERROR: top stage tensor_core_active is not true", file=sys.stderr)
     sys.exit(1)
-if compliance != "pass":
-    print("ERROR: compliance_status is not pass", file=sys.stderr)
+if event_compliance != "pass":
+    print("ERROR: top stage compliance_status is not pass", file=sys.stderr)
     sys.exit(1)
 PY
 
