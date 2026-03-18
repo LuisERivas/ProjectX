@@ -22,6 +22,7 @@ enum class PrecisionPreference {
 };
 
 struct RuntimeInfo {
+    bool observed = false;
     bool cuda_compiled = false;
     bool cuda_available = false;
     bool tensor_compiled = false;

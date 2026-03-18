@@ -2108,6 +2108,9 @@ void apply_runtime_info_to_compliance(const std::string& stage_id, StageComplian
         return;
     }
     const kmeans::RuntimeInfo info = kmeans::last_runtime_info();
+    if (!info.observed) {
+        return;
+    }
     c->cuda_enabled = info.cuda_available;
     c->tensor_core_active = info.tensor_active;
     c->gpu_arch_class = info.gpu_arch_class.empty() ? c->gpu_arch_class : info.gpu_arch_class;
@@ -2220,14 +2223,17 @@ ClusterStats VectorStore::cluster_stats() const {
     const StageCompliance compliance = evaluate_stage_compliance("top");
     const kmeans::RuntimeInfo runtime_info = kmeans::last_runtime_info();
     out.cuda_required = compliance.cuda_required;
-    out.cuda_enabled = runtime_info.cuda_available || compliance.cuda_enabled;
+    out.cuda_enabled = runtime_info.observed ? runtime_info.cuda_available : compliance.cuda_enabled;
     out.tensor_core_required = compliance.tensor_core_required;
-    out.tensor_core_active = runtime_info.tensor_active || compliance.tensor_core_active;
-    out.gpu_arch_class = !runtime_info.gpu_arch_class.empty() ? runtime_info.gpu_arch_class : compliance.gpu_arch_class;
-    out.kernel_backend_path = !runtime_info.backend_path.empty() ? runtime_info.backend_path : compliance.kernel_backend_path;
+    out.tensor_core_active = runtime_info.observed ? runtime_info.tensor_active : compliance.tensor_core_active;
+    out.gpu_arch_class = runtime_info.observed && !runtime_info.gpu_arch_class.empty() ?
+        runtime_info.gpu_arch_class : compliance.gpu_arch_class;
+    out.kernel_backend_path = runtime_info.observed && !runtime_info.backend_path.empty() ?
+        runtime_info.backend_path : compliance.kernel_backend_path;
     out.hot_path_language = compliance.hot_path_language;
     out.compliance_status = compliance.compliance_status;
-    out.fallback_reason = !runtime_info.fallback_reason.empty() ? runtime_info.fallback_reason : compliance.fallback_reason;
+    out.fallback_reason = runtime_info.observed && !runtime_info.fallback_reason.empty() ?
+        runtime_info.fallback_reason : compliance.fallback_reason;
     out.non_compliance_stage = compliance.non_compliance_stage;
     return out;
 }

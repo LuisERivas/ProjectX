@@ -167,6 +167,7 @@ Status run_kmeans(
             *backend_used = "cpu";
         }
         RuntimeInfo info{};
+        info.observed = true;
         info.backend_path = "cpu";
         set_runtime_info_for_stage(info);
         return run_kmeans_cpu(vectors, k, max_iterations, out);
@@ -199,6 +200,7 @@ Status run_kmeans(
         *backend_used = "cpu";
     }
     RuntimeInfo info{};
+    info.observed = true;
     info.backend_path = "cpu";
     info.fallback_reason = tensor_required ? "tensor_path_unavailable_or_not_effective" : "cuda_path_unavailable";
     set_runtime_info_for_stage(info);

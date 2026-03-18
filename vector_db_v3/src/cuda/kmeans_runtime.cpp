@@ -407,6 +407,7 @@ Status run_kmeans_cuda(
     KMeansResult* out) {
 #if VECTOR_DB_V3_CUDA_ENABLED
     RuntimeInfo info{};
+    info.observed = true;
     info.cuda_compiled = cuda_backend_compiled();
     info.tensor_compiled = tensor_backend_compiled();
     info.backend_path = "cuda_fp32";
