@@ -483,6 +483,24 @@ KMeansResult run_deterministic_kmeans(
     return out;
 }
 
+bool validate_kmeans_result_shape(const KMeansResult& result, std::size_t expected_rows) {
+    if (expected_rows == 0U) {
+        return true;
+    }
+    if (result.assignments.size() != expected_rows) {
+        return false;
+    }
+    if (result.centroids.empty()) {
+        return false;
+    }
+    for (std::uint32_t assignment : result.assignments) {
+        if (assignment >= result.centroids.size()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<std::uint32_t> coarse_ks(std::uint32_t k_min, std::uint32_t k_max) {
     std::vector<std::uint32_t> out;
     out.push_back(k_min);
@@ -759,6 +777,9 @@ Status emit_top_layer_artifacts(
     }
 
     const KMeansResult final_kmeans = run_deterministic_kmeans(kmeans_vectors, best_k, 12U);
+    if (!validate_kmeans_result_shape(final_kmeans, ids.size())) {
+        return Status::Error("top clustering: kmeans backend returned invalid result shape");
+    }
     std::vector<codec::TopAssignmentRow> assignments;
     assignments.reserve(ids.size());
     for (std::size_t i = 0; i < ids.size(); ++i) {
@@ -1028,6 +1049,9 @@ Status emit_mid_layer_artifacts(
             });
 
         const KMeansResult final_kmeans = run_deterministic_kmeans(parent_vectors, best_k, 12U);
+        if (!validate_kmeans_result_shape(final_kmeans, items.size())) {
+            return Status::Error("mid clustering: kmeans backend returned invalid result shape");
+        }
         for (std::size_t i = 0; i < items.size(); ++i) {
             mid_rows.push_back(codec::MidAssignmentRow{
                 items[i].embedding_id,

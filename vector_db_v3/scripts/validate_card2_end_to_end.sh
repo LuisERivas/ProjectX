@@ -130,8 +130,10 @@ PY
 )" > "${EVIDENCE_DIR}/insert.json"
 
 env VECTOR_DB_V3_KMEANS_BACKEND=cuda VECTOR_DB_V3_KMEANS_PRECISION=tensor \
+    VECTOR_DB_V3_TENSOR_MIN_OPS=1 \
     "${CLI}" build-top-clusters --path "${DATA_DIR}" --seed 7 > "${EVIDENCE_DIR}/build_top_tensor.jsonl"
 env VECTOR_DB_V3_KMEANS_BACKEND=cuda VECTOR_DB_V3_KMEANS_PRECISION=tensor \
+    VECTOR_DB_V3_TENSOR_MIN_OPS=1 \
     "${CLI}" cluster-stats --path "${DATA_DIR}" > "${EVIDENCE_DIR}/cluster_stats_tensor.json"
 
 env VECTOR_DB_V3_KMEANS_BACKEND=cuda VECTOR_DB_V3_KMEANS_PRECISION=fp32 \

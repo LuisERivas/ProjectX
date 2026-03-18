@@ -427,18 +427,28 @@ Status run_kmeans_cuda(
 
     if (precision_preference == PrecisionPreference::TensorFP16) {
         if (!info.tensor_available) {
-            info.fallback_reason = tensor_reason;
-            set_runtime_info_for_stage(info);
-            return Status::Error("kmeans tensor unavailable: " + tensor_reason);
+            if (tensor_required) {
+                info.fallback_reason = tensor_reason;
+                set_runtime_info_for_stage(info);
+                return Status::Error("kmeans tensor unavailable: " + tensor_reason);
+            }
+            info.fallback_reason = tensor_reason.empty() ? "tensor_runtime_unavailable" : tensor_reason;
+            use_tensor = false;
+        } else {
+            std::string effective_reason;
+            info.tensor_effective = tensor_path_effective(static_cast<std::uint32_t>(vectors.size()), k, kVectorDim, &effective_reason);
+            if (!info.tensor_effective) {
+                if (tensor_required) {
+                    info.fallback_reason = effective_reason;
+                    set_runtime_info_for_stage(info);
+                    return Status::Error("kmeans tensor unavailable: " + effective_reason);
+                }
+                info.fallback_reason = effective_reason;
+                use_tensor = false;
+            } else {
+                use_tensor = true;
+            }
         }
-        std::string effective_reason;
-        info.tensor_effective = tensor_path_effective(static_cast<std::uint32_t>(vectors.size()), k, kVectorDim, &effective_reason);
-        if (!info.tensor_effective) {
-            info.fallback_reason = effective_reason;
-            set_runtime_info_for_stage(info);
-            return Status::Error("kmeans tensor unavailable: " + effective_reason);
-        }
-        use_tensor = true;
     } else if (precision_preference == PrecisionPreference::Auto) {
         if (info.tensor_available) {
             std::string effective_reason;
