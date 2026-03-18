@@ -124,16 +124,26 @@ echo
 echo "[3/7] Backend selection spot checks"
 rm -rf "${DATA_DIR}"
 "${CLI}" init --path "${DATA_DIR}" > "${EVIDENCE_DIR}/init.json"
-"${CLI}" insert --path "${DATA_DIR}" --id 1 --vec "$(python3 - <<'PY'
-print(",".join(["0.1"] * 1024))
+SPOT_BULK_JSONL="${EVIDENCE_DIR}/spotcheck_bulk.jsonl"
+python3 - <<PY
+import json
+from pathlib import Path
+
+path = Path("${SPOT_BULK_JSONL}")
+rows = []
+for i in range(128):
+    base = 0.05 + (i % 16) * 0.03
+    vec = [round(base + (d % 13) * 0.0007, 6) for d in range(1024)]
+    rows.append({"embedding_id": i + 1, "vector": vec})
+path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
 PY
-)" > "${EVIDENCE_DIR}/insert.json"
+"${CLI}" bulk-insert --path "${DATA_DIR}" --input "${SPOT_BULK_JSONL}" --batch-size 32 > "${EVIDENCE_DIR}/bulk_insert.json"
 
 env VECTOR_DB_V3_KMEANS_BACKEND=cuda VECTOR_DB_V3_KMEANS_PRECISION=tensor \
-    VECTOR_DB_V3_TENSOR_MIN_OPS=1 \
+    VECTOR_DB_V3_TENSOR_MIN_OPS=100000 \
     "${CLI}" build-top-clusters --path "${DATA_DIR}" --seed 7 > "${EVIDENCE_DIR}/build_top_tensor.jsonl"
 env VECTOR_DB_V3_KMEANS_BACKEND=cuda VECTOR_DB_V3_KMEANS_PRECISION=tensor \
-    VECTOR_DB_V3_TENSOR_MIN_OPS=1 \
+    VECTOR_DB_V3_TENSOR_MIN_OPS=100000 \
     "${CLI}" cluster-stats --path "${DATA_DIR}" > "${EVIDENCE_DIR}/cluster_stats_tensor.json"
 
 env VECTOR_DB_V3_KMEANS_BACKEND=cuda VECTOR_DB_V3_KMEANS_PRECISION=fp32 \

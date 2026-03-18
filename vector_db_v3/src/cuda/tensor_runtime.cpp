@@ -104,6 +104,14 @@ Status checked_memset(void* ptr, int value, std::size_t bytes, const char* label
 }  // namespace
 
 bool tensor_path_effective(std::uint32_t vector_count, std::uint32_t k, std::size_t dim, std::string* reason) {
+    // Tensor path is not effective for tiny clustering problems and can add
+    // avoidable launch/setup overhead relative to FP32 CUDA.
+    if (vector_count < 8U || k < 2U) {
+        if (reason != nullptr) {
+            *reason = "tensor_problem_too_small";
+        }
+        return false;
+    }
     const char* override = std::getenv("VECTOR_DB_V3_FORCE_TENSOR_PATH");
     if (env_truthy(override)) {
         if (reason != nullptr) {
