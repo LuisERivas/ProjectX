@@ -48,9 +48,9 @@ add_library(vectordb_v3 ${VECTOR_DB_V3_CORE_SOURCES})
 target_include_directories(vectordb_v3 PUBLIC include)
 
 if (MSVC)
-    target_compile_options(vectordb_v3 PRIVATE /W4)
+    target_compile_options(vectordb_v3 PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 else()
-    target_compile_options(vectordb_v3 PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(vectordb_v3 PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
 endif()
 
 if(VECTOR_DB_V3_ENABLE_CUDA_BACKEND)

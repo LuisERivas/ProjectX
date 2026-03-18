@@ -76,7 +76,6 @@ __global__ void kmeans_update_kernel(
         return;
     }
     const std::uint32_t c = static_cast<std::uint32_t>(idx / dim);
-    const std::size_t d = idx % dim;
     const std::uint32_t count = counts[c];
     if (count == 0U) {
         return;
