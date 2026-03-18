@@ -99,6 +99,14 @@ Status checked_memset(void* ptr, int value, std::size_t bytes, const char* label
     return Status::Ok();
 }
 
+Status checked_sync(const char* label) {
+    const cudaError_t st = cudaDeviceSynchronize();
+    if (st != cudaSuccess) {
+        return Status::Error(std::string("cuda sync failed (") + label + "): " + cudaGetErrorString(st));
+    }
+    return Status::Ok();
+}
+
 #endif
 
 }  // namespace
@@ -160,7 +168,6 @@ Status run_kmeans_cuda_tensor(
     if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
         return Status::Error("kmeans tensor: cublasCreate failed");
     }
-    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
 
     const std::uint32_t n = static_cast<std::uint32_t>(vectors.size());
     k = std::min<std::uint32_t>(k, n);
@@ -268,9 +275,19 @@ Status run_kmeans_cuda_tensor(
         cublasDestroy(handle);
         return Status::Error("kmeans tensor: vectors fp16 pack launch failed");
     }
+    st = checked_sync("pack_vectors");
+    if (!st.ok) {
+        cublasDestroy(handle);
+        return st;
+    }
     if (!cuda::launch_row_norms_f32(static_cast<const float*>(d_vectors_f32.get()), static_cast<float*>(d_vector_norms.get()), n, dim)) {
         cublasDestroy(handle);
         return Status::Error("kmeans tensor: vector norms launch failed");
+    }
+    st = checked_sync("vector_norms");
+    if (!st.ok) {
+        cublasDestroy(handle);
+        return st;
     }
 
     const float alpha = 1.0f;
@@ -285,6 +302,11 @@ Status run_kmeans_cuda_tensor(
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: centroids fp16 pack launch failed");
         }
+        st = checked_sync("pack_centroids");
+        if (!st.ok) {
+            cublasDestroy(handle);
+            return st;
+        }
         if (!cuda::launch_row_norms_f32(
                 static_cast<const float*>(d_centroids_f32.get()),
                 static_cast<float*>(d_centroid_norms.get()),
@@ -292,6 +314,11 @@ Status run_kmeans_cuda_tensor(
                 dim)) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: centroid norms launch failed");
+        }
+        st = checked_sync("centroid_norms");
+        if (!st.ok) {
+            cublasDestroy(handle);
+            return st;
         }
 
         const cublasStatus_t gemm_st = cublasGemmEx(
@@ -313,10 +340,15 @@ Status run_kmeans_cuda_tensor(
             CUDA_R_32F,
             static_cast<int>(k),
             CUBLAS_COMPUTE_32F_FAST_16F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            CUBLAS_GEMM_DEFAULT);
         if (gemm_st != CUBLAS_STATUS_SUCCESS) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: cublasGemmEx failed");
+        }
+        st = checked_sync("gemm_dot");
+        if (!st.ok) {
+            cublasDestroy(handle);
+            return st;
         }
 
         if (!cuda::launch_argmin_from_dot_kn(
@@ -329,6 +361,11 @@ Status run_kmeans_cuda_tensor(
                 k)) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: argmin launch failed");
+        }
+        st = checked_sync("argmin");
+        if (!st.ok) {
+            cublasDestroy(handle);
+            return st;
         }
 
         st = checked_copy_d2h(h_assignments.data(), d_assignments.get(), n * sizeof(std::uint32_t), "assignments");
@@ -373,6 +410,11 @@ Status run_kmeans_cuda_tensor(
                 dim)) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: accumulate launch failed");
+        }
+        st = checked_sync("accumulate");
+        if (!st.ok) {
+            cublasDestroy(handle);
+            return st;
         }
 
         st = checked_copy_d2h(h_counts.data(), d_counts.get(), k * sizeof(std::uint32_t), "counts");
@@ -425,6 +467,11 @@ Status run_kmeans_cuda_tensor(
                 cublasDestroy(handle);
                 return Status::Error("kmeans tensor: accumulate relaunch failed");
             }
+            st = checked_sync("accumulate_repair");
+            if (!st.ok) {
+                cublasDestroy(handle);
+                return st;
+            }
         }
 
         if (!cuda::launch_update_kernel(
@@ -435,6 +482,11 @@ Status run_kmeans_cuda_tensor(
                 dim)) {
             cublasDestroy(handle);
             return Status::Error("kmeans tensor: update launch failed");
+        }
+        st = checked_sync("update");
+        if (!st.ok) {
+            cublasDestroy(handle);
+            return st;
         }
 
         if (!changed) {
