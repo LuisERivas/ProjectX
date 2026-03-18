@@ -1,0 +1,23 @@
+{
+  "mode": "evidence",
+  "profile": "minimum",
+  "baseline_ref": "none",
+  "thresholds_file": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\contracts\\perf_thresholds_jetson_orin.json",
+  "measured": {
+    "median_ms": 9.634,
+    "p95_ms": 15.002,
+    "variance_ratio": 0.28441,
+    "samples_ms": [
+      9.634,
+      9.336,
+      14.131,
+      15.002,
+      8.269
+    ]
+  },
+  "harness": {
+    "warmup_runs": 1,
+    "measure_runs": 5,
+    "failures": 6
+  }
+}

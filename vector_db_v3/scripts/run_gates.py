@@ -60,7 +60,9 @@ def gate_definitions(build_dir: Path, repo_root: Path) -> dict[str, dict]:
                     "-R",
                     "vectordb_v3_tests|vectordb_v3_exact_search_tests|vectordb_v3_top_layer_artifacts_tests|"
                     "vectordb_v3_mid_layer_artifacts_tests|vectordb_v3_lower_layer_gate_artifacts_tests|"
-                    "vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests",
+                    "vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests|"
+                    "vectordb_v3_kmeans_backend_parity_tests|vectordb_v3_kmeans_tie_break_determinism_tests|"
+                    "vectordb_v3_kmeans_backend_selection_tests",
                 ]
             ],
         },

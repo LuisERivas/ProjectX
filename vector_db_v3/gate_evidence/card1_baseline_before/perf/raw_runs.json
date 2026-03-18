@@ -1,0 +1,40 @@
+{
+  "runs": [
+    {
+      "phase": "warmup",
+      "run_index": 1,
+      "exit_code": 127,
+      "elapsed_ms": 10.669
+    },
+    {
+      "phase": "measure",
+      "run_index": 1,
+      "exit_code": 127,
+      "elapsed_ms": 9.634
+    },
+    {
+      "phase": "measure",
+      "run_index": 2,
+      "exit_code": 127,
+      "elapsed_ms": 9.336
+    },
+    {
+      "phase": "measure",
+      "run_index": 3,
+      "exit_code": 127,
+      "elapsed_ms": 14.131
+    },
+    {
+      "phase": "measure",
+      "run_index": 4,
+      "exit_code": 127,
+      "elapsed_ms": 15.002
+    },
+    {
+      "phase": "measure",
+      "run_index": 5,
+      "exit_code": 127,
+      "elapsed_ms": 8.269
+    }
+  ]
+}

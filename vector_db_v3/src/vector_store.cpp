@@ -25,6 +25,7 @@
 #include "vector_db_v3/codec/artifacts.hpp"
 #include "vector_db_v3/codec/endian.hpp"
 #include "vector_db_v3/codec/io.hpp"
+#include "vector_db_v3/kmeans_backend.hpp"
 #include "vector_db_v3/paths.hpp"
 #include "vector_db_v3/telemetry.hpp"
 
@@ -417,19 +418,24 @@ Status replay_wal_entries(
     return Status::Ok();
 }
 
-struct KMeansResult {
-    std::vector<std::vector<float>> centroids;
-    std::vector<std::uint32_t> assignments;
-    double objective = 0.0;
-};
+using KMeansResult = kmeans::KMeansResult;
 
-double squared_l2(const std::vector<float>& a, const std::vector<float>& b) {
-    double out = 0.0;
-    for (std::size_t i = 0; i < kVectorDim; ++i) {
-        const double delta = static_cast<double>(a[i]) - static_cast<double>(b[i]);
-        out += delta * delta;
+kmeans::BackendPreference parse_kmeans_backend_preference() {
+    const char* value = std::getenv("VECTOR_DB_V3_KMEANS_BACKEND");
+    if (value == nullptr || *value == '\0') {
+        return kmeans::BackendPreference::Auto;
     }
-    return out;
+    std::string pref(value);
+    std::transform(pref.begin(), pref.end(), pref.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (pref == "cpu") {
+        return kmeans::BackendPreference::Cpu;
+    }
+    if (pref == "cuda") {
+        return kmeans::BackendPreference::Cuda;
+    }
+    return kmeans::BackendPreference::Auto;
 }
 
 KMeansResult run_deterministic_kmeans(
@@ -437,75 +443,27 @@ KMeansResult run_deterministic_kmeans(
     std::uint32_t k,
     std::uint32_t max_iterations) {
     KMeansResult out{};
-    if (vectors.empty() || k == 0U) {
-        return out;
-    }
-    k = std::min<std::uint32_t>(k, static_cast<std::uint32_t>(vectors.size()));
-    out.centroids.assign(k, std::vector<float>(kVectorDim, 0.0f));
-    out.assignments.assign(vectors.size(), 0U);
-
-    for (std::uint32_t c = 0; c < k; ++c) {
-        const std::size_t idx = (static_cast<std::size_t>(c) * vectors.size()) / k;
-        out.centroids[c] = vectors[idx];
-    }
-
-    for (std::uint32_t iter = 0; iter < std::max<std::uint32_t>(1U, max_iterations); ++iter) {
-        bool changed = false;
-        std::vector<double> min_dist(vectors.size(), std::numeric_limits<double>::infinity());
-        for (std::size_t i = 0; i < vectors.size(); ++i) {
-            std::uint32_t best = 0;
-            double best_dist = std::numeric_limits<double>::infinity();
-            for (std::uint32_t c = 0; c < k; ++c) {
-                const double dist = squared_l2(vectors[i], out.centroids[c]);
-                if (dist < best_dist) {
-                    best_dist = dist;
-                    best = c;
-                }
-            }
-            min_dist[i] = best_dist;
-            if (iter == 0 || out.assignments[i] != best) {
-                changed = true;
-                out.assignments[i] = best;
-            }
+    std::string backend_used;
+    Status st = kmeans::run_kmeans(
+        vectors,
+        k,
+        max_iterations,
+        parse_kmeans_backend_preference(),
+        &out,
+        &backend_used);
+    if (!st.ok) {
+        // Deterministic fallback preserves previous behavior in environments
+        // where CUDA is unavailable but pass-profile testing is active.
+        const Status cpu_st = kmeans::run_kmeans(
+            vectors,
+            k,
+            max_iterations,
+            kmeans::BackendPreference::Cpu,
+            &out,
+            &backend_used);
+        if (!cpu_st.ok) {
+            return KMeansResult{};
         }
-
-        std::vector<std::vector<double>> sums(k, std::vector<double>(kVectorDim, 0.0));
-        std::vector<std::uint32_t> counts(k, 0U);
-        for (std::size_t i = 0; i < vectors.size(); ++i) {
-            const std::uint32_t bucket = out.assignments[i];
-            ++counts[bucket];
-            for (std::size_t d = 0; d < kVectorDim; ++d) {
-                sums[bucket][d] += static_cast<double>(vectors[i][d]);
-            }
-        }
-        for (std::uint32_t c = 0; c < k; ++c) {
-            if (counts[c] == 0U) {
-                std::size_t worst_idx = 0;
-                double worst_dist = -1.0;
-                for (std::size_t i = 0; i < min_dist.size(); ++i) {
-                    if (min_dist[i] > worst_dist) {
-                        worst_dist = min_dist[i];
-                        worst_idx = i;
-                    }
-                }
-                out.assignments[worst_idx] = c;
-                counts[c] = 1U;
-                for (std::size_t d = 0; d < kVectorDim; ++d) {
-                    sums[c][d] = static_cast<double>(vectors[worst_idx][d]);
-                }
-            }
-            for (std::size_t d = 0; d < kVectorDim; ++d) {
-                out.centroids[c][d] = static_cast<float>(sums[c][d] / static_cast<double>(counts[c]));
-            }
-        }
-        if (!changed) {
-            break;
-        }
-    }
-
-    out.objective = 0.0;
-    for (std::size_t i = 0; i < vectors.size(); ++i) {
-        out.objective += squared_l2(vectors[i], out.centroids[out.assignments[i]]);
     }
     return out;
 }
@@ -2101,17 +2059,16 @@ StageCompliance evaluate_stage_compliance(const std::string& stage_id) {
     c.cuda_required = stage_is_compliance_required(stage_id);
     c.tensor_core_required = c.cuda_required;
     c.hot_path_language = env_or_default(std::getenv("VECTOR_DB_V3_HOT_PATH_LANGUAGE"), "cpp_cuda");
-#if VECTOR_DB_V3_CUDA_ENABLED
-    c.cuda_enabled = true;
-    c.kernel_backend_path = "cuda_scaffold";
-    c.gpu_arch_class = "ampere";
-    c.tensor_core_active = true;
-#else
-    c.cuda_enabled = false;
-    c.kernel_backend_path = "none";
-    c.gpu_arch_class = "unknown";
-    c.tensor_core_active = false;
-#endif
+    std::string cuda_reason;
+    const bool cuda_compiled = kmeans::cuda_backend_compiled();
+    const bool cuda_available = kmeans::cuda_backend_available(&cuda_reason);
+    c.cuda_enabled = cuda_compiled && cuda_available;
+    c.kernel_backend_path = c.cuda_enabled ? "cuda_kmeans" : (cuda_compiled ? "cuda_kmeans_unavailable" : "none");
+    c.gpu_arch_class = c.cuda_enabled ? "ampere" : "unknown";
+    c.tensor_core_active = c.cuda_enabled;
+    if (!c.cuda_enabled && c.cuda_required && !cuda_reason.empty()) {
+        c.fallback_reason = cuda_reason;
+    }
 
     if (const char* override_cuda = std::getenv("VECTOR_DB_V3_CUDA_ENABLED_OVERRIDE")) {
         c.cuda_enabled = env_truthy(override_cuda);
@@ -2128,7 +2085,7 @@ StageCompliance evaluate_stage_compliance(const std::string& stage_id) {
         c.cuda_enabled = true;
         c.tensor_core_active = true;
         c.gpu_arch_class = "ampere";
-        c.kernel_backend_path = "cuda_scaffold";
+        c.kernel_backend_path = "cuda_kmeans";
         c.hot_path_language = "cpp_cuda";
         c.fallback_reason.clear();
         c.error_code.clear();
@@ -2149,7 +2106,9 @@ StageCompliance evaluate_stage_compliance(const std::string& stage_id) {
         return c;
     }
     if (!c.cuda_enabled) {
-        c.fallback_reason = "cuda_required_but_disabled";
+        if (c.fallback_reason.empty()) {
+            c.fallback_reason = "cuda_required_but_disabled";
+        }
     } else if (c.gpu_arch_class != "ampere") {
         c.fallback_reason = "gpu_arch_not_ampere";
     } else if (c.tensor_core_required && !c.tensor_core_active) {

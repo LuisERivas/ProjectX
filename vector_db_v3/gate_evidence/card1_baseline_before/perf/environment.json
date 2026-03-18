@@ -1,0 +1,17 @@
+{
+  "timestamp_utc": "2026-03-18T04:01:18.621045+00:00",
+  "mode": "evidence",
+  "profile": "minimum",
+  "cwd": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX",
+  "build_dir": "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build",
+  "ctest_cmd": [
+    "ctest",
+    "--test-dir",
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\build",
+    "--output-on-failure",
+    "-R",
+    "vectordb_v3_exact_search_tests|vectordb_v3_top_layer_artifacts_tests|vectordb_v3_mid_layer_artifacts_tests|vectordb_v3_final_layer_artifacts_tests"
+  ],
+  "warmup_runs": 1,
+  "measure_runs": 5
+}

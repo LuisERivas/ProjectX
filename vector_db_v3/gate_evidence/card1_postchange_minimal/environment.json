@@ -1,0 +1,10 @@
+{
+  "run_id": "card1_postchange_minimal",
+  "timestamp_utc": "2026-03-18T04:06:58.360584+00:00",
+  "os": "Windows-10-10.0.19045-SP0",
+  "python": "3.12.0",
+  "cmake": "unavailable",
+  "ctest": "unavailable",
+  "compiler_hint": "unknown",
+  "profile": "minimal"
+}

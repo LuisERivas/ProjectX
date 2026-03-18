@@ -5,13 +5,28 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(vectordb_v3
+find_package(CUDAToolkit QUIET)
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+endif()
+
+set(VECTOR_DB_V3_CORE_SOURCES
     src/vector_store.cpp
     src/telemetry.cpp
+    src/kmeans_backend_cpu.cpp
+    src/cuda/kmeans_runtime.cpp
     src/codec/checksum.cpp
     src/codec/io.cpp
     src/codec/artifacts.cpp
 )
+
+if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
+    list(APPEND VECTOR_DB_V3_CORE_SOURCES src/cuda/kmeans_kernels.cu)
+endif()
+
+add_library(vectordb_v3 ${VECTOR_DB_V3_CORE_SOURCES})
 target_include_directories(vectordb_v3 PUBLIC include)
 
 if (MSVC)
@@ -20,9 +35,13 @@ else()
     target_compile_options(vectordb_v3 PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
+if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
     target_compile_definitions(vectordb_v3 PUBLIC VECTOR_DB_V3_CUDA_ENABLED=1)
+    target_link_libraries(vectordb_v3 PRIVATE CUDAToolkit::cudart)
+    set_target_properties(vectordb_v3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set_target_properties(vectordb_v3 PROPERTIES CUDA_ARCHITECTURES 80)
+    endif()
 else()
     target_compile_definitions(vectordb_v3 PUBLIC VECTOR_DB_V3_CUDA_ENABLED=0)
 endif()
@@ -112,6 +131,21 @@ add_executable(vectordb_v3_compliance_fail_fast_tests
 )
 target_link_libraries(vectordb_v3_compliance_fail_fast_tests PRIVATE vectordb_v3)
 
+add_executable(vectordb_v3_kmeans_backend_parity_tests
+    tests/test_kmeans_backend_parity.cpp
+)
+target_link_libraries(vectordb_v3_kmeans_backend_parity_tests PRIVATE vectordb_v3)
+
+add_executable(vectordb_v3_kmeans_tie_break_determinism_tests
+    tests/test_kmeans_tie_break_determinism.cpp
+)
+target_link_libraries(vectordb_v3_kmeans_tie_break_determinism_tests PRIVATE vectordb_v3)
+
+add_executable(vectordb_v3_kmeans_backend_selection_tests
+    tests/test_kmeans_backend_selection.cpp
+)
+target_link_libraries(vectordb_v3_kmeans_backend_selection_tests PRIVATE vectordb_v3)
+
 enable_testing()
 add_test(NAME vectordb_v3_tests COMMAND vectordb_v3_tests)
 add_test(NAME vectordb_v3_codec_primitives_tests COMMAND vectordb_v3_codec_primitives_tests)
@@ -131,6 +165,11 @@ add_test(
     COMMAND vectordb_v3_final_layer_eligibility_reconciliation_tests)
 add_test(NAME vectordb_v3_compliance_pass_tests COMMAND vectordb_v3_compliance_pass_tests)
 add_test(NAME vectordb_v3_compliance_fail_fast_tests COMMAND vectordb_v3_compliance_fail_fast_tests)
+add_test(NAME vectordb_v3_kmeans_backend_parity_tests COMMAND vectordb_v3_kmeans_backend_parity_tests)
+add_test(
+    NAME vectordb_v3_kmeans_tie_break_determinism_tests
+    COMMAND vectordb_v3_kmeans_tie_break_determinism_tests)
+add_test(NAME vectordb_v3_kmeans_backend_selection_tests COMMAND vectordb_v3_kmeans_backend_selection_tests)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

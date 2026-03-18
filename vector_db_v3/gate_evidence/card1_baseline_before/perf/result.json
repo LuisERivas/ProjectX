@@ -1,0 +1,17 @@
+{
+  "gate_id": "G4",
+  "status": "warn_nonblocking",
+  "mode": "evidence",
+  "profile": "minimum",
+  "failed_metrics": [],
+  "exit_code": 0,
+  "notes": [
+    "one or more performance harness runs failed"
+  ],
+  "artifact_paths": [
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\card1_baseline_before\\perf\\perf_metrics.json",
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\card1_baseline_before\\perf\\raw_runs.json",
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\card1_baseline_before\\perf\\environment.json",
+    "C:\\Users\\lucho\\Desktop\\Projects\\ProjectX\\vector_db_v3\\gate_evidence\\card1_baseline_before\\perf\\perf.log"
+  ]
+}
