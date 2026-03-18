@@ -1,15 +1,33 @@
 cmake_minimum_required(VERSION 3.16)
+if(POLICY CMP0104)
+    cmake_policy(SET CMP0104 NEW)
+endif()
 project(vectordb_v3_m1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(CUDAToolkit QUIET)
 include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80)
+    endif()
+endif()
+find_package(CUDAToolkit QUIET)
+
+set(VECTOR_DB_V3_ENABLE_CUDA_BACKEND OFF)
+set(VECTOR_DB_V3_CUDART_TARGET "")
+if(CMAKE_CUDA_COMPILER)
+    if(TARGET CUDAToolkit::cudart)
+        set(VECTOR_DB_V3_ENABLE_CUDA_BACKEND ON)
+        set(VECTOR_DB_V3_CUDART_TARGET CUDAToolkit::cudart)
+    elseif(TARGET CUDA::cudart)
+        set(VECTOR_DB_V3_ENABLE_CUDA_BACKEND ON)
+        set(VECTOR_DB_V3_CUDART_TARGET CUDA::cudart)
+    endif()
 endif()
 
 set(VECTOR_DB_V3_CORE_SOURCES
@@ -22,7 +40,7 @@ set(VECTOR_DB_V3_CORE_SOURCES
     src/codec/artifacts.cpp
 )
 
-if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
+if(VECTOR_DB_V3_ENABLE_CUDA_BACKEND)
     list(APPEND VECTOR_DB_V3_CORE_SOURCES src/cuda/kmeans_kernels.cu)
 endif()
 
@@ -35,15 +53,15 @@ else()
     target_compile_options(vectordb_v3 PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
+if(VECTOR_DB_V3_ENABLE_CUDA_BACKEND)
     target_compile_definitions(vectordb_v3 PUBLIC VECTOR_DB_V3_CUDA_ENABLED=1)
-    target_link_libraries(vectordb_v3 PRIVATE CUDAToolkit::cudart)
+    target_link_libraries(vectordb_v3 PRIVATE ${VECTOR_DB_V3_CUDART_TARGET})
     set_target_properties(vectordb_v3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set_target_properties(vectordb_v3 PROPERTIES CUDA_ARCHITECTURES 80)
-    endif()
 else()
     target_compile_definitions(vectordb_v3 PUBLIC VECTOR_DB_V3_CUDA_ENABLED=0)
+    if(CMAKE_CUDA_COMPILER)
+        message(WARNING "CUDA compiler detected but cudart imported target not found; building CPU fallback only.")
+    endif()
 endif()
 
 add_executable(vectordb_v3_cli
