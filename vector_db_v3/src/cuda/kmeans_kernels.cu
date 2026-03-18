@@ -21,7 +21,8 @@ __global__ void kmeans_assign_kernel(
 
     const float* vec = vectors + static_cast<std::size_t>(idx) * dim;
     std::uint32_t best_idx = 0U;
-    float best_dist = CUDART_INF_F;
+    // Avoid toolkit-version-specific infinity macros in device code.
+    float best_dist = 3.402823466e+38F;
     for (std::uint32_t c = 0; c < k; ++c) {
         const float* centroid = centroids + static_cast<std::size_t>(c) * dim;
         float dist = 0.0f;
