@@ -28,12 +28,14 @@ int main() {
     using namespace vector_db_v3;
 
     std::vector<std::vector<float>> vectors;
-    vectors.reserve(96U);
-    for (std::size_t i = 0; i < 48U; ++i) {
-        vectors.push_back(make_vec(0.1f));
-    }
-    for (std::size_t i = 0; i < 48U; ++i) {
-        vectors.push_back(make_vec(0.9f));
+    constexpr std::size_t kClusters = 8U;
+    constexpr std::size_t kPerCluster = 12U;
+    vectors.reserve(kClusters * kPerCluster);
+    for (std::size_t c = 0; c < kClusters; ++c) {
+        const float base = 0.1f + static_cast<float>(c) * 0.2f;
+        for (std::size_t i = 0; i < kPerCluster; ++i) {
+            vectors.push_back(make_vec(base + static_cast<float>(i) * 0.0001f));
+        }
     }
 
     bool ok = true;
@@ -51,10 +53,17 @@ int main() {
 
     ok &= expect(cpu.assignments.size() == candidate.assignments.size(), "assignment size parity");
     if (cpu.assignments.size() == candidate.assignments.size()) {
+        // Label IDs can be permuted between backends while still representing
+        // the same clustering; compare pairwise co-membership invariants.
         for (std::size_t i = 0; i < cpu.assignments.size(); ++i) {
-            if (cpu.assignments[i] != candidate.assignments[i]) {
-                ok &= expect(false, "assignment parity mismatch");
-                break;
+            for (std::size_t j = i + 1; j < cpu.assignments.size(); ++j) {
+                const bool cpu_same = cpu.assignments[i] == cpu.assignments[j];
+                const bool cand_same = candidate.assignments[i] == candidate.assignments[j];
+                if (cpu_same != cand_same) {
+                    ok &= expect(false, "assignment co-membership parity mismatch");
+                    i = cpu.assignments.size();
+                    break;
+                }
             }
         }
     }
