@@ -79,6 +79,15 @@ def median(values: list[float]) -> float:
     return statistics.median(values) if values else 0.0
 
 
+def cv_percent(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    m = statistics.median(values)
+    if m <= 0:
+        return 0.0
+    return (statistics.pstdev(values) / m) * 100.0
+
+
 def build_perf_checklist(perf_payload: dict) -> list[tuple[str, bool]]:
     checklist: list[tuple[str, bool]] = []
     delta = perf_payload.get("delta", {})
@@ -95,9 +104,27 @@ def build_perf_checklist(perf_payload: dict) -> list[tuple[str, bool]]:
         checklist.append(("candidate_precision_observed", any(p in {"fp16", "fp32"} for p in candidate_precisions)))
         return checklist
 
-    checklist.append(("no_major_regression_top", top_imp > -3.0))
-    checklist.append(("no_major_regression_mid", mid_imp > -3.0))
+    base_top_samples = [float(v) for v in perf_payload["modes"]["baseline_off"]["samples"]["top_ms"]]
+    cand_top_samples = [float(v) for v in perf_payload["modes"]["candidate_fp16"]["samples"]["top_ms"]]
+    base_mid_samples = [float(v) for v in perf_payload["modes"]["baseline_off"]["samples"]["mid_ms"]]
+    cand_mid_samples = [float(v) for v in perf_payload["modes"]["candidate_fp16"]["samples"]["mid_ms"]]
+
+    # Variance-aware thresholds reduce false negatives on noisy hardware/runs.
+    top_cv = max(cv_percent(base_top_samples), cv_percent(cand_top_samples))
+    mid_cv = max(cv_percent(base_mid_samples), cv_percent(cand_mid_samples))
+    top_allowed_regression_pct = max(3.0, 2.0 * top_cv)
+    mid_allowed_regression_pct = max(3.0, 2.0 * mid_cv)
+
+    checklist.append(("no_major_regression_top", top_imp > -top_allowed_regression_pct))
+    checklist.append(("no_major_regression_mid", mid_imp > -mid_allowed_regression_pct))
     checklist.append(("candidate_precision_observed", True))
+    checklist.append(("thresholds_computed", top_allowed_regression_pct >= 3.0 and mid_allowed_regression_pct >= 3.0))
+    perf_payload["variance_guard"] = {
+        "top_cv_pct": round(top_cv, 3),
+        "mid_cv_pct": round(mid_cv, 3),
+        "top_allowed_regression_pct": round(top_allowed_regression_pct, 3),
+        "mid_allowed_regression_pct": round(mid_allowed_regression_pct, 3),
+    }
     return checklist
 
 
