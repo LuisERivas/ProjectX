@@ -90,6 +90,16 @@ def sha256_hex(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def should_skip_checksum_check(manifest_path: Path, target_path: Path) -> bool:
+    # Some summary manifests intentionally store checksums for related artifacts
+    # while the artifact_path points to the summary manifest container itself.
+    # Treat self-referential entries as non-blocking for parity checks.
+    try:
+        return manifest_path.resolve() == target_path.resolve()
+    except Exception:
+        return False
+
+
 def fail(message: str, report_out: Path, checks: list[dict]) -> int:
     payload = {"status": "fail", "message": message, "checks": checks}
     report_out.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +224,8 @@ def main() -> int:
         if isinstance(payload.get("checksum"), str) and isinstance(payload.get("artifact_path"), str):
             target_path = to_abs_artifact_path(clusters_current, payload["artifact_path"])
             if target_path.exists():
+                if should_skip_checksum_check(artifact_path, target_path):
+                    continue
                 manifest_checks.append(
                     {
                         "manifest_path": str(artifact_path),
@@ -230,6 +242,8 @@ def main() -> int:
                     continue
                 target_path = to_abs_artifact_path(clusters_current, item["artifact_path"])
                 if not target_path.exists():
+                    continue
+                if should_skip_checksum_check(artifact_path, target_path):
                     continue
                 manifest_checks.append(
                     {
