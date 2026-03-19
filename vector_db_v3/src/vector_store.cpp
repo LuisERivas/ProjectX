@@ -88,15 +88,6 @@ bool sync_file_descriptor(const fs::path& p) {
 #endif
 }
 
-std::size_t file_size_or_zero(const fs::path& p) {
-    std::error_code ec;
-    const auto sz = fs::file_size(p, ec);
-    if (ec) {
-        return 0U;
-    }
-    return static_cast<std::size_t>(sz);
-}
-
 Status write_manifest_json_atomic(const fs::path& path, const ManifestMeta& meta) {
     std::ostringstream out;
     out << "{\n"
@@ -113,25 +104,56 @@ Status write_manifest_json_atomic(const fs::path& path, const ManifestMeta& meta
 }
 
 std::uint64_t parse_u64_or_default(const std::string& body, const std::string& key, std::uint64_t fallback) {
-    const std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
-    std::smatch m;
-    if (!std::regex_search(body, m, re) || m.size() < 2) {
+    const std::string token = "\"" + key + "\"";
+    const std::size_t token_pos = body.find(token);
+    if (token_pos == std::string::npos) {
         return fallback;
     }
+    const std::size_t colon_pos = body.find(':', token_pos + token.size());
+    if (colon_pos == std::string::npos) {
+        return fallback;
+    }
+    std::size_t i = colon_pos + 1U;
+    while (i < body.size() && std::isspace(static_cast<unsigned char>(body[i]))) {
+        ++i;
+    }
+    if (i >= body.size() || !std::isdigit(static_cast<unsigned char>(body[i]))) {
+        return fallback;
+    }
+    const std::size_t start = i;
+    while (i < body.size() && std::isdigit(static_cast<unsigned char>(body[i]))) {
+        ++i;
+    }
     try {
-        return static_cast<std::uint64_t>(std::stoull(m[1].str()));
+        return static_cast<std::uint64_t>(std::stoull(body.substr(start, i - start)));
     } catch (...) {
         return fallback;
     }
 }
 
 std::string parse_string_or_default(const std::string& body, const std::string& key, const std::string& fallback) {
-    const std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
-    std::smatch m;
-    if (!std::regex_search(body, m, re) || m.size() < 2) {
+    const std::string token = "\"" + key + "\"";
+    const std::size_t token_pos = body.find(token);
+    if (token_pos == std::string::npos) {
         return fallback;
     }
-    return m[1].str();
+    const std::size_t colon_pos = body.find(':', token_pos + token.size());
+    if (colon_pos == std::string::npos) {
+        return fallback;
+    }
+    std::size_t i = colon_pos + 1U;
+    while (i < body.size() && std::isspace(static_cast<unsigned char>(body[i]))) {
+        ++i;
+    }
+    if (i >= body.size() || body[i] != '"') {
+        return fallback;
+    }
+    const std::size_t start = i + 1U;
+    const std::size_t end = body.find('"', start);
+    if (end == std::string::npos) {
+        return fallback;
+    }
+    return body.substr(start, end - start);
 }
 
 Status load_manifest_json(const fs::path& path, ManifestMeta* out) {
@@ -1038,16 +1060,11 @@ Status read_manifest_payload_string(const fs::path& artifact_path, std::string* 
 }
 
 std::uint32_t parse_u32_or_default(const std::string& body, const std::string& key, std::uint32_t fallback) {
-    const std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
-    std::smatch m;
-    if (!std::regex_search(body, m, re) || m.size() < 2) {
+    const std::uint64_t parsed = parse_u64_or_default(body, key, static_cast<std::uint64_t>(fallback));
+    if (parsed > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
         return fallback;
     }
-    try {
-        return static_cast<std::uint32_t>(std::stoul(m[1].str()));
-    } catch (...) {
-        return fallback;
-    }
+    return static_cast<std::uint32_t>(parsed);
 }
 
 Status parse_lower_gate_outcomes(const std::string& payload, std::vector<LowerGateOutcome>* out) {
@@ -1055,7 +1072,7 @@ Status parse_lower_gate_outcomes(const std::string& payload, std::vector<LowerGa
         return Status::Error("lower gate parse: invalid output pointer");
     }
     out->clear();
-    const std::regex row_re(
+    static const std::regex row_re(
         "\\{\"parent_top_centroid_numeric_id\":([0-9]+),\"mid_centroid_numeric_id\":([0-9]+),"
         "\"centroid_id\":([0-9]+),\"job_id\":\"([^\"]*)\",\"dataset_size\":([0-9]+),"
         "\"gate_decision\":\"(stop|continue)\"\\}");
@@ -1097,7 +1114,7 @@ Status parse_mid_parent_jobs(const std::string& payload, std::vector<MidParentJo
         return Status::Error("mid parent parse: invalid output pointer");
     }
     out->clear();
-    const std::regex row_re(
+    static const std::regex row_re(
         "\\{\"centroid_id\":([0-9]+),\"job_id\":\"([^\"]*)\",\"dataset_size\":([0-9]+),"
         "\"k_min\":([0-9]+),\"k_max\":([0-9]+),\"chosen_k\":([0-9]+)\\}");
     auto it = std::sregex_iterator(payload.begin(), payload.end(), row_re);
@@ -1289,89 +1306,97 @@ Status emit_top_layer_artifacts(
     const fs::path clusters_dir = paths::clusters_current_dir(data_dir);
     fs::create_directories(clusters_dir);
 
-    auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written) {
+    auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written, std::size_t bytes_written) {
         emit_step(
             telemetry::EventType::ArtifactWrite,
             status.ok ? "completed" : "failed",
             {
                 {"artifact_path", artifact_path.generic_string()},
                 {"rows_written", std::to_string(rows_written)},
-                {"bytes_written", std::to_string(file_size_or_zero(artifact_path))},
+                {"bytes_written", std::to_string(bytes_written)},
                 {"status", status.ok ? "ok" : "error"},
             });
     };
 
-    Status st = codec::write_id_estimate_file(paths::id_estimate_bin(data_dir), estimate);
+    codec::WriteArtifactInfo id_estimate_info{};
+    Status st = codec::write_id_estimate_file_with_info(paths::id_estimate_bin(data_dir), estimate, &id_estimate_info);
     if (!st.ok) {
         return st;
     }
-    write_and_emit(paths::id_estimate_bin(data_dir), st, 1U);
+    write_and_emit(paths::id_estimate_bin(data_dir), st, 1U, id_estimate_info.bytes_written);
 
-    st = codec::write_elbow_trace_file(paths::elbow_trace_bin(data_dir), elbow_rows);
+    codec::WriteArtifactInfo elbow_info{};
+    st = codec::write_elbow_trace_file_with_info(paths::elbow_trace_bin(data_dir), elbow_rows, &elbow_info);
     if (!st.ok) {
         return st;
     }
-    write_and_emit(paths::elbow_trace_bin(data_dir), st, elbow_rows.size());
+    write_and_emit(paths::elbow_trace_bin(data_dir), st, elbow_rows.size(), elbow_info.bytes_written);
 
-    st = codec::write_top_centroids_file(paths::centroids_bin(data_dir), centroid_rows);
+    codec::WriteArtifactInfo centroids_info{};
+    st = codec::write_top_centroids_file_with_info(paths::centroids_bin(data_dir), centroid_rows, &centroids_info);
     if (!st.ok) {
         return st;
     }
-    write_and_emit(paths::centroids_bin(data_dir), st, centroid_rows.size());
+    write_and_emit(paths::centroids_bin(data_dir), st, centroid_rows.size(), centroids_info.bytes_written);
 
-    st = codec::write_top_assignments_file(paths::top_assignments_bin(data_dir), assignments);
+    codec::WriteArtifactInfo assignments_info{};
+    st = codec::write_top_assignments_file_with_info(paths::top_assignments_bin(data_dir), assignments, &assignments_info);
     if (!st.ok) {
         return st;
     }
-    write_and_emit(paths::top_assignments_bin(data_dir), st, assignments.size());
+    write_and_emit(paths::top_assignments_bin(data_dir), st, assignments.size(), assignments_info.bytes_written);
 
-    st = codec::write_stability_report_file(paths::stability_report_bin(data_dir), stability);
+    codec::WriteArtifactInfo stability_info{};
+    st = codec::write_stability_report_file_with_info(paths::stability_report_bin(data_dir), stability, &stability_info);
     if (!st.ok) {
         return st;
     }
-    write_and_emit(paths::stability_report_bin(data_dir), st, 1U);
+    write_and_emit(paths::stability_report_bin(data_dir), st, 1U, stability_info.bytes_written);
 
-    std::vector<std::pair<std::string, std::filesystem::path>> manifest_artifacts = {
-        {"id_estimate.bin", paths::id_estimate_bin(data_dir)},
-        {"elbow_trace.bin", paths::elbow_trace_bin(data_dir)},
-        {"centroids.bin", paths::centroids_bin(data_dir)},
-        {"assignments.bin", paths::top_assignments_bin(data_dir)},
-        {"stability_report.bin", paths::stability_report_bin(data_dir)},
+    struct TopManifestArtifactEntry {
+        std::string artifact_path;
+        std::string checksum;
     };
-    std::ostringstream payload_json;
-    payload_json << "{";
-    payload_json << "\"stage\":\"top\",";
-    payload_json << "\"schema_version\":1,";
-    payload_json << "\"chosen_k\":" << best_k << ",";
-    payload_json << "\"artifacts\":[";
+    const std::vector<TopManifestArtifactEntry> manifest_artifacts = {
+        {"id_estimate.bin", id_estimate_info.checksum_sha256},
+        {"elbow_trace.bin", elbow_info.checksum_sha256},
+        {"centroids.bin", centroids_info.checksum_sha256},
+        {"assignments.bin", assignments_info.checksum_sha256},
+        {"stability_report.bin", stability_info.checksum_sha256},
+    };
+    std::string payload_json;
+    payload_json.reserve(1024U + manifest_artifacts.size() * 192U);
+    payload_json += "{";
+    payload_json += "\"stage\":\"top\",";
+    payload_json += "\"schema_version\":1,";
+    payload_json += "\"chosen_k\":";
+    payload_json += std::to_string(best_k);
+    payload_json += ",";
+    payload_json += "\"artifacts\":[";
     for (std::size_t i = 0; i < manifest_artifacts.size(); ++i) {
-        std::vector<std::uint8_t> artifact_bytes;
-        const Status rd = codec::read_file_bytes(manifest_artifacts[i].second, &artifact_bytes);
-        if (!rd.ok) {
-            return rd;
-        }
         if (i > 0) {
-            payload_json << ",";
+            payload_json += ",";
         }
-        payload_json << "{";
-        payload_json << "\"artifact_path\":\"" << escape_json_string(manifest_artifacts[i].first) << "\",";
-        payload_json << "\"artifact_format\":\"binary\",";
-        payload_json << "\"endianness\":\"little\",";
-        payload_json << "\"record_size_bytes\":0,";
-        payload_json << "\"record_count\":0,";
-        payload_json << "\"schema_version\":1,";
-        payload_json << "\"checksum\":\"" << codec::sha256_hex(artifact_bytes) << "\"";
-        payload_json << "}";
+        payload_json += "{";
+        payload_json += "\"artifact_path\":\"" + escape_json_string(manifest_artifacts[i].artifact_path) + "\",";
+        payload_json += "\"artifact_format\":\"binary\",";
+        payload_json += "\"endianness\":\"little\",";
+        payload_json += "\"record_size_bytes\":0,";
+        payload_json += "\"record_count\":0,";
+        payload_json += "\"schema_version\":1,";
+        payload_json += "\"checksum\":\"" + manifest_artifacts[i].checksum + "\"";
+        payload_json += "}";
     }
-    payload_json << "]}";
-    const std::string payload = payload_json.str();
-    st = codec::write_cluster_manifest_file(
+    payload_json += "]}";
+    codec::WriteArtifactInfo top_manifest_info{};
+    st = codec::write_cluster_manifest_file_with_info(
         paths::cluster_manifest_bin(data_dir),
-        std::vector<std::uint8_t>(payload.begin(), payload.end()));
+        std::vector<std::uint8_t>(payload_json.begin(), payload_json.end()),
+        &top_manifest_info);
     if (!st.ok) {
         return st;
     }
-    write_and_emit(paths::cluster_manifest_bin(data_dir), st, 1U);
+    write_and_emit(paths::cluster_manifest_bin(data_dir), st, 1U, top_manifest_info.bytes_written);
 
     *records_processed_out = ids.size();
     (void)seed;
@@ -1577,29 +1602,24 @@ Status emit_mid_layer_artifacts(
     const fs::path mid_dir = paths::mid_layer_dir(data_dir);
     fs::create_directories(mid_dir);
 
-    auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written) {
+    auto write_and_emit = [&](const fs::path& artifact_path, const Status& status, std::size_t rows_written, std::size_t bytes_written) {
         emit_step(
             telemetry::EventType::ArtifactWrite,
             status.ok ? "completed" : "failed",
             {
                 {"artifact_path", artifact_path.generic_string()},
                 {"rows_written", std::to_string(rows_written)},
-                {"bytes_written", std::to_string(file_size_or_zero(artifact_path))},
+                {"bytes_written", std::to_string(bytes_written)},
                 {"status", status.ok ? "ok" : "error"},
             });
     };
 
-    Status st = codec::write_mid_assignments_file(paths::mid_layer_assignments_bin(data_dir), mid_rows);
+    codec::WriteArtifactInfo mid_assign_info{};
+    Status st = codec::write_mid_assignments_file_with_info(paths::mid_layer_assignments_bin(data_dir), mid_rows, &mid_assign_info);
     if (!st.ok) {
         return st;
     }
-    write_and_emit(paths::mid_layer_assignments_bin(data_dir), st, mid_rows.size());
-
-    std::vector<std::uint8_t> mid_assign_bytes;
-    const Status mid_assign_rd = codec::read_file_bytes(paths::mid_layer_assignments_bin(data_dir), &mid_assign_bytes);
-    if (!mid_assign_rd.ok) {
-        return mid_assign_rd;
-    }
+    write_and_emit(paths::mid_layer_assignments_bin(data_dir), st, mid_rows.size(), mid_assign_info.bytes_written);
     std::ostringstream payload_json;
     payload_json << "{";
     payload_json << "\"stage\":\"mid\",";
@@ -1609,7 +1629,7 @@ Status emit_mid_layer_artifacts(
     payload_json << "\"artifact_format\":\"assignments.bin.v1\",";
     payload_json << "\"endianness\":\"little\",";
     payload_json << "\"record_size_bytes\":" << codec::kMidAssignmentRecordSize << ",";
-    payload_json << "\"checksum\":\"" << codec::sha256_hex(mid_assign_bytes) << "\",";
+    payload_json << "\"checksum\":\"" << mid_assign_info.checksum_sha256 << "\",";
     payload_json << "\"parent_jobs\":[";
     for (std::size_t i = 0; i < parent_jobs.size(); ++i) {
         if (i > 0) {
@@ -1627,13 +1647,15 @@ Status emit_mid_layer_artifacts(
     payload_json << "]}";
 
     const std::string payload = payload_json.str();
-    st = codec::write_cluster_manifest_file(
+    codec::WriteArtifactInfo mid_manifest_info{};
+    st = codec::write_cluster_manifest_file_with_info(
         paths::mid_layer_clustering_bin(data_dir),
-        std::vector<std::uint8_t>(payload.begin(), payload.end()));
+        std::vector<std::uint8_t>(payload.begin(), payload.end()),
+        &mid_manifest_info);
     if (!st.ok) {
         return st;
     }
-    write_and_emit(paths::mid_layer_clustering_bin(data_dir), st, 1U);
+    write_and_emit(paths::mid_layer_clustering_bin(data_dir), st, 1U, mid_manifest_info.bytes_written);
 
     *chosen_k_out = global_mid_offset;
     *records_processed_out = mid_rows.size();
@@ -1781,9 +1803,11 @@ Status emit_lower_layer_artifacts(
     payload_json << "}";
 
     const std::string payload = payload_json.str();
-    Status st = codec::write_cluster_manifest_file(
+    codec::WriteArtifactInfo lower_manifest_info{};
+    Status st = codec::write_cluster_manifest_file_with_info(
         paths::lower_layer_clustering_bin(data_dir),
-        std::vector<std::uint8_t>(payload.begin(), payload.end()));
+        std::vector<std::uint8_t>(payload.begin(), payload.end()),
+        &lower_manifest_info);
     if (!st.ok) {
         return st;
     }
@@ -1794,7 +1818,7 @@ Status emit_lower_layer_artifacts(
         {
             {"artifact_path", paths::lower_layer_clustering_bin(data_dir).generic_string()},
             {"rows_written", std::to_string(branch_embedding_ids.size())},
-            {"bytes_written", std::to_string(file_size_or_zero(paths::lower_layer_clustering_bin(data_dir)))},
+            {"bytes_written", std::to_string(lower_manifest_info.bytes_written)},
             {"status", "ok"},
         });
 
@@ -1893,7 +1917,9 @@ Status finalize_k_search_bounds_batch(
     if (!rows_valid.ok) {
         return Status::Error("finalization: invalid k_search_bounds_batch rows: " + rows_valid.message);
     }
-    const Status write_st = codec::write_k_search_bounds_batch_file(paths::k_search_bounds_batch_bin(data_dir), rows);
+    codec::WriteArtifactInfo k_bounds_info{};
+    const Status write_st =
+        codec::write_k_search_bounds_batch_file_with_info(paths::k_search_bounds_batch_bin(data_dir), rows, &k_bounds_info);
     if (!write_st.ok) {
         return write_st;
     }
@@ -1920,7 +1946,7 @@ Status finalize_k_search_bounds_batch(
             {"rows_mid", std::to_string(rows_mid)},
             {"rows_lower", std::to_string(rows_lower)},
             {"pipeline_step_name", "finalize_k_search_bounds_batch"},
-            {"bytes_written", std::to_string(file_size_or_zero(paths::k_search_bounds_batch_bin(data_dir)))},
+            {"bytes_written", std::to_string(k_bounds_info.bytes_written)},
             {"status", "ok"},
         });
     return Status::Ok();
@@ -2026,7 +2052,11 @@ Status finalize_post_cluster_membership(
         return Status::Error("finalization: post_cluster_membership row-count mismatch");
     }
 
-    st = codec::write_post_cluster_membership_file(paths::post_cluster_membership_bin(data_dir), membership_rows);
+    codec::WriteArtifactInfo membership_info{};
+    st = codec::write_post_cluster_membership_file_with_info(
+        paths::post_cluster_membership_bin(data_dir),
+        membership_rows,
+        &membership_info);
     if (!st.ok) {
         return st;
     }
@@ -2036,7 +2066,7 @@ Status finalize_post_cluster_membership(
         {
             {"artifact_path", paths::post_cluster_membership_bin(data_dir).generic_string()},
             {"rows_written", std::to_string(membership_rows.size())},
-            {"bytes_written", std::to_string(file_size_or_zero(paths::post_cluster_membership_bin(data_dir)))},
+            {"bytes_written", std::to_string(membership_info.bytes_written)},
             {"status", "ok"},
         });
     return Status::Ok();
@@ -2095,14 +2125,14 @@ Status emit_final_layer_artifacts(
     std::uint32_t next_final_cluster_id = 0U;
     std::uint32_t final_job_index = 0U;
 
-    auto emit_artifact = [&](const fs::path& artifact_path, std::size_t rows_written) {
+    auto emit_artifact = [&](const fs::path& artifact_path, std::size_t rows_written, std::size_t bytes_written) {
         emit_step(
             telemetry::EventType::ArtifactWrite,
             "completed",
             {
                 {"artifact_path", artifact_path.generic_string()},
                 {"rows_written", std::to_string(rows_written)},
-                {"bytes_written", std::to_string(file_size_or_zero(artifact_path))},
+                {"bytes_written", std::to_string(bytes_written)},
                 {"status", "ok"},
             });
     };
@@ -2154,17 +2184,18 @@ Status emit_final_layer_artifacts(
             return Status::Error("final clustering: invalid final assignments rows: " + st.message);
         }
 
-        st = codec::write_final_assignments_file(paths::final_cluster_assignments_bin(data_dir, final_cluster_id), final_rows);
+        codec::WriteArtifactInfo final_assignments_info{};
+        st = codec::write_final_assignments_file_with_info(
+            paths::final_cluster_assignments_bin(data_dir, final_cluster_id),
+            final_rows,
+            &final_assignments_info);
         if (!st.ok) {
             return st;
         }
-        emit_artifact(paths::final_cluster_assignments_bin(data_dir, final_cluster_id), final_rows.size());
-
-        std::vector<std::uint8_t> assignment_bytes;
-        st = codec::read_file_bytes(paths::final_cluster_assignments_bin(data_dir, final_cluster_id), &assignment_bytes);
-        if (!st.ok) {
-            return st;
-        }
+        emit_artifact(
+            paths::final_cluster_assignments_bin(data_dir, final_cluster_id),
+            final_rows.size(),
+            final_assignments_info.bytes_written);
 
         std::ostringstream manifest_payload;
         manifest_payload << "{";
@@ -2180,16 +2211,18 @@ Status emit_final_layer_artifacts(
         manifest_payload << "\"record_size_bytes\":" << codec::kFinalAssignmentRecordSize << ",";
         manifest_payload << "\"record_count\":" << final_rows.size() << ",";
         manifest_payload << "\"schema_version\":1,";
-        manifest_payload << "\"checksum\":\"" << codec::sha256_hex(assignment_bytes) << "\"";
+        manifest_payload << "\"checksum\":\"" << final_assignments_info.checksum_sha256 << "\"";
         manifest_payload << "}";
         const std::string manifest_payload_s = manifest_payload.str();
-        st = codec::write_cluster_manifest_file(
+        codec::WriteArtifactInfo final_manifest_info{};
+        st = codec::write_cluster_manifest_file_with_info(
             paths::final_cluster_manifest_bin(data_dir, final_cluster_id),
-            std::vector<std::uint8_t>(manifest_payload_s.begin(), manifest_payload_s.end()));
+            std::vector<std::uint8_t>(manifest_payload_s.begin(), manifest_payload_s.end()),
+            &final_manifest_info);
         if (!st.ok) {
             return st;
         }
-        emit_artifact(paths::final_cluster_manifest_bin(data_dir, final_cluster_id), 1U);
+        emit_artifact(paths::final_cluster_manifest_bin(data_dir, final_cluster_id), 1U, final_manifest_info.bytes_written);
 
         std::ostringstream summary_payload;
         summary_payload << "{";
@@ -2203,16 +2236,18 @@ Status emit_final_layer_artifacts(
         summary_payload << "\"schema_version\":1,";
         summary_payload << "\"dataset_size\":" << ids.size() << ",";
         summary_payload << "\"rows_written\":" << final_rows.size() << ",";
-        summary_payload << "\"checksum\":\"" << codec::sha256_hex(assignment_bytes) << "\"";
+        summary_payload << "\"checksum\":\"" << final_assignments_info.checksum_sha256 << "\"";
         summary_payload << "}";
         const std::string summary_payload_s = summary_payload.str();
-        st = codec::write_cluster_manifest_file(
+        codec::WriteArtifactInfo final_summary_info{};
+        st = codec::write_cluster_manifest_file_with_info(
             paths::final_cluster_summary_bin(data_dir, final_cluster_id),
-            std::vector<std::uint8_t>(summary_payload_s.begin(), summary_payload_s.end()));
+            std::vector<std::uint8_t>(summary_payload_s.begin(), summary_payload_s.end()),
+            &final_summary_info);
         if (!st.ok) {
             return st;
         }
-        emit_artifact(paths::final_cluster_summary_bin(data_dir, final_cluster_id), 1U);
+        emit_artifact(paths::final_cluster_summary_bin(data_dir, final_cluster_id), 1U, final_summary_info.bytes_written);
 
         emit_step(
             telemetry::EventType::StageProgress,
@@ -2264,13 +2299,15 @@ Status emit_final_layer_artifacts(
     }
     aggregate_payload << "]}";
     const std::string aggregate_payload_s = aggregate_payload.str();
-    st = codec::write_cluster_manifest_file(
+    codec::WriteArtifactInfo final_aggregate_info{};
+    st = codec::write_cluster_manifest_file_with_info(
         paths::final_layer_clusters_bin(data_dir),
-        std::vector<std::uint8_t>(aggregate_payload_s.begin(), aggregate_payload_s.end()));
+        std::vector<std::uint8_t>(aggregate_payload_s.begin(), aggregate_payload_s.end()),
+        &final_aggregate_info);
     if (!st.ok) {
         return st;
     }
-    emit_artifact(paths::final_layer_clusters_bin(data_dir), final_clusters.size());
+    emit_artifact(paths::final_layer_clusters_bin(data_dir), final_clusters.size(), final_aggregate_info.bytes_written);
 
     st = finalize_k_search_bounds_batch(data_dir, lower_outcomes, emit_step);
     if (!st.ok) {

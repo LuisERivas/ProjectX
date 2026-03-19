@@ -2,12 +2,18 @@
 
 #include <filesystem>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "vector_db_v3/codec/types.hpp"
 #include "vector_db_v3/status.hpp"
 
 namespace vector_db_v3::codec {
+
+struct WriteArtifactInfo {
+    std::size_t bytes_written = 0U;
+    std::string checksum_sha256;
+};
 
 Status encode_common_header(const CommonHeader& hdr, std::vector<std::uint8_t>* out);
 Status decode_common_header(const std::vector<std::uint8_t>& bytes, CommonHeader* out);
@@ -53,33 +59,73 @@ Status decode_post_cluster_membership(
     std::vector<PostClusterMembershipRow>* out);
 
 Status write_id_estimate_file(const std::filesystem::path& path, const IdEstimateRow& row);
+Status write_id_estimate_file_with_info(
+    const std::filesystem::path& path,
+    const IdEstimateRow& row,
+    WriteArtifactInfo* out_info);
 Status read_id_estimate_file(const std::filesystem::path& path, IdEstimateRow* row);
 Status write_elbow_trace_file(const std::filesystem::path& path, const std::vector<ElbowTraceRow>& rows);
+Status write_elbow_trace_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<ElbowTraceRow>& rows,
+    WriteArtifactInfo* out_info);
 Status read_elbow_trace_file(const std::filesystem::path& path, std::vector<ElbowTraceRow>* rows);
 Status write_stability_report_file(const std::filesystem::path& path, const StabilityReportRow& row);
+Status write_stability_report_file_with_info(
+    const std::filesystem::path& path,
+    const StabilityReportRow& row,
+    WriteArtifactInfo* out_info);
 Status read_stability_report_file(const std::filesystem::path& path, StabilityReportRow* row);
 Status write_top_assignments_file(const std::filesystem::path& path, const std::vector<TopAssignmentRow>& rows);
+Status write_top_assignments_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<TopAssignmentRow>& rows,
+    WriteArtifactInfo* out_info);
 Status read_top_assignments_file(const std::filesystem::path& path, std::vector<TopAssignmentRow>* rows);
 Status write_top_centroids_file(const std::filesystem::path& path, const std::vector<TopCentroidRow>& rows);
+Status write_top_centroids_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<TopCentroidRow>& rows,
+    WriteArtifactInfo* out_info);
 Status read_top_centroids_file(const std::filesystem::path& path, std::vector<TopCentroidRow>* rows);
 Status write_cluster_manifest_file(const std::filesystem::path& path, const std::vector<std::uint8_t>& payload);
+Status write_cluster_manifest_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<std::uint8_t>& payload,
+    WriteArtifactInfo* out_info);
 Status read_cluster_manifest_file(
     const std::filesystem::path& path,
     CommonHeader* header,
     std::vector<std::uint8_t>* payload);
 Status write_mid_assignments_file(const std::filesystem::path& path, const std::vector<MidAssignmentRow>& rows);
+Status write_mid_assignments_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<MidAssignmentRow>& rows,
+    WriteArtifactInfo* out_info);
 Status read_mid_assignments_file(const std::filesystem::path& path, std::vector<MidAssignmentRow>* rows);
 Status write_final_assignments_file(const std::filesystem::path& path, const std::vector<FinalAssignmentRow>& rows);
+Status write_final_assignments_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<FinalAssignmentRow>& rows,
+    WriteArtifactInfo* out_info);
 Status read_final_assignments_file(const std::filesystem::path& path, std::vector<FinalAssignmentRow>* rows);
 Status write_k_search_bounds_batch_file(
     const std::filesystem::path& path,
     const std::vector<KSearchBoundsBatchRow>& rows);
+Status write_k_search_bounds_batch_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<KSearchBoundsBatchRow>& rows,
+    WriteArtifactInfo* out_info);
 Status read_k_search_bounds_batch_file(
     const std::filesystem::path& path,
     std::vector<KSearchBoundsBatchRow>* rows);
 Status write_post_cluster_membership_file(
     const std::filesystem::path& path,
     const std::vector<PostClusterMembershipRow>& rows);
+Status write_post_cluster_membership_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<PostClusterMembershipRow>& rows,
+    WriteArtifactInfo* out_info);
 Status read_post_cluster_membership_file(
     const std::filesystem::path& path,
     std::vector<PostClusterMembershipRow>* rows);

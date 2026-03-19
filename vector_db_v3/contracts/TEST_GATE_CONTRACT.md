@@ -33,6 +33,7 @@ Define mandatory automated gates for M1 readiness.
 - WAL commit policy matrix validation (`strict_per_record` vs `batch_group_commit`) for ingest paths with durability invariants preserved.
 - Post-ingest checkpoint shortcut validation for pipeline workflows (`VECTOR_DB_V3_POST_INGEST_CHECKPOINT=0|1`) with fail-fast checkpoint error semantics and durability parity preserved.
 - Streamed binary ingest validation for `bulk-insert-bin` without full-file record materialization, including malformed input matrix (header mismatch, payload mismatch, truncation, trailing-byte rejection, invalid batch size).
+- Metadata-overhead optimization parity validation for write-time byte accounting/checksum sourcing (no schema drift), including `artifact_write.bytes_written` parity against persisted files and manifest checksum parity against referenced artifacts.
 - Per-cluster final artifact reconciliation with aggregate summary.
 - CUDA critical-path best-practice compliance validation (parallelized critical path, minimized host-device transfers, launch configuration/utilization checks, coalesced global-memory access checks, redundant global-access reduction checks, divergence-aware kernel checks).
 - Precision artifact ID-alignment validation (duplicate ID rejection, sorted-order validation, cardinality match across FP32/FP16/INT8 variants, exact ID-membership match across variants).

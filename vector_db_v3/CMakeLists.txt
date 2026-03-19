@@ -319,4 +319,11 @@ if(Python3_Interpreter_FOUND)
             "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_card9_streaming_bulk_insert.py"
             --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
             --report-out "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/card9_ctest/streaming_bulk_insert.json")
+    add_test(
+        NAME vectordb_v3_card10_metadata_overhead_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_card10_metadata_overhead.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --report-out "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/card10_ctest/metadata_overhead.json")
 endif()

@@ -66,7 +66,7 @@ def gate_definitions(build_dir: Path, repo_root: Path) -> dict[str, dict]:
                     "vectordb_v3_precision_shard_lifecycle_tests|vectordb_v3_precision_shard_alignment_failures_tests|"
                     "vectordb_v3_card5_ingest_async_tests|vectordb_v3_card6_single_process_tests|"
                     "vectordb_v3_card7_wal_commit_policy_tests|vectordb_v3_card8_post_ingest_checkpoint_tests|"
-                    "vectordb_v3_card9_streaming_bulk_insert_tests",
+                    "vectordb_v3_card9_streaming_bulk_insert_tests|vectordb_v3_card10_metadata_overhead_tests",
                 ]
             ],
         },
@@ -106,7 +106,7 @@ def gate_definitions(build_dir: Path, repo_root: Path) -> dict[str, dict]:
                     "vectordb_v3_precision_shard_lifecycle_tests|vectordb_v3_precision_shard_alignment_failures_tests|"
                     "vectordb_v3_card5_ingest_async_tests|vectordb_v3_card6_single_process_tests|"
                     "vectordb_v3_card7_wal_commit_policy_tests|vectordb_v3_card8_post_ingest_checkpoint_tests|"
-                    "vectordb_v3_card9_streaming_bulk_insert_tests",
+                    "vectordb_v3_card9_streaming_bulk_insert_tests|vectordb_v3_card10_metadata_overhead_tests",
                 ]
             ],
         },

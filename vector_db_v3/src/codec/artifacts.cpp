@@ -78,14 +78,19 @@ Status validate_sorted_unique_embedding_ids(
     return Status::Ok();
 }
 
-template <typename T, typename EncFn>
-Status write_single_fixed_record(const std::filesystem::path& path, const T& row, EncFn&& enc_fn) {
-    std::vector<std::uint8_t> bytes;
-    const Status enc = enc_fn(row, &bytes);
-    if (!enc.ok) {
-        return enc;
+Status write_bytes_with_info(
+    const std::filesystem::path& path,
+    const std::vector<std::uint8_t>& bytes,
+    WriteArtifactInfo* out_info) {
+    const Status write_st = write_atomic_bytes(path, bytes);
+    if (!write_st.ok) {
+        return write_st;
     }
-    return write_atomic_bytes(path, bytes);
+    if (out_info != nullptr) {
+        out_info->bytes_written = bytes.size();
+        out_info->checksum_sha256 = sha256_hex(bytes);
+    }
+    return Status::Ok();
 }
 
 template <typename T, typename DecFn>
@@ -102,16 +107,17 @@ Status read_single_fixed_record(
 }
 
 template <typename T, typename EncFn>
-Status write_rows_record(
+Status write_rows_record_with_info(
     const std::filesystem::path& path,
     const std::vector<T>& rows,
-    EncFn&& enc_fn) {
+    EncFn&& enc_fn,
+    WriteArtifactInfo* out_info) {
     std::vector<std::uint8_t> bytes;
     const Status enc = enc_fn(rows, &bytes);
     if (!enc.ok) {
         return enc;
     }
-    return write_atomic_bytes(path, bytes);
+    return write_bytes_with_info(path, bytes, out_info);
 }
 
 template <typename T, typename DecFn>
@@ -552,7 +558,19 @@ Status decode_post_cluster_membership(
 }
 
 Status write_id_estimate_file(const std::filesystem::path& path, const IdEstimateRow& row) {
-    return write_single_fixed_record<IdEstimateRow>(path, row, encode_id_estimate);
+    return write_id_estimate_file_with_info(path, row, nullptr);
+}
+
+Status write_id_estimate_file_with_info(
+    const std::filesystem::path& path,
+    const IdEstimateRow& row,
+    WriteArtifactInfo* out_info) {
+    std::vector<std::uint8_t> bytes;
+    const Status enc = encode_id_estimate(row, &bytes);
+    if (!enc.ok) {
+        return enc;
+    }
+    return write_bytes_with_info(path, bytes, out_info);
 }
 
 Status read_id_estimate_file(const std::filesystem::path& path, IdEstimateRow* row) {
@@ -560,7 +578,14 @@ Status read_id_estimate_file(const std::filesystem::path& path, IdEstimateRow* r
 }
 
 Status write_elbow_trace_file(const std::filesystem::path& path, const std::vector<ElbowTraceRow>& rows) {
-    return write_rows_record(path, rows, encode_elbow_trace);
+    return write_elbow_trace_file_with_info(path, rows, nullptr);
+}
+
+Status write_elbow_trace_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<ElbowTraceRow>& rows,
+    WriteArtifactInfo* out_info) {
+    return write_rows_record_with_info(path, rows, encode_elbow_trace, out_info);
 }
 
 Status read_elbow_trace_file(const std::filesystem::path& path, std::vector<ElbowTraceRow>* rows) {
@@ -568,7 +593,19 @@ Status read_elbow_trace_file(const std::filesystem::path& path, std::vector<Elbo
 }
 
 Status write_stability_report_file(const std::filesystem::path& path, const StabilityReportRow& row) {
-    return write_single_fixed_record<StabilityReportRow>(path, row, encode_stability_report);
+    return write_stability_report_file_with_info(path, row, nullptr);
+}
+
+Status write_stability_report_file_with_info(
+    const std::filesystem::path& path,
+    const StabilityReportRow& row,
+    WriteArtifactInfo* out_info) {
+    std::vector<std::uint8_t> bytes;
+    const Status enc = encode_stability_report(row, &bytes);
+    if (!enc.ok) {
+        return enc;
+    }
+    return write_bytes_with_info(path, bytes, out_info);
 }
 
 Status read_stability_report_file(const std::filesystem::path& path, StabilityReportRow* row) {
@@ -576,7 +613,14 @@ Status read_stability_report_file(const std::filesystem::path& path, StabilityRe
 }
 
 Status write_top_assignments_file(const std::filesystem::path& path, const std::vector<TopAssignmentRow>& rows) {
-    return write_rows_record(path, rows, encode_top_assignments);
+    return write_top_assignments_file_with_info(path, rows, nullptr);
+}
+
+Status write_top_assignments_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<TopAssignmentRow>& rows,
+    WriteArtifactInfo* out_info) {
+    return write_rows_record_with_info(path, rows, encode_top_assignments, out_info);
 }
 
 Status read_top_assignments_file(const std::filesystem::path& path, std::vector<TopAssignmentRow>* rows) {
@@ -584,7 +628,14 @@ Status read_top_assignments_file(const std::filesystem::path& path, std::vector<
 }
 
 Status write_top_centroids_file(const std::filesystem::path& path, const std::vector<TopCentroidRow>& rows) {
-    return write_rows_record(path, rows, encode_top_centroids);
+    return write_top_centroids_file_with_info(path, rows, nullptr);
+}
+
+Status write_top_centroids_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<TopCentroidRow>& rows,
+    WriteArtifactInfo* out_info) {
+    return write_rows_record_with_info(path, rows, encode_top_centroids, out_info);
 }
 
 Status read_top_centroids_file(const std::filesystem::path& path, std::vector<TopCentroidRow>* rows) {
@@ -592,6 +643,13 @@ Status read_top_centroids_file(const std::filesystem::path& path, std::vector<To
 }
 
 Status write_cluster_manifest_file(const std::filesystem::path& path, const std::vector<std::uint8_t>& payload) {
+    return write_cluster_manifest_file_with_info(path, payload, nullptr);
+}
+
+Status write_cluster_manifest_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<std::uint8_t>& payload,
+    WriteArtifactInfo* out_info) {
     CommonHeader header{};
     header.schema_version = 1U;
     header.record_type = 0x0F01U;
@@ -601,7 +659,7 @@ Status write_cluster_manifest_file(const std::filesystem::path& path, const std:
     if (!enc.ok) {
         return enc;
     }
-    return write_atomic_bytes(path, bytes);
+    return write_bytes_with_info(path, bytes, out_info);
 }
 
 Status read_cluster_manifest_file(
@@ -617,7 +675,14 @@ Status read_cluster_manifest_file(
 }
 
 Status write_mid_assignments_file(const std::filesystem::path& path, const std::vector<MidAssignmentRow>& rows) {
-    return write_rows_record(path, rows, encode_mid_assignments);
+    return write_mid_assignments_file_with_info(path, rows, nullptr);
+}
+
+Status write_mid_assignments_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<MidAssignmentRow>& rows,
+    WriteArtifactInfo* out_info) {
+    return write_rows_record_with_info(path, rows, encode_mid_assignments, out_info);
 }
 
 Status read_mid_assignments_file(const std::filesystem::path& path, std::vector<MidAssignmentRow>* rows) {
@@ -625,7 +690,14 @@ Status read_mid_assignments_file(const std::filesystem::path& path, std::vector<
 }
 
 Status write_final_assignments_file(const std::filesystem::path& path, const std::vector<FinalAssignmentRow>& rows) {
-    return write_rows_record(path, rows, encode_final_assignments);
+    return write_final_assignments_file_with_info(path, rows, nullptr);
+}
+
+Status write_final_assignments_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<FinalAssignmentRow>& rows,
+    WriteArtifactInfo* out_info) {
+    return write_rows_record_with_info(path, rows, encode_final_assignments, out_info);
 }
 
 Status read_final_assignments_file(const std::filesystem::path& path, std::vector<FinalAssignmentRow>* rows) {
@@ -635,7 +707,14 @@ Status read_final_assignments_file(const std::filesystem::path& path, std::vecto
 Status write_k_search_bounds_batch_file(
     const std::filesystem::path& path,
     const std::vector<KSearchBoundsBatchRow>& rows) {
-    return write_rows_record(path, rows, encode_k_search_bounds_batch);
+    return write_k_search_bounds_batch_file_with_info(path, rows, nullptr);
+}
+
+Status write_k_search_bounds_batch_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<KSearchBoundsBatchRow>& rows,
+    WriteArtifactInfo* out_info) {
+    return write_rows_record_with_info(path, rows, encode_k_search_bounds_batch, out_info);
 }
 
 Status read_k_search_bounds_batch_file(
@@ -647,7 +726,14 @@ Status read_k_search_bounds_batch_file(
 Status write_post_cluster_membership_file(
     const std::filesystem::path& path,
     const std::vector<PostClusterMembershipRow>& rows) {
-    return write_rows_record(path, rows, encode_post_cluster_membership);
+    return write_post_cluster_membership_file_with_info(path, rows, nullptr);
+}
+
+Status write_post_cluster_membership_file_with_info(
+    const std::filesystem::path& path,
+    const std::vector<PostClusterMembershipRow>& rows,
+    WriteArtifactInfo* out_info) {
+    return write_rows_record_with_info(path, rows, encode_post_cluster_membership, out_info);
 }
 
 Status read_post_cluster_membership_file(
