@@ -17,8 +17,11 @@
 #include "vector_db_v3/vector_store.hpp"
 #include "vector_db_v3/codec/endian.hpp"
 
-#if defined(VECTOR_DB_V3_CUDA_ENABLED) && VECTOR_DB_V3_CUDA_ENABLED
+#if defined(VECTOR_DB_V3_CUDA_ENABLED) && VECTOR_DB_V3_CUDA_ENABLED && defined(__has_include)
+#if __has_include(<cuda_runtime_api.h>)
 #include <cuda_runtime_api.h>
+#define VECTOR_DB_V3_CLI_HAS_CUDA_RUNTIME 1
+#endif
 #endif
 
 namespace {
@@ -385,7 +388,7 @@ public:
 
 private:
     void init_pinned_buffer_if_requested() {
-#if defined(VECTOR_DB_V3_CUDA_ENABLED) && VECTOR_DB_V3_CUDA_ENABLED
+#if defined(VECTOR_DB_V3_CLI_HAS_CUDA_RUNTIME)
         if (!env_truthy(std::getenv("VECTOR_DB_V3_INGEST_PINNED")) || pinned_row_ != nullptr || row_.empty()) {
             return;
         }
@@ -397,7 +400,7 @@ private:
     }
 
     void release_pinned_buffer() {
-#if defined(VECTOR_DB_V3_CUDA_ENABLED) && VECTOR_DB_V3_CUDA_ENABLED
+#if defined(VECTOR_DB_V3_CLI_HAS_CUDA_RUNTIME)
         if (pinned_row_ != nullptr) {
             cudaFreeHost(pinned_row_);
             pinned_row_ = nullptr;

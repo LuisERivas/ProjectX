@@ -288,35 +288,6 @@ Status append_wal_entry(const fs::path& wal_path, const WalEntry& entry) {
     return Status::Ok();
 }
 
-Status append_wal_entries(const fs::path& wal_path, const std::vector<WalEntry>& entries) {
-    if (entries.empty()) {
-        return Status::Ok();
-    }
-    std::ofstream out(wal_path, std::ios::binary | std::ios::app);
-    if (!out) {
-        return Status::Error("append_wal_entries: unable to open wal.log");
-    }
-    std::vector<std::uint8_t> bytes;
-    for (const auto& entry : entries) {
-        const Status enc = encode_wal_entry_bytes(entry, &bytes);
-        if (!enc.ok) {
-            return enc;
-        }
-        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        if (!out) {
-            return Status::Error("append_wal_entries: write failed");
-        }
-    }
-    out.flush();
-    if (!out) {
-        return Status::Error("append_wal_entries: flush failed");
-    }
-    if (!sync_file_descriptor(wal_path)) {
-        return Status::Error("append_wal_entries: fsync/_commit failed");
-    }
-    return Status::Ok();
-}
-
 Status load_checkpoint_snapshot(
     const fs::path& checkpoint_path,
     std::uint64_t* checkpoint_lsn,
