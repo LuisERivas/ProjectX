@@ -580,11 +580,9 @@ Status prepare_stage_embeddings(
     std::vector<std::vector<float>> fp32_vectors;
     collect_fp32_rows(rows, &fp32_ids, &fp32_vectors);
     fs::create_directories(paths::embeddings_dir(data_dir));
-
-    const Status write_fp32 = codec::write_embeddings_fp32_file(paths::embeddings_fp32_bin(data_dir), fp32_ids, fp32_vectors);
-    if (!write_fp32.ok) {
-        return Status::Error("precision shards: failed writing embeddings_fp32.bin: " + write_fp32.message);
-    }
+    const fs::path fp32_path = paths::embeddings_fp32_bin(data_dir);
+    const fs::path fp16_path = paths::embeddings_fp16_bin(data_dir);
+    const fs::path int8_path = paths::embeddings_int8_sym_bin(data_dir);
 
     const InternalShardMode mode = parse_internal_shard_mode();
     const InternalShardRepair repair = parse_internal_shard_repair();
@@ -593,37 +591,62 @@ Status prepare_stage_embeddings(
 
     auto regen_all = [&]() -> Status {
         return codec::regenerate_precision_shards(
-            paths::embeddings_fp32_bin(data_dir),
-            paths::embeddings_fp16_bin(data_dir),
-            paths::embeddings_int8_sym_bin(data_dir),
+            fp32_path,
+            fp16_path,
+            int8_path,
             need_fp16,
             need_int8);
     };
 
+    bool fp32_stale_or_missing = !fs::exists(fp32_path);
+    if (!fp32_stale_or_missing) {
+        std::vector<std::uint64_t> fp32_artifact_ids;
+        const Status st = codec::extract_embedding_ids_from_shard_file(fp32_path, &fp32_artifact_ids);
+        if (!st.ok) {
+            fp32_stale_or_missing = true;
+        } else if (fp32_artifact_ids.size() != fp32_ids.size() ||
+                   !std::equal(fp32_artifact_ids.begin(), fp32_artifact_ids.end(), fp32_ids.begin())) {
+            fp32_stale_or_missing = true;
+        }
+    }
+    if (fp32_stale_or_missing) {
+        const Status write_fp32 = codec::write_embeddings_fp32_file(fp32_path, fp32_ids, fp32_vectors);
+        if (!write_fp32.ok) {
+            return Status::Error("precision shards: failed writing embeddings_fp32.bin: " + write_fp32.message);
+        }
+    }
+
     if (mode != InternalShardMode::Off) {
-        bool missing = false;
-        if (need_fp16 && !fs::exists(paths::embeddings_fp16_bin(data_dir))) {
-            missing = true;
+        bool derived_missing = false;
+        if (need_fp16 && !fs::exists(fp16_path)) {
+            derived_missing = true;
         }
-        if (need_int8 && !fs::exists(paths::embeddings_int8_sym_bin(data_dir))) {
-            missing = true;
+        if (need_int8 && !fs::exists(int8_path)) {
+            derived_missing = true;
         }
-        if (missing || repair == InternalShardRepair::Regenerate) {
-            const Status regen = regen_all();
-            if (!regen.ok && repair == InternalShardRepair::Fail) {
-                return Status::Error("precision shards: regeneration failed: " + regen.message);
-            }
-            if (!regen.ok) {
-                sel.fallback_reason = "shard_regeneration_failed";
+        if (derived_missing) {
+            if (repair == InternalShardRepair::Regenerate) {
+                const Status regen = regen_all();
+                if (!regen.ok) {
+                    if (mode == InternalShardMode::Strict || repair == InternalShardRepair::Fail) {
+                        return Status::Error("precision shards: regeneration failed: " + regen.message);
+                    }
+                    sel.fallback_reason = "shard_regeneration_failed";
+                }
+            } else if (repair == InternalShardRepair::Fail || mode == InternalShardMode::Strict) {
+                return Status::Error("precision shards: required derived shard missing");
+            } else {
+                sel.fallback_reason = "shard_missing";
             }
         }
     }
 
     std::optional<std::vector<std::uint64_t>> fp16_ids;
     std::vector<std::vector<std::uint64_t>> int8_variants;
-    if (fs::exists(paths::embeddings_fp16_bin(data_dir))) {
+    bool extract_issue = false;
+    if (fs::exists(fp16_path)) {
         std::vector<std::uint64_t> ids;
-        const Status st = codec::extract_embedding_ids_from_shard_file(paths::embeddings_fp16_bin(data_dir), &ids);
+        const Status st = codec::extract_embedding_ids_from_shard_file(fp16_path, &ids);
         if (!st.ok) {
             sel.alignment_check_status = "fail";
             sel.alignment_failure_reason = "fp16_extract_failed";
@@ -632,13 +655,14 @@ Status prepare_stage_embeddings(
                 return Status::Error("precision shards: " + st.message);
             }
             sel.fallback_reason = "fp16_extract_failed";
+            extract_issue = true;
         } else {
             fp16_ids = std::move(ids);
         }
     }
-    if (fs::exists(paths::embeddings_int8_sym_bin(data_dir))) {
+    if (fs::exists(int8_path)) {
         std::vector<std::uint64_t> ids;
-        const Status st = codec::extract_embedding_ids_from_shard_file(paths::embeddings_int8_sym_bin(data_dir), &ids);
+        const Status st = codec::extract_embedding_ids_from_shard_file(int8_path, &ids);
         if (!st.ok) {
             sel.alignment_check_status = "fail";
             sel.alignment_failure_reason = "int8_extract_failed";
@@ -647,8 +671,36 @@ Status prepare_stage_embeddings(
                 return Status::Error("precision shards: " + st.message);
             }
             sel.fallback_reason = "int8_extract_failed";
+            extract_issue = true;
         } else {
             int8_variants.push_back(std::move(ids));
+        }
+    }
+
+    if (extract_issue && repair == InternalShardRepair::Regenerate) {
+        const Status regen = regen_all();
+        if (!regen.ok) {
+            if (mode == InternalShardMode::Strict || repair == InternalShardRepair::Fail) {
+                return Status::Error("precision shards: regeneration after extract failure failed: " + regen.message);
+            }
+            sel.fallback_reason = "shard_regeneration_failed";
+        } else {
+            fp16_ids.reset();
+            int8_variants.clear();
+            if (fs::exists(fp16_path)) {
+                std::vector<std::uint64_t> ids;
+                const Status st = codec::extract_embedding_ids_from_shard_file(fp16_path, &ids);
+                if (st.ok) {
+                    fp16_ids = std::move(ids);
+                }
+            }
+            if (fs::exists(int8_path)) {
+                std::vector<std::uint64_t> ids;
+                const Status st = codec::extract_embedding_ids_from_shard_file(int8_path, &ids);
+                if (st.ok) {
+                    int8_variants.push_back(std::move(ids));
+                }
+            }
         }
     }
 
@@ -678,10 +730,10 @@ Status prepare_stage_embeddings(
     }
 
     if (mode == InternalShardMode::FP16 || mode == InternalShardMode::Strict || mode == InternalShardMode::Auto) {
-        if (fs::exists(paths::embeddings_fp16_bin(data_dir))) {
+        if (fs::exists(fp16_path)) {
             std::vector<std::uint64_t> ids;
             std::vector<std::vector<float>> vectors;
-            const Status st = codec::read_embeddings_fp16_file(paths::embeddings_fp16_bin(data_dir), &ids, &vectors);
+            const Status st = codec::read_embeddings_fp16_file(fp16_path, &ids, &vectors);
             if (st.ok) {
                 *ids_out = std::move(ids);
                 *vectors_out = std::move(vectors);
@@ -702,10 +754,10 @@ Status prepare_stage_embeddings(
         }
     }
     if (mode == InternalShardMode::INT8) {
-        if (fs::exists(paths::embeddings_int8_sym_bin(data_dir))) {
+        if (fs::exists(int8_path)) {
             std::vector<std::uint64_t> ids;
             std::vector<std::vector<float>> vectors;
-            const Status st = codec::read_embeddings_int8_sym_file(paths::embeddings_int8_sym_bin(data_dir), &ids, &vectors);
+            const Status st = codec::read_embeddings_int8_sym_file(int8_path, &ids, &vectors);
             if (st.ok) {
                 *ids_out = std::move(ids);
                 *vectors_out = std::move(vectors);
