@@ -439,6 +439,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Choose legacy multi-process or composite single-process execution path.",
     )
     parser.add_argument(
+        "--post-ingest-checkpoint",
+        action="store_true",
+        help="In legacy orchestration mode, run checkpoint immediately after ingest.",
+    )
+    parser.add_argument(
         "--with-search-sanity",
         action="store_true",
         help="Append optional search sanity stage when --run-full-pipeline is enabled.",
@@ -586,6 +591,7 @@ def build_pipeline_stages(
     batch_size: int,
     seed: int | None,
     orchestration_mode: str,
+    post_ingest_checkpoint: bool,
     with_search_sanity: bool,
     with_cluster_stats: bool,
     query_vec_path: Path | None,
@@ -641,11 +647,17 @@ def build_pipeline_stages(
     stages: list[tuple[str, list[str]]] = [
         ("init", [str(cli_binary), "init", "--path", str(data_dir)]),
         ("ingest", ingest_cmd),
-        ("build-top-clusters", [str(cli_binary), "build-top-clusters", "--path", str(data_dir)]),
-        ("build-mid-layer-clusters", [str(cli_binary), "build-mid-layer-clusters", "--path", str(data_dir)]),
-        ("build-lower-layer-clusters", [str(cli_binary), "build-lower-layer-clusters", "--path", str(data_dir)]),
-        ("build-final-layer-clusters", [str(cli_binary), "build-final-layer-clusters", "--path", str(data_dir)]),
     ]
+    if post_ingest_checkpoint:
+        stages.append(("checkpoint", [str(cli_binary), "checkpoint", "--path", str(data_dir)]))
+    stages.extend(
+        [
+            ("build-top-clusters", [str(cli_binary), "build-top-clusters", "--path", str(data_dir)]),
+            ("build-mid-layer-clusters", [str(cli_binary), "build-mid-layer-clusters", "--path", str(data_dir)]),
+            ("build-lower-layer-clusters", [str(cli_binary), "build-lower-layer-clusters", "--path", str(data_dir)]),
+            ("build-final-layer-clusters", [str(cli_binary), "build-final-layer-clusters", "--path", str(data_dir)]),
+        ]
+    )
 
     if with_search_sanity:
         if query_vec_path is None:
@@ -829,6 +841,7 @@ def main() -> int:
                     batch_size=int(args.batch_size),
                     seed=args.seed,
                     orchestration_mode=args.orchestration_mode,
+                    post_ingest_checkpoint=bool(args.post_ingest_checkpoint),
                     with_search_sanity=bool(args.with_search_sanity),
                     with_cluster_stats=bool(args.with_cluster_stats),
                     query_vec_path=query_vec_path,
@@ -889,6 +902,7 @@ def main() -> int:
         "input_format": args.input_format,
         "run_full_pipeline": bool(args.run_full_pipeline),
         "orchestration_mode": args.orchestration_mode,
+        "post_ingest_checkpoint": bool(args.post_ingest_checkpoint),
         "runner_smoke": bool(args.runner_smoke),
         "with_search_sanity": bool(args.with_search_sanity),
         "with_cluster_stats": bool(args.with_cluster_stats),

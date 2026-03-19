@@ -86,3 +86,12 @@ Define stable CLI commands, output behavior, and failure semantics for M1.
   - batch ingest operations use grouped commit boundaries.
 - Existing command output schemas, exit codes, and stderr formatting remain unchanged.
 
+## Post-Ingest Checkpoint Shortcut (Card 8 additive)
+
+- `run-full-pipeline` supports an additive post-ingest checkpoint shortcut policy via `VECTOR_DB_V3_POST_INGEST_CHECKPOINT`.
+- Supported truthy values: `1`, `true`, `yes`, `on`.
+- Supported falsy values: `0`, `false`, `no`, `off`.
+- Default behavior when unset is enabled for `run-full-pipeline`.
+- On checkpoint failure in this path, command must fail fast with runtime error exit semantics.
+- Existing required output keys and command semantics remain stable; additive field `post_ingest_checkpoint` may report `applied` or `skipped`.
+

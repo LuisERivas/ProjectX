@@ -103,6 +103,31 @@ bool env_truthy(const char* value) {
     return s == "1" || s == "true" || s == "yes" || s == "on";
 }
 
+bool env_falsy(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s == "0" || s == "false" || s == "no" || s == "off";
+}
+
+bool env_bool_with_default(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+        return default_value;
+    }
+    if (env_truthy(raw)) {
+        return true;
+    }
+    if (env_falsy(raw)) {
+        return false;
+    }
+    return default_value;
+}
+
 std::string trim(const std::string& s) {
     const auto left = s.find_first_not_of(" \t\r\n");
     if (left == std::string::npos) {
@@ -678,6 +703,16 @@ int main(int argc, char** argv) {
             return ingest_status.code == 2 ? emit_usage_error(ingest_status.message) : emit_runtime_error(ingest_status.message);
         }
 
+        const bool post_ingest_checkpoint = env_bool_with_default("VECTOR_DB_V3_POST_INGEST_CHECKPOINT", true);
+        std::string post_ingest_checkpoint_status = "skipped";
+        if (post_ingest_checkpoint) {
+            const auto checkpoint_status = store.checkpoint();
+            if (!checkpoint_status.ok) {
+                return emit_runtime_error("post-ingest checkpoint failed: " + checkpoint_status.message);
+            }
+            post_ingest_checkpoint_status = "applied";
+        }
+
         vector_db_v3::FullPipelineRunStats pipeline_stats{};
         const auto pipeline_status = store.run_full_pipeline_clustering(seed, &pipeline_stats);
         if (!pipeline_status.ok) {
@@ -705,6 +740,7 @@ int main(int argc, char** argv) {
                   << ",\"stages_executed\":" << pipeline_stats.stages_executed
                   << ",\"stages_completed\":" << pipeline_stats.stages_completed
                   << ",\"failed_stage\":" << (pipeline_stats.failed_stage.empty() ? "null" : ("\"" + json_escape(pipeline_stats.failed_stage) + "\""))
+                  << ",\"post_ingest_checkpoint\":\"" << post_ingest_checkpoint_status << "\""
                   << ",\"elapsed_ms_total\":" << std::fixed << std::setprecision(3) << elapsed_ms;
         if (with_search_sanity) {
             std::cout << ",\"search_sanity\":\"ok\"";
