@@ -3143,6 +3143,8 @@ Status run_stages_with_telemetry(
         }
     }
 
+    const std::string final_output_status =
+        stages_failed > 0U ? "failed" : ((stages_completed == 0U && stages_skipped > 0U) ? "skipped" : "success");
     std::vector<std::pair<std::string, std::string>> summary_extra = {
         {"pipeline_mode", "single_process_composite"},
         {"stages_planned", std::to_string(stage_specs.size())},
@@ -3151,7 +3153,7 @@ Status run_stages_with_telemetry(
         {"stages_skipped", std::to_string(stages_skipped)},
         {"records_processed_total", std::to_string(records_processed_total)},
         {"failed_stage", failed_stage.empty() ? "none" : failed_stage},
-        {"final_output_status", pipeline_status.ok ? "success" : "failed"},
+        {"final_output_status", final_output_status},
         {"summary_version", "1"},
     };
     if (!previous_run_available) {
