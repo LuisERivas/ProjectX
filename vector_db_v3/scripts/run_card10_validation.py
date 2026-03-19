@@ -76,7 +76,10 @@ def parse_final_command_json(stdout: str) -> dict:
         text = line.strip()
         if not text:
             continue
-        obj = json.loads(text)
+        try:
+            obj = json.loads(text)
+        except Exception:
+            continue
         if isinstance(obj, dict) and "event_type" not in obj:
             payload = obj
     if payload is None:
