@@ -75,6 +75,28 @@ def write_bulk_bin(path: Path, rows: list[tuple[int, float]]) -> None:
             f.write(row)
 
 
+def mutate_header_record_count(path: Path, record_count: int) -> None:
+    raw = bytearray(path.read_bytes())
+    if len(raw) < 18:
+        raise ValueError("binary file too short for header mutation")
+    raw[10:18] = int(record_count).to_bytes(8, "little", signed=False)
+    path.write_bytes(raw)
+
+
+def truncate_bytes(path: Path, count: int) -> None:
+    if count <= 0:
+        return
+    raw = path.read_bytes()
+    if len(raw) <= count:
+        raise ValueError("cannot truncate entire file")
+    path.write_bytes(raw[:-count])
+
+
+def append_trailing_bytes(path: Path, payload: bytes) -> None:
+    with path.open("ab") as f:
+        f.write(payload)
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     build_dir = root / "build"
@@ -196,6 +218,55 @@ def main() -> int:
         return fail("bulk-insert-bin malformed header should be usage error (2)", out, err)
     if not err.startswith("error: "):
         return fail("bulk-insert-bin malformed header stderr format", out, err)
+
+    bad_payload_bin = data_dir / "bulk_bad_payload.bin"
+    write_bulk_bin(bad_payload_bin, [(30, 0.2), (31, 0.3)])
+    mutate_header_record_count(bad_payload_bin, 99)
+    code, out, err = run(
+        [str(cli), "bulk-insert-bin", "--path", str(data_dir), "--input", str(bad_payload_bin), "--batch-size", "1"],
+        root,
+        env=env_pass,
+    )
+    if code != 2:
+        return fail("bulk-insert-bin payload mismatch should be usage error (2)", out, err)
+    if not err.startswith("error: "):
+        return fail("bulk-insert-bin payload mismatch stderr format", out, err)
+
+    bad_truncated_bin = data_dir / "bulk_bad_truncated.bin"
+    write_bulk_bin(bad_truncated_bin, [(40, 0.2), (41, 0.3)])
+    truncate_bytes(bad_truncated_bin, 7)
+    code, out, err = run(
+        [str(cli), "bulk-insert-bin", "--path", str(data_dir), "--input", str(bad_truncated_bin), "--batch-size", "2"],
+        root,
+        env=env_pass,
+    )
+    if code != 2:
+        return fail("bulk-insert-bin truncated record should be usage error (2)", out, err)
+    if not err.startswith("error: "):
+        return fail("bulk-insert-bin truncated record stderr format", out, err)
+
+    bad_trailing_bin = data_dir / "bulk_bad_trailing.bin"
+    write_bulk_bin(bad_trailing_bin, [(50, 0.2), (51, 0.3)])
+    append_trailing_bytes(bad_trailing_bin, b"\xFF")
+    code, out, err = run(
+        [str(cli), "bulk-insert-bin", "--path", str(data_dir), "--input", str(bad_trailing_bin), "--batch-size", "2"],
+        root,
+        env=env_pass,
+    )
+    if code != 2:
+        return fail("bulk-insert-bin trailing-bytes should be usage error (2)", out, err)
+    if not err.startswith("error: "):
+        return fail("bulk-insert-bin trailing-bytes stderr format", out, err)
+
+    code, out, err = run(
+        [str(cli), "bulk-insert-bin", "--path", str(data_dir), "--input", str(bulk_bin), "--batch-size", "0"],
+        root,
+        env=env_pass,
+    )
+    if code != 2:
+        return fail("bulk-insert-bin batch-size 0 should be usage error (2)", out, err)
+    if not err.startswith("error: "):
+        return fail("bulk-insert-bin batch-size 0 stderr format", out, err)
 
     code, out, err = run([str(cli), "search", "--path", str(data_dir), "--vec", vec_csv(1.0), "--topk", "2"], root, env=env_pass)
     if code != 0:

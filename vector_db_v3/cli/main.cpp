@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -347,7 +348,14 @@ public:
             return false;
         }
         const std::uint64_t payload_bytes = static_cast<std::uint64_t>(file_size - kBulkInsertBinHeaderBytes);
-        const std::uint64_t expected_bytes = remaining_ * static_cast<std::uint64_t>(kBulkInsertBinRecordBytes);
+        const std::uint64_t record_bytes = static_cast<std::uint64_t>(kBulkInsertBinRecordBytes);
+        if (record_bytes != 0U && remaining_ > (std::numeric_limits<std::uint64_t>::max() / record_bytes)) {
+            if (error != nullptr) {
+                *error = "binary record_count overflow";
+            }
+            return false;
+        }
+        const std::uint64_t expected_bytes = remaining_ * record_bytes;
         if (payload_bytes != expected_bytes) {
             if (error != nullptr) {
                 *error = "binary payload size does not match record_count";

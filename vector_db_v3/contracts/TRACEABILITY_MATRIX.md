@@ -30,6 +30,8 @@ Provide requirement-to-contract-to-test mapping for M1 implementation governance
 | Card 7 validation runner evidence (`run_card7_validation.py`) for durability matrix and perf comparison | `TEST_GATE_CONTRACT.md`, `TRACEABILITY_MATRIX.md` | G1, G2, G3, G4, G5, G6, G7 |
 | Post-ingest checkpoint shortcut policy for pipeline workflows (`VECTOR_DB_V3_POST_INGEST_CHECKPOINT`) | `CLI_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G1, G2, G3, G6 |
 | Card 8 validation runner evidence (`run_card8_validation.py`) for durability matrix and checkpoint A/B performance comparison | `TEST_GATE_CONTRACT.md`, `TRACEABILITY_MATRIX.md` | G1, G2, G3, G4, G5, G6, G7 |
+| Streamed binary ingest path for `bulk-insert-bin` (no full materialization) with malformed-input deterministic handling | `CLI_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G1, G3, G4 |
+| Card 9 validation runner evidence (`run_card9_validation.py`) for streaming functional/negative/perf matrix | `TEST_GATE_CONTRACT.md`, `TRACEABILITY_MATRIX.md` | G1, G3, G4, G7 |
 | Terminal JSONL lifecycle events | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | Active pipeline terminal reporting and previous-run timing baseline | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | CUDA/Tensor/Ampere compliance | `COMPLIANCE_CONTRACT.md` | G5, G6 |

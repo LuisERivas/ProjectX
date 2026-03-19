@@ -95,3 +95,14 @@ Define stable CLI commands, output behavior, and failure semantics for M1.
 - On checkpoint failure in this path, command must fail fast with runtime error exit semantics.
 - Existing required output keys and command semantics remain stable; additive field `post_ingest_checkpoint` may report `applied` or `skipped`.
 
+## Streamed Binary Ingest (Card 9 hardening additive)
+
+- `bulk-insert-bin` processes records in streaming batches through ingest pipeline boundaries and does not require full-file `Record` materialization.
+- Malformed binary input remains usage-class failure (`exit=2`) with stderr in `error: <message>` form, including:
+  - header mismatch/short header,
+  - payload-size mismatch,
+  - truncated record,
+  - trailing bytes after last record,
+  - invalid `--batch-size`.
+- Success payload schema for `bulk-insert-bin` remains unchanged (`status`, `command`, `inserted`, `batches`).
+
