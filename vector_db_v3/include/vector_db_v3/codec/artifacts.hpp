@@ -105,4 +105,42 @@ Status validate_precision_id_alignment(
     const std::optional<std::vector<std::uint64_t>>& fp16_ids,
     const std::vector<std::vector<std::uint64_t>>& int8_variants);
 
+Status write_embeddings_fp32_file(
+    const std::filesystem::path& path,
+    const std::vector<std::uint64_t>& ids,
+    const std::vector<std::vector<float>>& vectors);
+Status read_embeddings_fp32_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint64_t>* ids,
+    std::vector<std::vector<float>>* vectors);
+
+Status write_embeddings_fp16_file(
+    const std::filesystem::path& path,
+    const std::vector<std::uint64_t>& ids,
+    const std::vector<std::vector<float>>& vectors);
+Status read_embeddings_fp16_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint64_t>* ids,
+    std::vector<std::vector<float>>* vectors);
+
+Status write_embeddings_int8_sym_file(
+    const std::filesystem::path& path,
+    const std::vector<std::uint64_t>& ids,
+    const std::vector<std::vector<float>>& vectors);
+Status read_embeddings_int8_sym_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint64_t>* ids,
+    std::vector<std::vector<float>>* vectors);
+
+Status extract_embedding_ids_from_shard_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint64_t>* ids);
+
+Status regenerate_precision_shards(
+    const std::filesystem::path& fp32_path,
+    const std::filesystem::path& fp16_path,
+    const std::filesystem::path& int8_sym_path,
+    bool regenerate_fp16,
+    bool regenerate_int8_sym);
+
 }  // namespace vector_db_v3::codec

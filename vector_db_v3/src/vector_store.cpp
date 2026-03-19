@@ -451,6 +451,288 @@ bool tensor_policy_required() {
     return policy == "required";
 }
 
+enum class InternalShardMode {
+    Off = 0,
+    Auto = 1,
+    FP16 = 2,
+    INT8 = 3,
+    Strict = 4,
+};
+
+enum class InternalShardRepair {
+    Regenerate = 0,
+    Fallback = 1,
+    Fail = 2,
+};
+
+codec::PrecisionShardSelectionInfo g_last_precision_selection{};
+
+InternalShardMode parse_internal_shard_mode() {
+    const char* value = std::getenv("VECTOR_DB_V3_INTERNAL_SHARD_MODE");
+    if (value == nullptr || *value == '\0') {
+        return InternalShardMode::Off;
+    }
+    std::string mode(value);
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mode == "auto") {
+        return InternalShardMode::Auto;
+    }
+    if (mode == "fp16") {
+        return InternalShardMode::FP16;
+    }
+    if (mode == "int8") {
+        return InternalShardMode::INT8;
+    }
+    if (mode == "strict") {
+        return InternalShardMode::Strict;
+    }
+    return InternalShardMode::Off;
+}
+
+InternalShardRepair parse_internal_shard_repair() {
+    const char* value = std::getenv("VECTOR_DB_V3_INTERNAL_SHARD_REPAIR");
+    if (value == nullptr || *value == '\0') {
+        return InternalShardRepair::Regenerate;
+    }
+    std::string mode(value);
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mode == "fallback") {
+        return InternalShardRepair::Fallback;
+    }
+    if (mode == "fail") {
+        return InternalShardRepair::Fail;
+    }
+    return InternalShardRepair::Regenerate;
+}
+
+void set_last_precision_selection(const codec::PrecisionShardSelectionInfo& info) {
+    g_last_precision_selection = info;
+}
+
+codec::PrecisionShardSelectionInfo last_precision_selection() {
+    return g_last_precision_selection;
+}
+
+void collect_fp32_rows(
+    const std::map<std::uint64_t, Record>& rows,
+    std::vector<std::uint64_t>* ids_out,
+    std::vector<std::vector<float>>* vectors_out) {
+    ids_out->clear();
+    vectors_out->clear();
+    ids_out->reserve(rows.size());
+    vectors_out->reserve(rows.size());
+    for (const auto& kv : rows) {
+        ids_out->push_back(kv.first);
+        vectors_out->push_back(kv.second.vector);
+    }
+}
+
+Status refresh_precision_shards_from_rows(
+    const fs::path& data_dir,
+    const std::map<std::uint64_t, Record>& rows,
+    bool regenerate_derived) {
+    std::vector<std::uint64_t> ids;
+    std::vector<std::vector<float>> vectors;
+    collect_fp32_rows(rows, &ids, &vectors);
+    fs::create_directories(paths::embeddings_dir(data_dir));
+    const Status write_fp32 = codec::write_embeddings_fp32_file(paths::embeddings_fp32_bin(data_dir), ids, vectors);
+    if (!write_fp32.ok) {
+        return write_fp32;
+    }
+    if (!regenerate_derived) {
+        return Status::Ok();
+    }
+    const InternalShardMode mode = parse_internal_shard_mode();
+    const bool need_fp16 = mode == InternalShardMode::Auto || mode == InternalShardMode::FP16 || mode == InternalShardMode::Strict;
+    const bool need_int8 = mode == InternalShardMode::INT8;
+    return codec::regenerate_precision_shards(
+        paths::embeddings_fp32_bin(data_dir),
+        paths::embeddings_fp16_bin(data_dir),
+        paths::embeddings_int8_sym_bin(data_dir),
+        need_fp16,
+        need_int8);
+}
+
+Status prepare_stage_embeddings(
+    const fs::path& data_dir,
+    const std::map<std::uint64_t, Record>& rows,
+    std::vector<std::uint64_t>* ids_out,
+    std::vector<std::vector<float>>* vectors_out,
+    codec::PrecisionShardSelectionInfo* selection_out) {
+    if (ids_out == nullptr || vectors_out == nullptr || selection_out == nullptr) {
+        return Status::Error("prepare_stage_embeddings: invalid output pointer");
+    }
+
+    codec::PrecisionShardSelectionInfo sel{};
+    sel.observed = true;
+    sel.source_embedding_artifact = "embeddings_fp32.bin";
+    sel.compute_precision = "fp32";
+    sel.alignment_check_status = "pass";
+    sel.alignment_mismatch_count = 0;
+    sel.alignment_failure_reason = "none";
+    sel.fallback_reason = "none";
+
+    std::vector<std::uint64_t> fp32_ids;
+    std::vector<std::vector<float>> fp32_vectors;
+    collect_fp32_rows(rows, &fp32_ids, &fp32_vectors);
+    fs::create_directories(paths::embeddings_dir(data_dir));
+
+    const Status write_fp32 = codec::write_embeddings_fp32_file(paths::embeddings_fp32_bin(data_dir), fp32_ids, fp32_vectors);
+    if (!write_fp32.ok) {
+        return Status::Error("precision shards: failed writing embeddings_fp32.bin: " + write_fp32.message);
+    }
+
+    const InternalShardMode mode = parse_internal_shard_mode();
+    const InternalShardRepair repair = parse_internal_shard_repair();
+    const bool need_fp16 = mode == InternalShardMode::Auto || mode == InternalShardMode::FP16 || mode == InternalShardMode::Strict;
+    const bool need_int8 = mode == InternalShardMode::INT8;
+
+    auto regen_all = [&]() -> Status {
+        return codec::regenerate_precision_shards(
+            paths::embeddings_fp32_bin(data_dir),
+            paths::embeddings_fp16_bin(data_dir),
+            paths::embeddings_int8_sym_bin(data_dir),
+            need_fp16,
+            need_int8);
+    };
+
+    if (mode != InternalShardMode::Off) {
+        bool missing = false;
+        if (need_fp16 && !fs::exists(paths::embeddings_fp16_bin(data_dir))) {
+            missing = true;
+        }
+        if (need_int8 && !fs::exists(paths::embeddings_int8_sym_bin(data_dir))) {
+            missing = true;
+        }
+        if (missing || repair == InternalShardRepair::Regenerate) {
+            const Status regen = regen_all();
+            if (!regen.ok && repair == InternalShardRepair::Fail) {
+                return Status::Error("precision shards: regeneration failed: " + regen.message);
+            }
+            if (!regen.ok) {
+                sel.fallback_reason = "shard_regeneration_failed";
+            }
+        }
+    }
+
+    std::optional<std::vector<std::uint64_t>> fp16_ids;
+    std::vector<std::vector<std::uint64_t>> int8_variants;
+    if (fs::exists(paths::embeddings_fp16_bin(data_dir))) {
+        std::vector<std::uint64_t> ids;
+        const Status st = codec::extract_embedding_ids_from_shard_file(paths::embeddings_fp16_bin(data_dir), &ids);
+        if (!st.ok) {
+            sel.alignment_check_status = "fail";
+            sel.alignment_failure_reason = "fp16_extract_failed";
+            sel.alignment_mismatch_count = 1;
+            if (repair == InternalShardRepair::Fail || mode == InternalShardMode::Strict) {
+                return Status::Error("precision shards: " + st.message);
+            }
+            sel.fallback_reason = "fp16_extract_failed";
+        } else {
+            fp16_ids = std::move(ids);
+        }
+    }
+    if (fs::exists(paths::embeddings_int8_sym_bin(data_dir))) {
+        std::vector<std::uint64_t> ids;
+        const Status st = codec::extract_embedding_ids_from_shard_file(paths::embeddings_int8_sym_bin(data_dir), &ids);
+        if (!st.ok) {
+            sel.alignment_check_status = "fail";
+            sel.alignment_failure_reason = "int8_extract_failed";
+            sel.alignment_mismatch_count = 1;
+            if (repair == InternalShardRepair::Fail || mode == InternalShardMode::Strict) {
+                return Status::Error("precision shards: " + st.message);
+            }
+            sel.fallback_reason = "int8_extract_failed";
+        } else {
+            int8_variants.push_back(std::move(ids));
+        }
+    }
+
+    const codec::PrecisionAlignmentResult alignment =
+        codec::evaluate_precision_id_alignment(fp32_ids, fp16_ids, int8_variants);
+    if (!alignment.pass) {
+        sel.alignment_check_status = "fail";
+        sel.alignment_mismatch_count = alignment.mismatch_count;
+        sel.alignment_failure_reason = alignment.reason;
+        if (repair == InternalShardRepair::Regenerate) {
+            const Status regen = regen_all();
+            if (!regen.ok) {
+                if (mode == InternalShardMode::Strict || repair == InternalShardRepair::Fail) {
+                    return Status::Error("precision shards: failed regeneration after alignment mismatch: " + regen.message);
+                }
+                sel.fallback_reason = "alignment_regeneration_failed";
+            } else {
+                sel.alignment_check_status = "pass";
+                sel.alignment_mismatch_count = 0;
+                sel.alignment_failure_reason = "none";
+            }
+        } else if (repair == InternalShardRepair::Fail || mode == InternalShardMode::Strict) {
+            return Status::Error("precision alignment failed: " + alignment.reason);
+        } else {
+            sel.fallback_reason = "alignment_failed";
+        }
+    }
+
+    if (mode == InternalShardMode::FP16 || mode == InternalShardMode::Strict || mode == InternalShardMode::Auto) {
+        if (fs::exists(paths::embeddings_fp16_bin(data_dir))) {
+            std::vector<std::uint64_t> ids;
+            std::vector<std::vector<float>> vectors;
+            const Status st = codec::read_embeddings_fp16_file(paths::embeddings_fp16_bin(data_dir), &ids, &vectors);
+            if (st.ok) {
+                *ids_out = std::move(ids);
+                *vectors_out = std::move(vectors);
+                sel.source_embedding_artifact = "embeddings_fp16.bin";
+                sel.compute_precision = "fp16";
+                *selection_out = sel;
+                return Status::Ok();
+            }
+            if (mode == InternalShardMode::Strict || repair == InternalShardRepair::Fail) {
+                return Status::Error("precision shards: fp16 read failed: " + st.message);
+            }
+            sel.fallback_reason = "fp16_read_failed";
+        } else if (mode == InternalShardMode::Strict || mode == InternalShardMode::FP16) {
+            if (repair == InternalShardRepair::Fail || mode == InternalShardMode::Strict) {
+                return Status::Error("precision shards: fp16 shard missing");
+            }
+            sel.fallback_reason = "fp16_missing";
+        }
+    }
+    if (mode == InternalShardMode::INT8) {
+        if (fs::exists(paths::embeddings_int8_sym_bin(data_dir))) {
+            std::vector<std::uint64_t> ids;
+            std::vector<std::vector<float>> vectors;
+            const Status st = codec::read_embeddings_int8_sym_file(paths::embeddings_int8_sym_bin(data_dir), &ids, &vectors);
+            if (st.ok) {
+                *ids_out = std::move(ids);
+                *vectors_out = std::move(vectors);
+                sel.source_embedding_artifact = "embeddings_int8_sym.bin";
+                sel.compute_precision = "int8_sym";
+                *selection_out = sel;
+                return Status::Ok();
+            }
+            if (repair == InternalShardRepair::Fail) {
+                return Status::Error("precision shards: int8 shard read failed: " + st.message);
+            }
+            sel.fallback_reason = "int8_read_failed";
+        } else if (repair == InternalShardRepair::Fail) {
+            return Status::Error("precision shards: int8 shard missing");
+        } else {
+            sel.fallback_reason = "int8_missing";
+        }
+    }
+
+    *ids_out = std::move(fp32_ids);
+    *vectors_out = std::move(fp32_vectors);
+    sel.source_embedding_artifact = "embeddings_fp32.bin";
+    sel.compute_precision = "fp32";
+    *selection_out = sel;
+    return Status::Ok();
+}
+
 KMeansResult run_deterministic_kmeans(
     const std::vector<std::vector<float>>& vectors,
     std::uint32_t k,
@@ -688,14 +970,21 @@ Status emit_top_layer_artifacts(
 
     std::vector<std::uint64_t> ids;
     std::vector<std::vector<float>> kmeans_vectors;
-    ids.reserve(rows.size());
-    kmeans_vectors.reserve(rows.size());
-    for (const auto& kv : rows) {
-        if (kv.second.vector.size() != kVectorDim) {
+    codec::PrecisionShardSelectionInfo selection{};
+    const Status prep = prepare_stage_embeddings(
+        data_dir,
+        rows,
+        &ids,
+        &kmeans_vectors,
+        &selection);
+    if (!prep.ok) {
+        return prep;
+    }
+    set_last_precision_selection(selection);
+    for (const auto& vec : kmeans_vectors) {
+        if (vec.size() != kVectorDim) {
             return Status::Error("top clustering: encountered non-1024D vector");
         }
-        ids.push_back(kv.first);
-        kmeans_vectors.push_back(kv.second.vector);
     }
     if (kmeans_vectors.empty()) {
         kmeans_vectors.push_back(std::vector<float>(kVectorDim, 0.0f));
@@ -944,6 +1233,27 @@ Status emit_mid_layer_artifacts(
         return Status::Error("mid clustering: invalid top assignments input: " + top_assignments_valid.message);
     }
 
+    std::vector<std::uint64_t> source_ids;
+    std::vector<std::vector<float>> source_vectors;
+    codec::PrecisionShardSelectionInfo selection{};
+    const Status prep = prepare_stage_embeddings(
+        data_dir,
+        rows,
+        &source_ids,
+        &source_vectors,
+        &selection);
+    if (!prep.ok) {
+        return prep;
+    }
+    set_last_precision_selection(selection);
+    std::map<std::uint64_t, std::size_t> source_index;
+    for (std::size_t i = 0; i < source_ids.size(); ++i) {
+        if (source_vectors[i].size() != kVectorDim) {
+            return Status::Error("mid clustering: encountered non-1024D vector");
+        }
+        source_index[source_ids[i]] = i;
+    }
+
     struct ParentItem {
         std::uint64_t embedding_id = 0;
         const std::vector<float>* vector = nullptr;
@@ -951,14 +1261,11 @@ Status emit_mid_layer_artifacts(
     std::map<std::uint32_t, std::vector<ParentItem>> parent_groups;
     parent_groups.clear();
     for (const auto& row : top_assignments) {
-        const auto it = rows.find(row.embedding_id);
-        if (it == rows.end()) {
+        const auto it = source_index.find(row.embedding_id);
+        if (it == source_index.end()) {
             return Status::Error("mid clustering: top assignment references missing live embedding_id");
         }
-        if (it->second.vector.size() != kVectorDim) {
-            return Status::Error("mid clustering: encountered non-1024D vector");
-        }
-        parent_groups[row.top_centroid_numeric_id].push_back(ParentItem{row.embedding_id, &it->second.vector});
+        parent_groups[row.top_centroid_numeric_id].push_back(ParentItem{row.embedding_id, &source_vectors[it->second]});
     }
 
     std::vector<codec::MidAssignmentRow> mid_rows;
@@ -1824,6 +2131,7 @@ struct VectorStore::Impl {
     std::size_t wal_entries = 0;
     std::size_t tombstone_rows = 0;
     std::string checkpoint_file;
+    bool precision_shards_dirty = true;
 };
 
 VectorStore::VectorStore(std::string data_dir) : impl_(new Impl(std::move(data_dir))) {}
@@ -1834,6 +2142,7 @@ Status VectorStore::init() {
         fs::create_directories(impl_->data_dir);
         fs::create_directories(paths::segments_dir(impl_->data_dir));
         fs::create_directories(paths::clusters_current_dir(impl_->data_dir));
+        fs::create_directories(paths::embeddings_dir(impl_->data_dir));
         if (!fs::exists(paths::manifest(impl_->data_dir))) {
             ManifestMeta meta{};
             const Status write = write_manifest_json_atomic(paths::manifest(impl_->data_dir), meta);
@@ -1904,6 +2213,11 @@ Status VectorStore::open() {
     if (!replay.ok) {
         return replay;
     }
+    const Status shard_refresh = refresh_precision_shards_from_rows(impl_->data_dir, impl_->rows, true);
+    if (!shard_refresh.ok) {
+        return Status::Error("open: failed refreshing precision shards: " + shard_refresh.message);
+    }
+    impl_->precision_shards_dirty = false;
     impl_->opened = true;
     return Status::Ok();
 }
@@ -1941,6 +2255,11 @@ Status VectorStore::checkpoint() {
     impl_->wal_entries = 0;
     impl_->checkpoint_file = meta.checkpoint_file;
     impl_->tombstone_rows = 0;
+    const Status shard_refresh = refresh_precision_shards_from_rows(impl_->data_dir, impl_->rows, true);
+    if (!shard_refresh.ok) {
+        return Status::Error("checkpoint: failed refreshing precision shards: " + shard_refresh.message);
+    }
+    impl_->precision_shards_dirty = false;
     return Status::Ok();
 }
 
@@ -1963,6 +2282,12 @@ Status VectorStore::insert(std::uint64_t embedding_id, const std::vector<float>&
     impl_->rows[embedding_id] = Record{embedding_id, vector_fp32_1024};
     impl_->last_lsn = entry.lsn;
     impl_->wal_entries += 1U;
+    impl_->precision_shards_dirty = true;
+    const Status shard_refresh = refresh_precision_shards_from_rows(impl_->data_dir, impl_->rows, true);
+    if (!shard_refresh.ok) {
+        return Status::Error("insert: failed refreshing precision shards: " + shard_refresh.message);
+    }
+    impl_->precision_shards_dirty = false;
     return Status::Ok();
 }
 
@@ -1971,10 +2296,29 @@ Status VectorStore::insert_batch(const std::vector<Record>& records) {
         return Status::Error("store not open");
     }
     for (const auto& rec : records) {
-        const Status s = insert(rec.embedding_id, rec.vector);
-        if (!s.ok) {
-            return s;
+        if (rec.vector.size() != kVectorDim) {
+            return Status::Error("insert_batch: vector dimension mismatch");
         }
+        WalEntry entry{};
+        entry.lsn = impl_->last_lsn + 1U;
+        entry.op = kWalOpInsert;
+        entry.embedding_id = rec.embedding_id;
+        entry.vector = rec.vector;
+        const Status wal = append_wal_entry(paths::wal(impl_->data_dir), entry);
+        if (!wal.ok) {
+            return wal;
+        }
+        impl_->rows[rec.embedding_id] = Record{rec.embedding_id, rec.vector};
+        impl_->last_lsn = entry.lsn;
+        impl_->wal_entries += 1U;
+        impl_->precision_shards_dirty = true;
+    }
+    if (impl_->precision_shards_dirty) {
+        const Status shard_refresh = refresh_precision_shards_from_rows(impl_->data_dir, impl_->rows, true);
+        if (!shard_refresh.ok) {
+            return Status::Error("insert_batch: failed refreshing precision shards: " + shard_refresh.message);
+        }
+        impl_->precision_shards_dirty = false;
     }
     return Status::Ok();
 }
@@ -1999,6 +2343,12 @@ Status VectorStore::remove(std::uint64_t embedding_id) {
     impl_->last_lsn = entry.lsn;
     impl_->wal_entries += 1U;
     impl_->tombstone_rows += 1U;
+    impl_->precision_shards_dirty = true;
+    const Status shard_refresh = refresh_precision_shards_from_rows(impl_->data_dir, impl_->rows, true);
+    if (!shard_refresh.ok) {
+        return Status::Error("delete: failed refreshing precision shards: " + shard_refresh.message);
+    }
+    impl_->precision_shards_dirty = false;
     return Status::Ok();
 }
 
@@ -2237,6 +2587,22 @@ void append_residency_fields(
     extra->push_back({"gpu_residency_alloc_calls", std::to_string(info.residency.alloc_calls)});
 }
 
+void append_precision_fields(
+    std::vector<std::pair<std::string, std::string>>* extra,
+    const codec::PrecisionShardSelectionInfo& info) {
+    if (extra == nullptr) {
+        return;
+    }
+    extra->push_back({"source_embedding_artifact", info.source_embedding_artifact});
+    extra->push_back({"compute_precision", info.compute_precision});
+    extra->push_back({"alignment_check_status", info.alignment_check_status});
+    extra->push_back({"alignment_mismatch_count", std::to_string(info.alignment_mismatch_count)});
+    extra->push_back({"precision_fallback_reason", info.fallback_reason.empty() ? "none" : info.fallback_reason});
+    if (info.alignment_check_status == "fail") {
+        extra->push_back({"alignment_failure_reason", info.alignment_failure_reason.empty() ? "unknown" : info.alignment_failure_reason});
+    }
+}
+
 ClusterStats VectorStore::cluster_stats() const {
     ClusterStats out{};
     out.available = false;
@@ -2364,6 +2730,15 @@ Status run_stage_with_telemetry(
     const bool force_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_FAIL"));
     const bool force_compliance_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_COMPLIANCE_FAIL"));
     StageCompliance compliance = evaluate_stage_compliance(stage_id);
+    codec::PrecisionShardSelectionInfo default_precision{};
+    default_precision.observed = true;
+    default_precision.source_embedding_artifact = "embeddings_fp32.bin";
+    default_precision.compute_precision = "fp32";
+    default_precision.alignment_check_status = "pass";
+    default_precision.alignment_mismatch_count = 0;
+    default_precision.alignment_failure_reason = "none";
+    default_precision.fallback_reason = "none";
+    set_last_precision_selection(default_precision);
     std::shared_ptr<kmeans::CudaPipelineContext> pipeline_context;
     if (stage_id == "top" || stage_id == "mid") {
         pipeline_context = kmeans::CudaPipelineContext::create_from_env();
@@ -2374,6 +2749,7 @@ Status run_stage_with_telemetry(
 
     std::vector<std::pair<std::string, std::string>> compliance_extra;
     append_compliance_fields(&compliance_extra, compliance, true);
+    append_precision_fields(&compliance_extra, last_precision_selection());
     telemetry::emit_event(
         std::cout,
         telemetry::EventType::ComplianceCheck,
@@ -2565,6 +2941,7 @@ Status run_stage_with_telemetry(
         append_residency_fields(&terminal_extra, kmeans::last_runtime_info());
         append_compliance_fields(&terminal_extra, compliance, false);
     }
+    append_precision_fields(&terminal_extra, last_precision_selection());
 
     const auto stage_end_steady = steady_clock::now();
     const double raw_stage_elapsed_ms =

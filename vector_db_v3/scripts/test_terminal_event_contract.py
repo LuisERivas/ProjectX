@@ -139,6 +139,29 @@ def assert_residency_fields(events: list[dict]) -> None:
             raise AssertionError(f"missing residency field: {key}")
 
 
+def assert_precision_fields(events: list[dict]) -> None:
+    terminal = None
+    for e in events:
+        if e.get("event_type") in {"stage_end", "stage_fail", "stage_skip"}:
+            terminal = e
+    if terminal is None:
+        raise AssertionError("missing terminal stage event")
+    required = [
+        "source_embedding_artifact",
+        "compute_precision",
+        "alignment_check_status",
+        "alignment_mismatch_count",
+        "precision_fallback_reason",
+    ]
+    for key in required:
+        if key not in terminal:
+            raise AssertionError(f"missing precision field: {key}")
+    if terminal.get("alignment_check_status") not in {"pass", "fail"}:
+        raise AssertionError("alignment_check_status must be pass|fail")
+    if terminal.get("alignment_check_status") == "fail" and "alignment_failure_reason" not in terminal:
+        raise AssertionError("alignment_failure_reason required when alignment_check_status=fail")
+
+
 def assert_top_stage_sub_events(events: list[dict]) -> None:
     k_selection = [e for e in events if e.get("event_type") == "k_selection"]
     if not k_selection:
@@ -256,6 +279,8 @@ def main() -> int:
     env_pass = dict(os.environ)
     env_pass["VECTOR_DB_V3_COMPLIANCE_PROFILE"] = "pass"
     env_pass["VECTOR_DB_V3_GPU_RESIDENCY_MODE"] = "stage"
+    env_pass["VECTOR_DB_V3_INTERNAL_SHARD_MODE"] = "fp16"
+    env_pass["VECTOR_DB_V3_INTERNAL_SHARD_REPAIR"] = "regenerate"
 
     code, out, err = run([str(cli), "init", "--path", str(data_dir)], root, env=env_pass)
     if code != 0:
@@ -273,6 +298,7 @@ def main() -> int:
         assert_top_stage_sub_events(events)
         assert_compliance_fields(events, "pass")
         assert_residency_fields(events)
+        assert_precision_fields(events)
         stage_start = next(e for e in events if e["event_type"] == "stage_start")
         if "stage_started_ts" not in stage_start or "stage_elapsed_ms" not in stage_start:
             raise AssertionError("stage_start missing baseline lifecycle fields")
@@ -313,6 +339,7 @@ def main() -> int:
         assert_mid_stage_sub_events(events)
         assert_compliance_fields(events, "pass")
         assert_residency_fields(events)
+        assert_precision_fields(events)
     except Exception as exc:
         return fail(f"mid run telemetry contract mismatch: {exc}", out, err)
     if not cmd or cmd.get("status") != "ok":
@@ -330,6 +357,7 @@ def main() -> int:
         assert_lower_stage_sub_events(events)
         assert_compliance_fields(events, "pass")
         assert_residency_fields(events)
+        assert_precision_fields(events)
     except Exception as exc:
         return fail(f"lower run telemetry contract mismatch: {exc}", out, err)
     if not cmd or cmd.get("status") != "ok":
@@ -347,6 +375,7 @@ def main() -> int:
         assert_final_stage_sub_events(events)
         assert_compliance_fields(events, "pass")
         assert_residency_fields(events)
+        assert_precision_fields(events)
     except Exception as exc:
         return fail(f"final run telemetry contract mismatch: {exc}", out, err)
     if not cmd or cmd.get("status") != "ok":
@@ -356,6 +385,7 @@ def main() -> int:
     env_fail = dict(os.environ)
     env_fail["VECTOR_DB_V3_COMPLIANCE_PROFILE"] = "pass"
     env_fail["VECTOR_DB_V3_FORCE_STAGE_FAIL"] = "1"
+    env_fail["VECTOR_DB_V3_INTERNAL_SHARD_MODE"] = "fp16"
     code, out, err = run([str(cli), "build-mid-layer-clusters", "--path", str(data_dir)], root, env=env_fail)
     if code != 1:
         return fail("forced runtime failure should return exit code 1", out, err)
@@ -388,6 +418,7 @@ def main() -> int:
             if stage_fail.get("non_compliance_stage") != stage_id:
                 raise AssertionError("compliance stage_fail non_compliance_stage mismatch")
             assert_compliance_fields(events, "fail")
+            assert_precision_fields(events)
         except Exception as exc:
             return fail(f"compliance stage_fail contract mismatch ({stage_cmd}): {exc}", out, err)
 
@@ -403,6 +434,7 @@ def main() -> int:
         summary = next(e for e in events if e["event_type"] == "pipeline_summary")
         if summary.get("final_output_status") != "skipped":
             raise AssertionError("pipeline_summary final_output_status should be skipped")
+        assert_precision_fields(events)
     except Exception as exc:
         return fail(f"stage_skip contract mismatch: {exc}", out, err)
     if not cmd or cmd.get("status") != "ok":

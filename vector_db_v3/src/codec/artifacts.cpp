@@ -1,6 +1,7 @@
 #include "vector_db_v3/codec/artifacts.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -124,6 +125,60 @@ Status read_rows_record(
         return rd;
     }
     return dec_fn(bytes, rows);
+}
+
+constexpr std::uint32_t kEmbeddingShardMagicFp32 = 0x33465045U;     // EFP3
+constexpr std::uint32_t kEmbeddingShardMagicFp16 = 0x36465045U;     // EFP6
+constexpr std::uint32_t kEmbeddingShardMagicInt8Sym = 0x38535045U;  // EPS8
+
+std::uint16_t fp32_to_fp16_bits(float value) {
+    std::uint32_t x = 0;
+    std::memcpy(&x, &value, sizeof(float));
+    const std::uint32_t sign = (x >> 16U) & 0x8000U;
+    const std::int32_t exp = static_cast<std::int32_t>((x >> 23U) & 0xFFU) - 127 + 15;
+    std::uint32_t mant = x & 0x007FFFFFU;
+    if (exp <= 0) {
+        if (exp < -10) {
+            return static_cast<std::uint16_t>(sign);
+        }
+        mant = (mant | 0x00800000U) >> static_cast<std::uint32_t>(1 - exp);
+        return static_cast<std::uint16_t>(sign | ((mant + 0x00001000U) >> 13U));
+    }
+    if (exp >= 0x1F) {
+        return static_cast<std::uint16_t>(sign | 0x7C00U);
+    }
+    return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10U) | ((mant + 0x00001000U) >> 13U));
+}
+
+float fp16_bits_to_fp32(std::uint16_t h) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000U) << 16U;
+    const std::uint32_t exp = (h >> 10U) & 0x1FU;
+    const std::uint32_t mant = h & 0x03FFU;
+
+    std::uint32_t out = 0;
+    if (exp == 0U) {
+        if (mant == 0U) {
+            out = sign;
+        } else {
+            std::uint32_t m = mant;
+            std::int32_t e = -1;
+            while ((m & 0x0400U) == 0U) {
+                m <<= 1U;
+                --e;
+            }
+            m &= 0x03FFU;
+            const std::uint32_t exp32 = static_cast<std::uint32_t>(127 - 15 + 1 + e);
+            out = sign | (exp32 << 23U) | (m << 13U);
+        }
+    } else if (exp == 0x1FU) {
+        out = sign | 0x7F800000U | (mant << 13U);
+    } else {
+        const std::uint32_t exp32 = exp + (127U - 15U);
+        out = sign | (exp32 << 23U) | (mant << 13U);
+    }
+    float f = 0.0f;
+    std::memcpy(&f, &out, sizeof(float));
+    return f;
 }
 
 }  // namespace
@@ -599,6 +654,328 @@ Status read_post_cluster_membership_file(
     const std::filesystem::path& path,
     std::vector<PostClusterMembershipRow>* rows) {
     return read_rows_record(path, rows, decode_post_cluster_membership);
+}
+
+Status write_embeddings_fp32_file(
+    const std::filesystem::path& path,
+    const std::vector<std::uint64_t>& ids,
+    const std::vector<std::vector<float>>& vectors) {
+    if (ids.size() != vectors.size()) {
+        return Status::Error("embeddings_fp32.bin: ids/vectors size mismatch");
+    }
+    for (std::size_t i = 0; i < vectors.size(); ++i) {
+        if (vectors[i].size() != 1024U) {
+            return Status::Error("embeddings_fp32.bin: vector dimension mismatch");
+        }
+        if (i > 0 && ids[i - 1] >= ids[i]) {
+            return Status::Error("embeddings_fp32.bin: ids must be strictly ascending");
+        }
+    }
+    const std::size_t record_size = kEmbeddingShardRecordSizeFp32;
+    std::vector<std::uint8_t> bytes(kEmbeddingShardHeaderSize + ids.size() * record_size, 0U);
+    store_le_u32(bytes.data() + 0U, kEmbeddingShardMagicFp32);
+    store_le_u16(bytes.data() + 4U, 1U);
+    store_le_u16(bytes.data() + 6U, static_cast<std::uint16_t>(EmbeddingShardValueType::FP32));
+    store_le_u32(bytes.data() + 8U, static_cast<std::uint32_t>(record_size));
+    store_le_u64(bytes.data() + 12U, static_cast<std::uint64_t>(ids.size()));
+    store_le_u32(bytes.data() + 20U, 0U);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const std::size_t base = kEmbeddingShardHeaderSize + i * record_size;
+        store_le_u64(bytes.data() + base, ids[i]);
+        for (std::size_t d = 0; d < 1024U; ++d) {
+            store_le_f32(bytes.data() + base + 8U + d * sizeof(float), vectors[i][d]);
+        }
+    }
+    return write_atomic_bytes(path, bytes);
+}
+
+Status read_embeddings_fp32_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint64_t>* ids,
+    std::vector<std::vector<float>>* vectors) {
+    const Status ids_guard = ensure_out(ids, "read_embeddings_fp32_file");
+    if (!ids_guard.ok) {
+        return ids_guard;
+    }
+    const Status vec_guard = ensure_out(vectors, "read_embeddings_fp32_file");
+    if (!vec_guard.ok) {
+        return vec_guard;
+    }
+    std::vector<std::uint8_t> bytes;
+    const Status rd = read_file_bytes(path, &bytes);
+    if (!rd.ok) {
+        return rd;
+    }
+    if (bytes.size() < kEmbeddingShardHeaderSize) {
+        return Status::Error("embeddings_fp32.bin: truncated header");
+    }
+    if (load_le_u32(bytes.data() + 0U) != kEmbeddingShardMagicFp32) {
+        return Status::Error("embeddings_fp32.bin: bad magic");
+    }
+    if (load_le_u16(bytes.data() + 4U) != 1U) {
+        return Status::Error("embeddings_fp32.bin: unsupported schema_version");
+    }
+    if (load_le_u16(bytes.data() + 6U) != static_cast<std::uint16_t>(EmbeddingShardValueType::FP32)) {
+        return Status::Error("embeddings_fp32.bin: value_type mismatch");
+    }
+    const std::size_t record_size = load_le_u32(bytes.data() + 8U);
+    const std::size_t record_count = static_cast<std::size_t>(load_le_u64(bytes.data() + 12U));
+    if (record_size != kEmbeddingShardRecordSizeFp32) {
+        return Status::Error("embeddings_fp32.bin: unexpected record_size");
+    }
+    if (bytes.size() != kEmbeddingShardHeaderSize + record_count * record_size) {
+        return Status::Error("embeddings_fp32.bin: byte size mismatch");
+    }
+    ids->assign(record_count, 0U);
+    vectors->assign(record_count, std::vector<float>(1024U, 0.0f));
+    for (std::size_t i = 0; i < record_count; ++i) {
+        const std::size_t base = kEmbeddingShardHeaderSize + i * record_size;
+        (*ids)[i] = load_le_u64(bytes.data() + base);
+        for (std::size_t d = 0; d < 1024U; ++d) {
+            (*vectors)[i][d] = load_le_f32(bytes.data() + base + 8U + d * sizeof(float));
+        }
+    }
+    return Status::Ok();
+}
+
+Status write_embeddings_fp16_file(
+    const std::filesystem::path& path,
+    const std::vector<std::uint64_t>& ids,
+    const std::vector<std::vector<float>>& vectors) {
+    if (ids.size() != vectors.size()) {
+        return Status::Error("embeddings_fp16.bin: ids/vectors size mismatch");
+    }
+    for (std::size_t i = 0; i < vectors.size(); ++i) {
+        if (vectors[i].size() != 1024U) {
+            return Status::Error("embeddings_fp16.bin: vector dimension mismatch");
+        }
+        if (i > 0 && ids[i - 1] >= ids[i]) {
+            return Status::Error("embeddings_fp16.bin: ids must be strictly ascending");
+        }
+    }
+    const std::size_t record_size = kEmbeddingShardRecordSizeFp16;
+    std::vector<std::uint8_t> bytes(kEmbeddingShardHeaderSize + ids.size() * record_size, 0U);
+    store_le_u32(bytes.data() + 0U, kEmbeddingShardMagicFp16);
+    store_le_u16(bytes.data() + 4U, 1U);
+    store_le_u16(bytes.data() + 6U, static_cast<std::uint16_t>(EmbeddingShardValueType::FP16));
+    store_le_u32(bytes.data() + 8U, static_cast<std::uint32_t>(record_size));
+    store_le_u64(bytes.data() + 12U, static_cast<std::uint64_t>(ids.size()));
+    store_le_u32(bytes.data() + 20U, 0U);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const std::size_t base = kEmbeddingShardHeaderSize + i * record_size;
+        store_le_u64(bytes.data() + base, ids[i]);
+        for (std::size_t d = 0; d < 1024U; ++d) {
+            store_le_u16(bytes.data() + base + 8U + d * sizeof(std::uint16_t), fp32_to_fp16_bits(vectors[i][d]));
+        }
+    }
+    return write_atomic_bytes(path, bytes);
+}
+
+Status read_embeddings_fp16_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint64_t>* ids,
+    std::vector<std::vector<float>>* vectors) {
+    const Status ids_guard = ensure_out(ids, "read_embeddings_fp16_file");
+    if (!ids_guard.ok) {
+        return ids_guard;
+    }
+    const Status vec_guard = ensure_out(vectors, "read_embeddings_fp16_file");
+    if (!vec_guard.ok) {
+        return vec_guard;
+    }
+    std::vector<std::uint8_t> bytes;
+    const Status rd = read_file_bytes(path, &bytes);
+    if (!rd.ok) {
+        return rd;
+    }
+    if (bytes.size() < kEmbeddingShardHeaderSize) {
+        return Status::Error("embeddings_fp16.bin: truncated header");
+    }
+    if (load_le_u32(bytes.data() + 0U) != kEmbeddingShardMagicFp16) {
+        return Status::Error("embeddings_fp16.bin: bad magic");
+    }
+    if (load_le_u16(bytes.data() + 4U) != 1U) {
+        return Status::Error("embeddings_fp16.bin: unsupported schema_version");
+    }
+    if (load_le_u16(bytes.data() + 6U) != static_cast<std::uint16_t>(EmbeddingShardValueType::FP16)) {
+        return Status::Error("embeddings_fp16.bin: value_type mismatch");
+    }
+    const std::size_t record_size = load_le_u32(bytes.data() + 8U);
+    const std::size_t record_count = static_cast<std::size_t>(load_le_u64(bytes.data() + 12U));
+    if (record_size != kEmbeddingShardRecordSizeFp16) {
+        return Status::Error("embeddings_fp16.bin: unexpected record_size");
+    }
+    if (bytes.size() != kEmbeddingShardHeaderSize + record_count * record_size) {
+        return Status::Error("embeddings_fp16.bin: byte size mismatch");
+    }
+    ids->assign(record_count, 0U);
+    vectors->assign(record_count, std::vector<float>(1024U, 0.0f));
+    for (std::size_t i = 0; i < record_count; ++i) {
+        const std::size_t base = kEmbeddingShardHeaderSize + i * record_size;
+        (*ids)[i] = load_le_u64(bytes.data() + base);
+        for (std::size_t d = 0; d < 1024U; ++d) {
+            const std::uint16_t bits = load_le_u16(bytes.data() + base + 8U + d * sizeof(std::uint16_t));
+            (*vectors)[i][d] = fp16_bits_to_fp32(bits);
+        }
+    }
+    return Status::Ok();
+}
+
+Status write_embeddings_int8_sym_file(
+    const std::filesystem::path& path,
+    const std::vector<std::uint64_t>& ids,
+    const std::vector<std::vector<float>>& vectors) {
+    if (ids.size() != vectors.size()) {
+        return Status::Error("embeddings_int8_sym.bin: ids/vectors size mismatch");
+    }
+    for (std::size_t i = 0; i < vectors.size(); ++i) {
+        if (vectors[i].size() != 1024U) {
+            return Status::Error("embeddings_int8_sym.bin: vector dimension mismatch");
+        }
+        if (i > 0 && ids[i - 1] >= ids[i]) {
+            return Status::Error("embeddings_int8_sym.bin: ids must be strictly ascending");
+        }
+    }
+    const std::size_t record_size = kEmbeddingShardRecordSizeInt8Sym;
+    std::vector<std::uint8_t> bytes(kEmbeddingShardHeaderSize + ids.size() * record_size, 0U);
+    store_le_u32(bytes.data() + 0U, kEmbeddingShardMagicInt8Sym);
+    store_le_u16(bytes.data() + 4U, 1U);
+    store_le_u16(bytes.data() + 6U, static_cast<std::uint16_t>(EmbeddingShardValueType::INT8Sym));
+    store_le_u32(bytes.data() + 8U, static_cast<std::uint32_t>(record_size));
+    store_le_u64(bytes.data() + 12U, static_cast<std::uint64_t>(ids.size()));
+    store_le_u32(bytes.data() + 20U, 0U);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const std::size_t base = kEmbeddingShardHeaderSize + i * record_size;
+        store_le_u64(bytes.data() + base, ids[i]);
+        float max_abs = 0.0f;
+        for (float v : vectors[i]) {
+            max_abs = std::max(max_abs, std::fabs(v));
+        }
+        const float scale = max_abs > 0.0f ? (max_abs / 127.0f) : 1.0f;
+        store_le_f32(bytes.data() + base + 8U, scale);
+        for (std::size_t d = 0; d < 1024U; ++d) {
+            const float q = vectors[i][d] / scale;
+            const int rounded = static_cast<int>(std::nearbyint(q));
+            const int clamped = std::max(-127, std::min(127, rounded));
+            bytes[base + 12U + d] = static_cast<std::uint8_t>(static_cast<std::int8_t>(clamped));
+        }
+    }
+    return write_atomic_bytes(path, bytes);
+}
+
+Status read_embeddings_int8_sym_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint64_t>* ids,
+    std::vector<std::vector<float>>* vectors) {
+    const Status ids_guard = ensure_out(ids, "read_embeddings_int8_sym_file");
+    if (!ids_guard.ok) {
+        return ids_guard;
+    }
+    const Status vec_guard = ensure_out(vectors, "read_embeddings_int8_sym_file");
+    if (!vec_guard.ok) {
+        return vec_guard;
+    }
+    std::vector<std::uint8_t> bytes;
+    const Status rd = read_file_bytes(path, &bytes);
+    if (!rd.ok) {
+        return rd;
+    }
+    if (bytes.size() < kEmbeddingShardHeaderSize) {
+        return Status::Error("embeddings_int8_sym.bin: truncated header");
+    }
+    if (load_le_u32(bytes.data() + 0U) != kEmbeddingShardMagicInt8Sym) {
+        return Status::Error("embeddings_int8_sym.bin: bad magic");
+    }
+    if (load_le_u16(bytes.data() + 4U) != 1U) {
+        return Status::Error("embeddings_int8_sym.bin: unsupported schema_version");
+    }
+    if (load_le_u16(bytes.data() + 6U) != static_cast<std::uint16_t>(EmbeddingShardValueType::INT8Sym)) {
+        return Status::Error("embeddings_int8_sym.bin: value_type mismatch");
+    }
+    const std::size_t record_size = load_le_u32(bytes.data() + 8U);
+    const std::size_t record_count = static_cast<std::size_t>(load_le_u64(bytes.data() + 12U));
+    if (record_size != kEmbeddingShardRecordSizeInt8Sym) {
+        return Status::Error("embeddings_int8_sym.bin: unexpected record_size");
+    }
+    if (bytes.size() != kEmbeddingShardHeaderSize + record_count * record_size) {
+        return Status::Error("embeddings_int8_sym.bin: byte size mismatch");
+    }
+    ids->assign(record_count, 0U);
+    vectors->assign(record_count, std::vector<float>(1024U, 0.0f));
+    for (std::size_t i = 0; i < record_count; ++i) {
+        const std::size_t base = kEmbeddingShardHeaderSize + i * record_size;
+        (*ids)[i] = load_le_u64(bytes.data() + base);
+        const float scale = load_le_f32(bytes.data() + base + 8U);
+        for (std::size_t d = 0; d < 1024U; ++d) {
+            const std::int8_t q = static_cast<std::int8_t>(bytes[base + 12U + d]);
+            (*vectors)[i][d] = static_cast<float>(q) * scale;
+        }
+    }
+    return Status::Ok();
+}
+
+Status extract_embedding_ids_from_shard_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint64_t>* ids) {
+    const Status guard = ensure_out(ids, "extract_embedding_ids_from_shard_file");
+    if (!guard.ok) {
+        return guard;
+    }
+    std::vector<std::uint8_t> bytes;
+    const Status rd = read_file_bytes(path, &bytes);
+    if (!rd.ok) {
+        return rd;
+    }
+    if (bytes.size() < kEmbeddingShardHeaderSize) {
+        return Status::Error("embedding shard: truncated header");
+    }
+    const std::uint32_t magic = load_le_u32(bytes.data() + 0U);
+    const std::size_t record_size = load_le_u32(bytes.data() + 8U);
+    const std::size_t record_count = static_cast<std::size_t>(load_le_u64(bytes.data() + 12U));
+    if (magic != kEmbeddingShardMagicFp32 &&
+        magic != kEmbeddingShardMagicFp16 &&
+        magic != kEmbeddingShardMagicInt8Sym) {
+        return Status::Error("embedding shard: unknown magic");
+    }
+    if (bytes.size() != kEmbeddingShardHeaderSize + record_count * record_size) {
+        return Status::Error("embedding shard: byte size mismatch");
+    }
+    if (record_size < sizeof(std::uint64_t)) {
+        return Status::Error("embedding shard: invalid record size");
+    }
+    ids->assign(record_count, 0U);
+    for (std::size_t i = 0; i < record_count; ++i) {
+        const std::size_t base = kEmbeddingShardHeaderSize + i * record_size;
+        (*ids)[i] = load_le_u64(bytes.data() + base);
+    }
+    return Status::Ok();
+}
+
+Status regenerate_precision_shards(
+    const std::filesystem::path& fp32_path,
+    const std::filesystem::path& fp16_path,
+    const std::filesystem::path& int8_sym_path,
+    bool regenerate_fp16,
+    bool regenerate_int8_sym) {
+    std::vector<std::uint64_t> ids;
+    std::vector<std::vector<float>> vectors;
+    const Status read_st = read_embeddings_fp32_file(fp32_path, &ids, &vectors);
+    if (!read_st.ok) {
+        return read_st;
+    }
+    if (regenerate_fp16) {
+        const Status st = write_embeddings_fp16_file(fp16_path, ids, vectors);
+        if (!st.ok) {
+            return st;
+        }
+    }
+    if (regenerate_int8_sym) {
+        const Status st = write_embeddings_int8_sym_file(int8_sym_path, ids, vectors);
+        if (!st.ok) {
+            return st;
+        }
+    }
+    return Status::Ok();
 }
 
 Status validate_id_estimate(const IdEstimateRow& row) {

@@ -19,6 +19,8 @@ Provide requirement-to-contract-to-test mapping for M1 implementation governance
 | Binary `id_estimate` and end-of-pipeline k-search bounds batch artifact | `M1_SCOPE_CONTRACT.md`, `ARTIFACT_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G3, G7 |
 | End-of-pipeline consolidated post-cluster membership artifact | `ARTIFACT_CONTRACT.md`, `BINARY_FORMATS.md`, `TEST_GATE_CONTRACT.md` | G3 |
 | Precision consistency by ID-alignment across FP32/FP16/INT8 artifacts (no quant sidecar metadata requirement) | `ARTIFACT_CONTRACT.md`, `BINARY_FORMATS.md`, `TERMINAL_EVENT_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G3, G7 |
+| Internal precision shard lifecycle (FP32 canonical + FP16/INT8 derived) and deterministic repair/fallback behavior | `ARTIFACT_CONTRACT.md`, `BINARY_FORMATS.md`, `TEST_GATE_CONTRACT.md` | G1, G3, G6 |
+| Card 4 validation runner evidence (`run_card4_validation.py`) for targeted correctness + AB checks | `TEST_GATE_CONTRACT.md`, `TRACEABILITY_MATRIX.md` | G1, G3, G4, G5, G6, G7 |
 | Terminal JSONL lifecycle events | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | Active pipeline terminal reporting and previous-run timing baseline | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | CUDA/Tensor/Ampere compliance | `COMPLIANCE_CONTRACT.md` | G5, G6 |

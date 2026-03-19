@@ -109,6 +109,31 @@ struct PrecisionAlignmentResult {
     std::string reason;
 };
 
+enum class EmbeddingShardValueType : std::uint16_t {
+    FP32 = 1,
+    FP16 = 2,
+    INT8Sym = 3,
+};
+
+struct EmbeddingShardHeader {
+    std::uint32_t magic = 0;
+    std::uint16_t schema_version = 1;
+    EmbeddingShardValueType value_type = EmbeddingShardValueType::FP32;
+    std::uint32_t record_size_bytes = 0;
+    std::uint64_t record_count = 0;
+    std::uint32_t reserved = 0;
+};
+
+struct PrecisionShardSelectionInfo {
+    bool observed = false;
+    std::string source_embedding_artifact = "embeddings_fp32.bin";
+    std::string compute_precision = "fp32";
+    std::string alignment_check_status = "pass";
+    std::size_t alignment_mismatch_count = 0;
+    std::string alignment_failure_reason;
+    std::string fallback_reason;
+};
+
 constexpr std::size_t kCommonHeaderSize = 16;
 constexpr std::size_t kIdEstimateRecordSize = 12;
 constexpr std::size_t kElbowTraceRecordSize = 12;
@@ -119,5 +144,9 @@ constexpr std::size_t kMidAssignmentRecordSize = 16;
 constexpr std::size_t kFinalAssignmentRecordSize = 12;
 constexpr std::size_t kKSearchBoundsBatchRecordSize = 24;
 constexpr std::size_t kPostClusterMembershipRecordSize = 24;
+constexpr std::size_t kEmbeddingShardHeaderSize = 24;
+constexpr std::size_t kEmbeddingShardRecordSizeFp32 = 8 + (1024 * sizeof(float));
+constexpr std::size_t kEmbeddingShardRecordSizeFp16 = 8 + (1024 * sizeof(std::uint16_t));
+constexpr std::size_t kEmbeddingShardRecordSizeInt8Sym = 8 + 4 + 1024;
 
 }  // namespace vector_db_v3::codec

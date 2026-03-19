@@ -120,4 +120,20 @@ inline std::filesystem::path telemetry_baseline_jsonl(const std::filesystem::pat
     return clusters_current_dir(data_dir) / "telemetry_stage_baseline.jsonl";
 }
 
+inline std::filesystem::path embeddings_dir(const std::filesystem::path& data_dir) {
+    return data_dir / "embeddings";
+}
+
+inline std::filesystem::path embeddings_fp32_bin(const std::filesystem::path& data_dir) {
+    return embeddings_dir(data_dir) / "embeddings_fp32.bin";
+}
+
+inline std::filesystem::path embeddings_fp16_bin(const std::filesystem::path& data_dir) {
+    return embeddings_dir(data_dir) / "embeddings_fp16.bin";
+}
+
+inline std::filesystem::path embeddings_int8_sym_bin(const std::filesystem::path& data_dir) {
+    return embeddings_dir(data_dir) / "embeddings_int8_sym.bin";
+}
+
 }  // namespace vector_db_v3::paths
