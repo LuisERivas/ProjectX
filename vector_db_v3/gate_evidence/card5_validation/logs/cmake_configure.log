@@ -1,6 +1,6 @@
 $ cmake -S C:\Users\lucho\Desktop\Projects\ProjectX\vector_db_v3 -B C:\Users\lucho\Desktop\Projects\ProjectX\vector_db_v3\build
 exit_code=127
-elapsed_ms=6.682
+elapsed_ms=8.504
 
 --- stdout ---
 

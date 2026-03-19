@@ -73,6 +73,20 @@ def summarize(values: list[float]) -> dict:
         "p95_ms": round(percentile(values, 0.95), 3),
     }
 
+def summarize_internal_metrics(samples: list[dict]) -> dict:
+    if not samples:
+        return {}
+    def median_of(key: str) -> float:
+        vals = [float(s.get(key, 0.0)) for s in samples]
+        return round(float(statistics.median(vals)), 3) if vals else 0.0
+    return {
+        "samples": len(samples),
+        "peak_queue_depth_max": int(max(int(s.get("peak_queue_depth", 0)) for s in samples)),
+        "producer_wait_ms_median": median_of("producer_wait_ms"),
+        "consumer_wait_ms_median": median_of("consumer_wait_ms"),
+        "commit_apply_ms_median": median_of("commit_apply_ms"),
+    }
+
 
 def cv_percent(values: list[float]) -> float:
     if not values:
@@ -110,9 +124,14 @@ def run_ingest_perf(cli: Path, repo_root: Path, out_dir: Path, async_mode: bool,
     env = dict(os.environ)
     env["VECTOR_DB_V3_INGEST_ASYNC_MODE"] = "1" if async_mode else "0"
     env["VECTOR_DB_V3_INGEST_PINNED"] = "1" if async_mode else "0"
+    env["VECTOR_DB_V3_INGEST_ASYNC_POLICY"] = "on" if async_mode else "off"
+    env["VECTOR_DB_V3_INGEST_QUEUE_CAPACITY"] = "8" if async_mode else "4"
+    env["VECTOR_DB_V3_INGEST_PRODUCER_CHUNK"] = "96" if async_mode else "64"
     env["VECTOR_DB_V3_COMPLIANCE_PROFILE"] = "pass"
+    metrics_path = mode_dir / "ingest_metrics.jsonl"
+    env["VECTOR_DB_V3_INGEST_METRICS_PATH"] = str(metrics_path)
 
-    rows = [(50000 + i, 0.001 * ((i % 113) + 1)) for i in range(1024)]
+    rows = [(50000 + i, 0.001 * ((i % 113) + 1)) for i in range(8192)]
     bulk_path = mode_dir / "bulk.bin"
     write_bulk_bin(bulk_path, rows)
 
@@ -140,7 +159,21 @@ def run_ingest_perf(cli: Path, repo_root: Path, out_dir: Path, async_mode: bool,
         if i >= warmup:
             durations.append(elapsed)
     write_json(mode_dir / "runs.json", {"runs": logs})
-    return {"mode": mode_name, "summary": summarize(durations)}
+    metric_rows: list[dict] = []
+    if metrics_path.exists():
+        for line in metrics_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                metric_rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return {
+        "mode": mode_name,
+        "summary": summarize(durations),
+        "internal_metrics": summarize_internal_metrics(metric_rows),
+    }
 
 
 def main() -> int:

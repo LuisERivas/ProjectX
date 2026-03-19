@@ -14,6 +14,7 @@ namespace vector_db_v3::ingest {
 struct PipelineOptions {
     std::size_t batch_size = 1000U;
     std::size_t queue_capacity_batches = 4U;
+    std::size_t reserved_batch_capacity = 0U;
     bool async_enabled = false;
     bool request_pinned = false;
 };
@@ -24,6 +25,10 @@ struct PipelineStats {
     std::string pinned_mode = "off";
     std::size_t batches_committed = 0U;
     std::size_t records_committed = 0U;
+    std::size_t peak_queue_depth = 0U;
+    double producer_wait_ms = 0.0;
+    double consumer_wait_ms = 0.0;
+    double commit_apply_ms = 0.0;
 };
 
 using RecordBatch = std::vector<Record>;

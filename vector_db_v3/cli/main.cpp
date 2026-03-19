@@ -17,6 +17,10 @@
 #include "vector_db_v3/vector_store.hpp"
 #include "vector_db_v3/codec/endian.hpp"
 
+#if defined(VECTOR_DB_V3_CUDA_ENABLED) && VECTOR_DB_V3_CUDA_ENABLED
+#include <cuda_runtime_api.h>
+#endif
+
 namespace {
 
 using Args = std::unordered_map<std::string, std::string>;
@@ -138,6 +142,31 @@ std::string json_escape(const std::string& in) {
     return out;
 }
 
+void append_ingest_metrics_if_requested(
+    const vector_db_v3::ingest::PipelineStats& stats,
+    std::uint32_t batch_size) {
+    const char* path = std::getenv("VECTOR_DB_V3_INGEST_METRICS_PATH");
+    if (path == nullptr || *path == '\0') {
+        return;
+    }
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        return;
+    }
+    out << "{"
+        << "\"async_enabled\":" << (stats.async_enabled ? "true" : "false")
+        << ",\"pinned_enabled\":" << (stats.pinned_enabled ? "true" : "false")
+        << ",\"pinned_mode\":\"" << json_escape(stats.pinned_mode) << "\""
+        << ",\"batch_size\":" << batch_size
+        << ",\"batches_committed\":" << stats.batches_committed
+        << ",\"records_committed\":" << stats.records_committed
+        << ",\"peak_queue_depth\":" << stats.peak_queue_depth
+        << ",\"producer_wait_ms\":" << std::fixed << std::setprecision(3) << stats.producer_wait_ms
+        << ",\"consumer_wait_ms\":" << std::fixed << std::setprecision(3) << stats.consumer_wait_ms
+        << ",\"commit_apply_ms\":" << std::fixed << std::setprecision(3) << stats.commit_apply_ms
+        << "}\n";
+}
+
 int emit_usage_error(const std::string& message) {
     std::cerr << "error: " << message << "\n";
     return 2;
@@ -236,6 +265,10 @@ class BinaryRecordStreamReader {
 public:
     explicit BinaryRecordStreamReader(std::string input_path) : path_(std::move(input_path)) {}
 
+    ~BinaryRecordStreamReader() {
+        release_pinned_buffer();
+    }
+
     bool open(std::string* error) {
         in_.open(path_, std::ios::binary);
         if (!in_) {
@@ -297,6 +330,7 @@ public:
             return false;
         }
         row_.assign(kBulkInsertBinRecordBytes, 0U);
+        init_pinned_buffer_if_requested();
         opened_ = true;
         return true;
     }
@@ -318,17 +352,21 @@ public:
             *eof = true;
             return true;
         }
-        in_.read(reinterpret_cast<char*>(row_.data()), static_cast<std::streamsize>(row_.size()));
+        std::uint8_t* row_ptr = row_.data();
+        if (pinned_row_ != nullptr) {
+            row_ptr = pinned_row_;
+        }
+        in_.read(reinterpret_cast<char*>(row_ptr), static_cast<std::streamsize>(row_.size()));
         if (!in_ || in_.gcount() != static_cast<std::streamsize>(row_.size())) {
             if (error != nullptr) {
                 *error = "binary record truncated";
             }
             return false;
         }
-        out->embedding_id = vector_db_v3::codec::load_le_u64(row_.data());
+        out->embedding_id = vector_db_v3::codec::load_le_u64(row_ptr);
         out->vector.resize(vector_db_v3::kVectorDim);
         for (std::size_t d = 0; d < vector_db_v3::kVectorDim; ++d) {
-            out->vector[d] = vector_db_v3::codec::load_le_f32(row_.data() + 8U + d * sizeof(float));
+            out->vector[d] = vector_db_v3::codec::load_le_f32(row_ptr + 8U + d * sizeof(float));
         }
         --remaining_;
         *eof = remaining_ == 0U;
@@ -346,11 +384,33 @@ public:
     }
 
 private:
+    void init_pinned_buffer_if_requested() {
+#if defined(VECTOR_DB_V3_CUDA_ENABLED) && VECTOR_DB_V3_CUDA_ENABLED
+        if (!env_truthy(std::getenv("VECTOR_DB_V3_INGEST_PINNED")) || pinned_row_ != nullptr || row_.empty()) {
+            return;
+        }
+        void* ptr = nullptr;
+        if (cudaHostAlloc(&ptr, row_.size(), cudaHostAllocDefault) == cudaSuccess) {
+            pinned_row_ = static_cast<std::uint8_t*>(ptr);
+        }
+#endif
+    }
+
+    void release_pinned_buffer() {
+#if defined(VECTOR_DB_V3_CUDA_ENABLED) && VECTOR_DB_V3_CUDA_ENABLED
+        if (pinned_row_ != nullptr) {
+            cudaFreeHost(pinned_row_);
+            pinned_row_ = nullptr;
+        }
+#endif
+    }
+
     std::string path_;
     std::ifstream in_;
     std::uint64_t remaining_ = 0U;
     bool opened_ = false;
     std::vector<std::uint8_t> row_;
+    std::uint8_t* pinned_row_ = nullptr;
 };
 
 vector_db_v3::Status run_ingest_pipeline(
@@ -373,6 +433,7 @@ vector_db_v3::Status run_ingest_pipeline(
     }
     *inserted_out = stats.records_committed;
     *batches_out = stats.batches_committed;
+    append_ingest_metrics_if_requested(stats, batch_size);
     return vector_db_v3::Status::Ok();
 }
 
@@ -459,7 +520,6 @@ int main(int argc, char** argv) {
                 return vector_db_v3::Status::Error("jsonl producer invalid outputs");
             }
             out_batch->clear();
-            out_batch->reserve(batch_size);
             std::string line;
             while (out_batch->size() < batch_size && std::getline(in, line)) {
                 ++line_no;
@@ -516,7 +576,6 @@ int main(int argc, char** argv) {
                 return vector_db_v3::Status::Error("binary producer invalid outputs");
             }
             out_batch->clear();
-            out_batch->reserve(batch_size);
             bool reached_eof = false;
             while (out_batch->size() < batch_size && !reached_eof) {
                 vector_db_v3::Record rec{};

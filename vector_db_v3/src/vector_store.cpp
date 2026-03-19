@@ -166,46 +166,104 @@ Status write_truncated_file(const fs::path& path, const std::vector<std::uint8_t
     return Status::Ok();
 }
 
-Status encode_wal_entry_bytes(const WalEntry& entry, std::vector<std::uint8_t>* out) {
+Status encode_wal_entry_bytes_raw(
+    std::uint64_t lsn,
+    std::uint8_t op,
+    std::uint64_t embedding_id,
+    const float* vector_data,
+    std::size_t vector_dim,
+    std::vector<std::uint8_t>* out) {
     if (out == nullptr) {
         return Status::Error("encode_wal_entry_bytes: out is null");
     }
-    const bool is_insert = entry.op == kWalOpInsert;
-    const bool is_delete = entry.op == kWalOpDelete;
+    const bool is_insert = op == kWalOpInsert;
+    const bool is_delete = op == kWalOpDelete;
     if (!is_insert && !is_delete) {
         return Status::Error("encode_wal_entry_bytes: invalid op");
     }
-    if (is_insert && entry.vector.size() != kVectorDim) {
+    if (is_insert && vector_dim != kVectorDim) {
         return Status::Error("encode_wal_entry_bytes: insert vector dim mismatch");
     }
-    if (is_delete && !entry.vector.empty()) {
+    if (is_delete && vector_dim != 0U) {
         return Status::Error("encode_wal_entry_bytes: delete should not carry vector payload");
     }
 
-    std::vector<std::uint8_t> payload;
-    if (is_insert) {
-        payload.resize(kVectorDim * sizeof(float), 0U);
-        for (std::size_t i = 0; i < kVectorDim; ++i) {
-            codec::store_le_f32(payload.data() + i * sizeof(float), entry.vector[i]);
-        }
-    }
-    const std::uint32_t payload_bytes = static_cast<std::uint32_t>(payload.size());
-    const std::uint32_t vector_dim = is_insert ? static_cast<std::uint32_t>(kVectorDim) : 0U;
+    const std::uint32_t payload_bytes = is_insert ? static_cast<std::uint32_t>(kVectorDim * sizeof(float)) : 0U;
+    const std::uint32_t wal_vector_dim = is_insert ? static_cast<std::uint32_t>(kVectorDim) : 0U;
 
     out->assign(kWalFixedBytes + payload_bytes + 4U, 0U);
     codec::store_le_u32(out->data() + 0U, kWalMagic);
     codec::store_le_u16(out->data() + 4U, kWalSchemaVersion);
-    (*out)[6U] = entry.op;
+    (*out)[6U] = op;
     (*out)[7U] = 0U;
-    codec::store_le_u64(out->data() + 8U, entry.lsn);
-    codec::store_le_u64(out->data() + 16U, entry.embedding_id);
-    codec::store_le_u32(out->data() + 24U, vector_dim);
+    codec::store_le_u64(out->data() + 8U, lsn);
+    codec::store_le_u64(out->data() + 16U, embedding_id);
+    codec::store_le_u32(out->data() + 24U, wal_vector_dim);
     codec::store_le_u32(out->data() + 28U, payload_bytes);
-    if (!payload.empty()) {
-        std::memcpy(out->data() + kWalFixedBytes, payload.data(), payload.size());
+    if (is_insert) {
+        for (std::size_t i = 0; i < kVectorDim; ++i) {
+            codec::store_le_f32(out->data() + kWalFixedBytes + i * sizeof(float), vector_data[i]);
+        }
     }
-    const std::uint32_t crc = codec::crc32(out->data() + 4U, kWalFixedBytes - 4U + payload.size());
-    codec::store_le_u32(out->data() + kWalFixedBytes + payload.size(), crc);
+    const std::uint32_t crc = codec::crc32(out->data() + 4U, kWalFixedBytes - 4U + payload_bytes);
+    codec::store_le_u32(out->data() + kWalFixedBytes + payload_bytes, crc);
+    return Status::Ok();
+}
+
+Status encode_wal_entry_bytes(const WalEntry& entry, std::vector<std::uint8_t>* out) {
+    return encode_wal_entry_bytes_raw(
+        entry.lsn,
+        entry.op,
+        entry.embedding_id,
+        entry.vector.empty() ? nullptr : entry.vector.data(),
+        entry.vector.size(),
+        out);
+}
+
+Status append_wal_entries_from_records(
+    const fs::path& wal_path,
+    const std::vector<Record>& records,
+    std::uint64_t first_lsn,
+    std::uint64_t* last_lsn_out) {
+    if (records.empty()) {
+        if (last_lsn_out != nullptr) {
+            *last_lsn_out = first_lsn > 0U ? first_lsn - 1U : 0U;
+        }
+        return Status::Ok();
+    }
+    std::ofstream out(wal_path, std::ios::binary | std::ios::app);
+    if (!out) {
+        return Status::Error("append_wal_entries: unable to open wal.log");
+    }
+    std::vector<std::uint8_t> bytes;
+    std::uint64_t lsn = first_lsn;
+    for (const auto& rec : records) {
+        const Status enc = encode_wal_entry_bytes_raw(
+            lsn,
+            kWalOpInsert,
+            rec.embedding_id,
+            rec.vector.data(),
+            rec.vector.size(),
+            &bytes);
+        if (!enc.ok) {
+            return enc;
+        }
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!out) {
+            return Status::Error("append_wal_entries: write failed");
+        }
+        ++lsn;
+    }
+    out.flush();
+    if (!out) {
+        return Status::Error("append_wal_entries: flush failed");
+    }
+    if (!sync_file_descriptor(wal_path)) {
+        return Status::Error("append_wal_entries: fsync/_commit failed");
+    }
+    if (last_lsn_out != nullptr) {
+        *last_lsn_out = lsn - 1U;
+    }
     return Status::Ok();
 }
 
@@ -2385,31 +2443,26 @@ Status VectorStore::insert_batch_with_options(
     if (records.empty()) {
         return Status::Ok();
     }
-    std::vector<WalEntry> wal_entries;
-    wal_entries.reserve(records.size());
-    std::uint64_t next_lsn = impl_->last_lsn + 1U;
     for (const auto& rec : records) {
         if (rec.vector.size() != kVectorDim) {
             return Status::Error("insert_batch_with_options: vector dimension mismatch");
         }
-        WalEntry entry{};
-        entry.lsn = next_lsn++;
-        entry.op = kWalOpInsert;
-        entry.embedding_id = rec.embedding_id;
-        entry.vector = rec.vector;
-        wal_entries.push_back(std::move(entry));
     }
-    const Status wal = append_wal_entries(paths::wal(impl_->data_dir), wal_entries);
+    std::uint64_t last_lsn_written = impl_->last_lsn;
+    const Status wal = append_wal_entries_from_records(
+        paths::wal(impl_->data_dir),
+        records,
+        impl_->last_lsn + 1U,
+        &last_lsn_written);
     if (!wal.ok) {
         return wal;
     }
-    for (std::size_t i = 0; i < records.size(); ++i) {
-        const auto& rec = records[i];
+    for (const auto& rec : records) {
         impl_->rows[rec.embedding_id] = Record{rec.embedding_id, rec.vector};
-        impl_->last_lsn = wal_entries[i].lsn;
         impl_->wal_entries += 1U;
         impl_->precision_shards_dirty = true;
     }
+    impl_->last_lsn = last_lsn_written;
     if (!defer_precision_refresh && impl_->precision_shards_dirty) {
         const Status shard_refresh = refresh_precision_shards_from_rows(impl_->data_dir, impl_->rows, true);
         if (!shard_refresh.ok) {
