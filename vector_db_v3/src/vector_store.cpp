@@ -267,6 +267,65 @@ Status append_wal_entries_from_records(
     return Status::Ok();
 }
 
+Status append_wal_entry(const fs::path& wal_path, const WalEntry& entry);
+
+Status append_wal_entries_strict_from_records(
+    const fs::path& wal_path,
+    const std::vector<Record>& records,
+    std::uint64_t first_lsn,
+    std::uint64_t* last_lsn_out) {
+    if (records.empty()) {
+        if (last_lsn_out != nullptr) {
+            *last_lsn_out = first_lsn > 0U ? first_lsn - 1U : 0U;
+        }
+        return Status::Ok();
+    }
+    std::uint64_t lsn = first_lsn;
+    for (const auto& rec : records) {
+        WalEntry entry{};
+        entry.lsn = lsn++;
+        entry.op = kWalOpInsert;
+        entry.embedding_id = rec.embedding_id;
+        entry.vector = rec.vector;
+        const Status wal = append_wal_entry(wal_path, entry);
+        if (!wal.ok) {
+            return wal;
+        }
+    }
+    if (last_lsn_out != nullptr) {
+        *last_lsn_out = lsn - 1U;
+    }
+    return Status::Ok();
+}
+
+enum class WalCommitPolicyMode {
+    Auto,
+    StrictPerRecord,
+    BatchGroupCommit,
+};
+
+WalCommitPolicyMode wal_commit_policy_from_env() {
+    const char* raw = std::getenv("VECTOR_DB_V3_WAL_COMMIT_POLICY");
+    if (raw == nullptr || *raw == '\0') {
+        return WalCommitPolicyMode::Auto;
+    }
+    std::string mode(raw);
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mode == "strict_per_record" || mode == "strict") {
+        return WalCommitPolicyMode::StrictPerRecord;
+    }
+    if (mode == "batch_group_commit" || mode == "batch") {
+        return WalCommitPolicyMode::BatchGroupCommit;
+    }
+    return WalCommitPolicyMode::Auto;
+}
+
+bool use_strict_commit_for_batch(WalCommitPolicyMode mode) {
+    return mode == WalCommitPolicyMode::StrictPerRecord;
+}
+
 Status append_wal_entry(const fs::path& wal_path, const WalEntry& entry) {
     std::vector<std::uint8_t> bytes;
     const Status enc = encode_wal_entry_bytes(entry, &bytes);
@@ -2419,12 +2478,22 @@ Status VectorStore::insert_batch_with_options(
             return Status::Error("insert_batch_with_options: vector dimension mismatch");
         }
     }
+    const WalCommitPolicyMode policy_mode = wal_commit_policy_from_env();
     std::uint64_t last_lsn_written = impl_->last_lsn;
-    const Status wal = append_wal_entries_from_records(
-        paths::wal(impl_->data_dir),
-        records,
-        impl_->last_lsn + 1U,
-        &last_lsn_written);
+    Status wal = Status::Ok();
+    if (use_strict_commit_for_batch(policy_mode)) {
+        wal = append_wal_entries_strict_from_records(
+            paths::wal(impl_->data_dir),
+            records,
+            impl_->last_lsn + 1U,
+            &last_lsn_written);
+    } else {
+        wal = append_wal_entries_from_records(
+            paths::wal(impl_->data_dir),
+            records,
+            impl_->last_lsn + 1U,
+            &last_lsn_written);
+    }
     if (!wal.ok) {
         return wal;
     }

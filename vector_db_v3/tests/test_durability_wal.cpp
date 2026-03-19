@@ -39,9 +39,14 @@ int main() {
         ok &= expect(store.open().ok, "open");
         ok &= expect(store.insert(10U, make_vec(1.0f)).ok, "insert 10");
         ok &= expect(store.insert(20U, make_vec(2.0f)).ok, "insert 20");
+        std::vector<vector_db_v3::Record> batch = {
+            vector_db_v3::Record{30U, make_vec(3.0f)},
+            vector_db_v3::Record{40U, make_vec(4.0f)},
+        };
+        ok &= expect(store.insert_batch(batch).ok, "insert_batch 30/40");
         const auto ws = store.wal_stats();
-        ok &= expect(ws.last_lsn == 2U, "lsn should be 2");
-        ok &= expect(ws.wal_entries == 2U, "wal entries should be 2");
+        ok &= expect(ws.last_lsn == 4U, "lsn should be 4");
+        ok &= expect(ws.wal_entries == 4U, "wal entries should be 4");
         ok &= expect(store.close().ok, "close");
     }
 
@@ -50,6 +55,8 @@ int main() {
         ok &= expect(store.open().ok, "reopen");
         auto rec = store.get(10U);
         ok &= expect(rec.has_value(), "record 10 exists after replay");
+        ok &= expect(store.get(30U).has_value(), "record 30 exists after replay");
+        ok &= expect(store.get(40U).has_value(), "record 40 exists after replay");
         ok &= expect(store.remove(10U).ok, "delete 10");
         ok &= expect(store.get(10U).has_value() == false, "record 10 deleted in memory");
         ok &= expect(store.close().ok, "close2");

@@ -74,3 +74,15 @@ Define stable CLI commands, output behavior, and failure semantics for M1.
   - `embedding_id: u64`
   - `vector: 1024 x f32` (FP32 ingest boundary)
 
+## WAL Commit Policy (Card 7 additive)
+
+- WAL commit behavior for ingest/batch paths is configurable via `VECTOR_DB_V3_WAL_COMMIT_POLICY`.
+- Supported values:
+  - `auto` (default compatibility mode)
+  - `strict_per_record`
+  - `batch_group_commit`
+- `auto` preserves current behavior:
+  - single-record operations remain strict per-record durability boundaries,
+  - batch ingest operations use grouped commit boundaries.
+- Existing command output schemas, exit codes, and stderr formatting remain unchanged.
+

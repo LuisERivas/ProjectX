@@ -151,10 +151,16 @@ void append_ingest_metrics_if_requested(
     if (!out) {
         return;
     }
+    const char* wal_policy_raw = std::getenv("VECTOR_DB_V3_WAL_COMMIT_POLICY");
+    std::string wal_policy = "auto";
+    if (wal_policy_raw != nullptr && *wal_policy_raw != '\0') {
+        wal_policy = wal_policy_raw;
+    }
     out << "{"
         << "\"async_enabled\":" << (stats.async_enabled ? "true" : "false")
         << ",\"pinned_enabled\":" << (stats.pinned_enabled ? "true" : "false")
         << ",\"pinned_mode\":\"" << json_escape(stats.pinned_mode) << "\""
+        << ",\"wal_commit_policy\":\"" << json_escape(wal_policy) << "\""
         << ",\"batch_size\":" << batch_size
         << ",\"batches_committed\":" << stats.batches_committed
         << ",\"records_committed\":" << stats.records_committed

@@ -17,6 +17,7 @@ Freeze M1 feature boundaries and non-negotiable runtime behavior for Vector DB v
 - Binary FP32 ingest feed is allowed for synthetic/perf workloads, with unchanged command and stage semantics.
 - End-of-pipeline batch finalization step that writes consolidated k-search bounds across clustering stages.
 - End-of-pipeline consolidated post-cluster membership artifact with one row per live embedding.
+- Configurable WAL commit policy for ingest/batch paths (`strict_per_record`, `batch_group_commit`, compatibility-safe `auto`).
 
 ## Out of Scope (M1)
 
