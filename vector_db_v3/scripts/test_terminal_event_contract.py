@@ -246,7 +246,10 @@ def assert_mid_stage_sub_events(events: list[dict]) -> None:
     if observed != {"mid_assignments", "mid_summary"}:
         raise AssertionError(f"mid artifact_write coverage mismatch: observed={sorted(observed)}")
 
-    progress_events = [e for e in events if e.get("event_type") == "stage_progress"]
+    progress_events = [
+        e for e in events
+        if e.get("event_type") == "stage_progress" and e.get("stage_id") == "mid"
+    ]
     for event in progress_events:
         if "centroid_id" not in event or "job_id" not in event:
             raise AssertionError("mid stage_progress events must include centroid_id and job_id")
@@ -268,7 +271,10 @@ def assert_lower_stage_sub_events(events: list[dict]) -> None:
     if not observed:
         raise AssertionError("lower artifact_write coverage mismatch")
 
-    progress_events = [e for e in events if e.get("event_type") == "stage_progress"]
+    progress_events = [
+        e for e in events
+        if e.get("event_type") == "stage_progress" and e.get("stage_id") == "lower"
+    ]
     if not progress_events:
         # Empty-data lower runs can legitimately have zero branch jobs.
         if rows_written is None or rows_written > 0:
@@ -297,7 +303,10 @@ def assert_final_stage_sub_events(events: list[dict]) -> None:
     if observed != expected_suffixes:
         raise AssertionError(f"final artifact_write coverage mismatch: observed={sorted(observed)}")
 
-    progress_events = [e for e in events if e.get("event_type") == "stage_progress"]
+    progress_events = [
+        e for e in events
+        if e.get("event_type") == "stage_progress" and e.get("stage_id") == "final"
+    ]
     for event in progress_events:
         if "centroid_id" not in event or "job_id" not in event:
             raise AssertionError("final stage_progress events must include centroid_id and job_id")
