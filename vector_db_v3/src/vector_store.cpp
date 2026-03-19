@@ -2847,7 +2847,47 @@ void append_precision_fields(
 
 ClusterStats VectorStore::cluster_stats() const {
     ClusterStats out{};
-    out.available = false;
+    out.available = impl_ != nullptr && impl_->opened;
+    out.build_lsn = impl_ != nullptr ? impl_->last_lsn : 0U;
+    out.vectors_indexed = impl_ != nullptr ? impl_->rows.size() : 0U;
+
+    if (impl_ != nullptr && impl_->opened) {
+        codec::IdEstimateRow estimate{};
+        if (codec::read_id_estimate_file(paths::id_estimate_bin(impl_->data_dir), &estimate).ok &&
+            codec::validate_id_estimate(estimate).ok) {
+            out.k_min = static_cast<std::size_t>(estimate.k_min);
+            out.k_max = static_cast<std::size_t>(estimate.k_max);
+        }
+
+        std::string top_manifest_payload;
+        if (read_manifest_payload_string(paths::cluster_manifest_bin(impl_->data_dir), &top_manifest_payload).ok) {
+            out.chosen_k = static_cast<std::size_t>(parse_u32_or_default(top_manifest_payload, "chosen_k", 0U));
+        }
+
+        std::vector<codec::ElbowTraceRow> elbow_rows;
+        if (codec::read_elbow_trace_file(paths::elbow_trace_bin(impl_->data_dir), &elbow_rows).ok) {
+            std::uint32_t chosen = static_cast<std::uint32_t>(out.chosen_k);
+            if (chosen != 0U) {
+                for (const auto& row : elbow_rows) {
+                    if (row.k_value == chosen) {
+                        out.objective = static_cast<double>(row.objective_value);
+                        break;
+                    }
+                }
+            }
+            if (out.objective == 0.0 && !elbow_rows.empty()) {
+                // Fallback to the best objective observed if chosen_k is unavailable.
+                float best = elbow_rows.front().objective_value;
+                for (const auto& row : elbow_rows) {
+                    if (row.objective_value < best) {
+                        best = row.objective_value;
+                    }
+                }
+                out.objective = static_cast<double>(best);
+            }
+        }
+    }
+
     const StageCompliance compliance = evaluate_stage_compliance("top");
     const kmeans::RuntimeInfo runtime_info = kmeans::last_runtime_info();
     out.cuda_required = compliance.cuda_required;
