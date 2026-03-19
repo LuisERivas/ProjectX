@@ -180,16 +180,78 @@ def main() -> int:
         "vectordb_v3_codec_corruption_tests|vectordb_v3_cli_contract_tests|"
         "vectordb_v3_terminal_event_contract_tests|vectordb_v3_card10_metadata_overhead_tests"
     )
-    ok, msg = log_cmd("ctest_targeted", ["ctest", "--test-dir", str(build_dir), "--output-on-failure", "-R", regex])
-    ctest_lines = [line for line in transcript_lines if line.startswith("$ ctest") or line.startswith("exit_code=") or line.startswith("---")]
-    (out_dir / "ctest.log").write_text("\n".join(ctest_lines) + ("\n" if ctest_lines else ""), encoding="utf-8")
-    if not ok:
+    ctest_cmd = ["ctest", "--test-dir", str(build_dir), "--output-on-failure", "-R", regex]
+    ctest_code, ctest_out, ctest_err, ctest_elapsed_ms = run_command(ctest_cmd, cwd=repo_root)
+    steps.append(
+        {
+            "name": "ctest_targeted",
+            "command": ctest_cmd,
+            "exit_code": ctest_code,
+            "elapsed_ms": round(ctest_elapsed_ms, 3),
+        }
+    )
+    transcript_lines.append(f"$ {' '.join(ctest_cmd)}")
+    transcript_lines.append(f"exit_code={ctest_code} elapsed_ms={ctest_elapsed_ms:.3f}")
+    if ctest_out:
+        transcript_lines.append("--- stdout ---")
+        transcript_lines.append(ctest_out.rstrip())
+    if ctest_err:
+        transcript_lines.append("--- stderr ---")
+        transcript_lines.append(ctest_err.rstrip())
+    transcript_lines.append("")
+
+    ctest_log_parts = [
+        f"$ {' '.join(ctest_cmd)}",
+        f"exit_code={ctest_code} elapsed_ms={ctest_elapsed_ms:.3f}",
+        "--- stdout ---",
+        ctest_out.rstrip() if ctest_out else "",
+        "--- stderr ---",
+        ctest_err.rstrip() if ctest_err else "",
+        "",
+    ]
+
+    if ctest_code != 0:
+        ctest_verbose_cmd = ["ctest", "--test-dir", str(build_dir), "--output-on-failure", "-V", "-R", regex]
+        v_code, v_out, v_err, v_elapsed_ms = run_command(ctest_verbose_cmd, cwd=repo_root)
+        steps.append(
+            {
+                "name": "ctest_targeted_verbose_on_fail",
+                "command": ctest_verbose_cmd,
+                "exit_code": v_code,
+                "elapsed_ms": round(v_elapsed_ms, 3),
+            }
+        )
+        transcript_lines.append(f"$ {' '.join(ctest_verbose_cmd)}")
+        transcript_lines.append(f"exit_code={v_code} elapsed_ms={v_elapsed_ms:.3f}")
+        if v_out:
+            transcript_lines.append("--- stdout ---")
+            transcript_lines.append(v_out.rstrip())
+        if v_err:
+            transcript_lines.append("--- stderr ---")
+            transcript_lines.append(v_err.rstrip())
+        transcript_lines.append("")
+        ctest_log_parts.extend(
+            [
+                f"$ {' '.join(ctest_verbose_cmd)}",
+                f"exit_code={v_code} elapsed_ms={v_elapsed_ms:.3f}",
+                "--- stdout ---",
+                v_out.rstrip() if v_out else "",
+                "--- stderr ---",
+                v_err.rstrip() if v_err else "",
+                "",
+            ]
+        )
+
+    (out_dir / "ctest.log").write_text("\n".join(ctest_log_parts), encoding="utf-8")
+    if ctest_code != 0:
         write_json(out_dir / "summary.json", {"status": "fail", "failed_step": "ctest_targeted", "steps": steps})
         write_json(out_dir / "parity_results.json", {"status": "not_run"})
         write_json(out_dir / "perf_results.json", {"status": "not_run"})
         (out_dir / "command_transcript.log").write_text("\n".join(transcript_lines) + "\n", encoding="utf-8")
         print("FAIL: targeted ctest failed", file=sys.stderr)
-        print(msg, file=sys.stderr)
+        detail = ctest_err or ctest_out
+        if detail:
+            print(detail, file=sys.stderr)
         return 1
 
     card10_report = out_dir / "card10_metadata_report.json"
