@@ -78,6 +78,8 @@ public:
 
     Status insert(std::uint64_t embedding_id, const std::vector<float>& vector_fp32_1024);
     Status insert_batch(const std::vector<Record>& records);
+    Status insert_batch_with_options(const std::vector<Record>& records, bool defer_precision_refresh);
+    Status flush_ingest_state();
     Status remove(std::uint64_t embedding_id);
     std::optional<Record> get(std::uint64_t embedding_id) const;
     std::vector<SearchResult> search_exact(const std::vector<float>& query, std::size_t top_k) const;

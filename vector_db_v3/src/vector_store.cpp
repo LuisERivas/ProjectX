@@ -230,6 +230,35 @@ Status append_wal_entry(const fs::path& wal_path, const WalEntry& entry) {
     return Status::Ok();
 }
 
+Status append_wal_entries(const fs::path& wal_path, const std::vector<WalEntry>& entries) {
+    if (entries.empty()) {
+        return Status::Ok();
+    }
+    std::ofstream out(wal_path, std::ios::binary | std::ios::app);
+    if (!out) {
+        return Status::Error("append_wal_entries: unable to open wal.log");
+    }
+    std::vector<std::uint8_t> bytes;
+    for (const auto& entry : entries) {
+        const Status enc = encode_wal_entry_bytes(entry, &bytes);
+        if (!enc.ok) {
+            return enc;
+        }
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!out) {
+            return Status::Error("append_wal_entries: write failed");
+        }
+    }
+    out.flush();
+    if (!out) {
+        return Status::Error("append_wal_entries: flush failed");
+    }
+    if (!sync_file_descriptor(wal_path)) {
+        return Status::Error("append_wal_entries: fsync/_commit failed");
+    }
+    return Status::Ok();
+}
+
 Status load_checkpoint_snapshot(
     const fs::path& checkpoint_path,
     std::uint64_t* checkpoint_lsn,
@@ -2344,34 +2373,65 @@ Status VectorStore::insert(std::uint64_t embedding_id, const std::vector<float>&
 }
 
 Status VectorStore::insert_batch(const std::vector<Record>& records) {
+    return insert_batch_with_options(records, false);
+}
+
+Status VectorStore::insert_batch_with_options(
+    const std::vector<Record>& records,
+    bool defer_precision_refresh) {
     if (!impl_->opened) {
         return Status::Error("store not open");
     }
+    if (records.empty()) {
+        return Status::Ok();
+    }
+    std::vector<WalEntry> wal_entries;
+    wal_entries.reserve(records.size());
+    std::uint64_t next_lsn = impl_->last_lsn + 1U;
     for (const auto& rec : records) {
         if (rec.vector.size() != kVectorDim) {
-            return Status::Error("insert_batch: vector dimension mismatch");
+            return Status::Error("insert_batch_with_options: vector dimension mismatch");
         }
         WalEntry entry{};
-        entry.lsn = impl_->last_lsn + 1U;
+        entry.lsn = next_lsn++;
         entry.op = kWalOpInsert;
         entry.embedding_id = rec.embedding_id;
         entry.vector = rec.vector;
-        const Status wal = append_wal_entry(paths::wal(impl_->data_dir), entry);
-        if (!wal.ok) {
-            return wal;
-        }
+        wal_entries.push_back(std::move(entry));
+    }
+    const Status wal = append_wal_entries(paths::wal(impl_->data_dir), wal_entries);
+    if (!wal.ok) {
+        return wal;
+    }
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        const auto& rec = records[i];
         impl_->rows[rec.embedding_id] = Record{rec.embedding_id, rec.vector};
-        impl_->last_lsn = entry.lsn;
+        impl_->last_lsn = wal_entries[i].lsn;
         impl_->wal_entries += 1U;
         impl_->precision_shards_dirty = true;
     }
-    if (impl_->precision_shards_dirty) {
+    if (!defer_precision_refresh && impl_->precision_shards_dirty) {
         const Status shard_refresh = refresh_precision_shards_from_rows(impl_->data_dir, impl_->rows, true);
         if (!shard_refresh.ok) {
             return Status::Error("insert_batch: failed refreshing precision shards: " + shard_refresh.message);
         }
         impl_->precision_shards_dirty = false;
     }
+    return Status::Ok();
+}
+
+Status VectorStore::flush_ingest_state() {
+    if (!impl_->opened) {
+        return Status::Error("store not open");
+    }
+    if (!impl_->precision_shards_dirty) {
+        return Status::Ok();
+    }
+    const Status shard_refresh = refresh_precision_shards_from_rows(impl_->data_dir, impl_->rows, true);
+    if (!shard_refresh.ok) {
+        return Status::Error("flush_ingest_state: failed refreshing precision shards: " + shard_refresh.message);
+    }
+    impl_->precision_shards_dirty = false;
     return Status::Ok();
 }
 

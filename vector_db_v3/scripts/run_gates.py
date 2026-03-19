@@ -63,7 +63,8 @@ def gate_definitions(build_dir: Path, repo_root: Path) -> dict[str, dict]:
                     "vectordb_v3_final_layer_artifacts_tests|vectordb_v3_final_layer_eligibility_reconciliation_tests|"
                     "vectordb_v3_kmeans_backend_parity_tests|vectordb_v3_kmeans_tie_break_determinism_tests|"
                     "vectordb_v3_kmeans_backend_selection_tests|vectordb_v3_gpu_residency_tests|"
-                    "vectordb_v3_precision_shard_lifecycle_tests|vectordb_v3_precision_shard_alignment_failures_tests",
+                    "vectordb_v3_precision_shard_lifecycle_tests|vectordb_v3_precision_shard_alignment_failures_tests|"
+                    "vectordb_v3_card5_ingest_async_tests",
                 ]
             ],
         },
@@ -99,7 +100,8 @@ def gate_definitions(build_dir: Path, repo_root: Path) -> dict[str, dict]:
                     "vectordb_v3_top_layer_artifacts_tests|vectordb_v3_mid_layer_artifacts_tests|"
                     "vectordb_v3_lower_layer_gate_artifacts_tests|vectordb_v3_final_layer_artifacts_tests|"
                     "vectordb_v3_final_layer_eligibility_reconciliation_tests|"
-                    "vectordb_v3_precision_shard_lifecycle_tests|vectordb_v3_precision_shard_alignment_failures_tests",
+                    "vectordb_v3_precision_shard_lifecycle_tests|vectordb_v3_precision_shard_alignment_failures_tests|"
+                    "vectordb_v3_card5_ingest_async_tests",
                 ]
             ],
         },

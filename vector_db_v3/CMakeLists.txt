@@ -41,6 +41,7 @@ endif()
 
 set(VECTOR_DB_V3_CORE_SOURCES
     src/vector_store.cpp
+    src/ingest_pipeline.cpp
     src/telemetry.cpp
     src/kmeans_backend_cpu.cpp
     src/cuda/kmeans_runtime.cpp
@@ -287,4 +288,7 @@ if(Python3_Interpreter_FOUND)
             --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
             --events-only
             --out-dir "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/repro_ctest")
+    add_test(
+        NAME vectordb_v3_card5_ingest_async_tests
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_card5_ingest_async.py")
 endif()

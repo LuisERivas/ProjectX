@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -11,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "vector_db_v3/ingest_pipeline.hpp"
 #include "vector_db_v3/vector_store.hpp"
 #include "vector_db_v3/codec/endian.hpp"
 
@@ -85,6 +88,17 @@ bool parse_u32(const std::string& s, std::uint32_t& out) {
     } catch (...) {
         return false;
     }
+}
+
+bool env_truthy(const char* value) {
+    if (value == nullptr) {
+        return false;
+    }
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s == "1" || s == "true" || s == "yes" || s == "on";
 }
 
 std::string trim(const std::string& s) {
@@ -218,83 +232,148 @@ bool parse_jsonl_record(const std::string& line, vector_db_v3::Record& out, std:
     return true;
 }
 
-bool parse_binary_records(
-    const std::string& input_path,
-    std::vector<vector_db_v3::Record>& records,
-    std::string& error) {
-    std::ifstream in(input_path, std::ios::binary);
-    if (!in) {
-        error = "unable to open input binary file";
-        return false;
-    }
+class BinaryRecordStreamReader {
+public:
+    explicit BinaryRecordStreamReader(std::string input_path) : path_(std::move(input_path)) {}
 
-    std::vector<std::uint8_t> header(kBulkInsertBinHeaderBytes, 0U);
-    in.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
-    if (!in || in.gcount() != static_cast<std::streamsize>(header.size())) {
-        error = "binary header too short";
-        return false;
-    }
-
-    const std::uint32_t magic = vector_db_v3::codec::load_le_u32(header.data() + 0U);
-    const std::uint16_t version = vector_db_v3::codec::load_le_u16(header.data() + 4U);
-    const std::uint32_t record_size = vector_db_v3::codec::load_le_u32(header.data() + 6U);
-    const std::uint64_t record_count = vector_db_v3::codec::load_le_u64(header.data() + 10U);
-    if (magic != kBulkInsertBinMagic) {
-        error = "binary header magic mismatch";
-        return false;
-    }
-    if (version != kBulkInsertBinVersion) {
-        error = "binary header version mismatch";
-        return false;
-    }
-    if (record_size != static_cast<std::uint32_t>(kBulkInsertBinRecordBytes)) {
-        error = "binary record size mismatch";
-        return false;
-    }
-
-    std::error_code ec;
-    const auto file_size = std::filesystem::file_size(std::filesystem::path(input_path), ec);
-    if (ec) {
-        error = "unable to inspect binary file size";
-        return false;
-    }
-    if (file_size < kBulkInsertBinHeaderBytes) {
-        error = "binary file size is smaller than header";
-        return false;
-    }
-    const std::uint64_t payload_bytes = static_cast<std::uint64_t>(file_size - kBulkInsertBinHeaderBytes);
-    const std::uint64_t expected_bytes = record_count * static_cast<std::uint64_t>(kBulkInsertBinRecordBytes);
-    if (payload_bytes != expected_bytes) {
-        error = "binary payload size does not match record_count";
-        return false;
-    }
-
-    records.clear();
-    records.reserve(static_cast<std::size_t>(record_count));
-    std::vector<std::uint8_t> row(kBulkInsertBinRecordBytes, 0U);
-    for (std::uint64_t i = 0; i < record_count; ++i) {
-        in.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row.size()));
-        if (!in || in.gcount() != static_cast<std::streamsize>(row.size())) {
-            error = "binary record truncated";
+    bool open(std::string* error) {
+        in_.open(path_, std::ios::binary);
+        if (!in_) {
+            if (error != nullptr) {
+                *error = "unable to open input binary file";
+            }
             return false;
         }
-
-        vector_db_v3::Record rec{};
-        rec.embedding_id = vector_db_v3::codec::load_le_u64(row.data());
-        rec.vector.resize(vector_db_v3::kVectorDim);
-        for (std::size_t d = 0; d < vector_db_v3::kVectorDim; ++d) {
-            rec.vector[d] = vector_db_v3::codec::load_le_f32(row.data() + 8U + d * sizeof(float));
+        std::vector<std::uint8_t> header(kBulkInsertBinHeaderBytes, 0U);
+        in_.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+        if (!in_ || in_.gcount() != static_cast<std::streamsize>(header.size())) {
+            if (error != nullptr) {
+                *error = "binary header too short";
+            }
+            return false;
         }
-        records.push_back(std::move(rec));
+        const std::uint32_t magic = vector_db_v3::codec::load_le_u32(header.data() + 0U);
+        const std::uint16_t version = vector_db_v3::codec::load_le_u16(header.data() + 4U);
+        const std::uint32_t record_size = vector_db_v3::codec::load_le_u32(header.data() + 6U);
+        remaining_ = vector_db_v3::codec::load_le_u64(header.data() + 10U);
+        if (magic != kBulkInsertBinMagic) {
+            if (error != nullptr) {
+                *error = "binary header magic mismatch";
+            }
+            return false;
+        }
+        if (version != kBulkInsertBinVersion) {
+            if (error != nullptr) {
+                *error = "binary header version mismatch";
+            }
+            return false;
+        }
+        if (record_size != static_cast<std::uint32_t>(kBulkInsertBinRecordBytes)) {
+            if (error != nullptr) {
+                *error = "binary record size mismatch";
+            }
+            return false;
+        }
+        std::error_code ec;
+        const auto file_size = std::filesystem::file_size(std::filesystem::path(path_), ec);
+        if (ec) {
+            if (error != nullptr) {
+                *error = "unable to inspect binary file size";
+            }
+            return false;
+        }
+        if (file_size < kBulkInsertBinHeaderBytes) {
+            if (error != nullptr) {
+                *error = "binary file size is smaller than header";
+            }
+            return false;
+        }
+        const std::uint64_t payload_bytes = static_cast<std::uint64_t>(file_size - kBulkInsertBinHeaderBytes);
+        const std::uint64_t expected_bytes = remaining_ * static_cast<std::uint64_t>(kBulkInsertBinRecordBytes);
+        if (payload_bytes != expected_bytes) {
+            if (error != nullptr) {
+                *error = "binary payload size does not match record_count";
+            }
+            return false;
+        }
+        row_.assign(kBulkInsertBinRecordBytes, 0U);
+        opened_ = true;
+        return true;
     }
 
-    char trailing = 0;
-    in.read(&trailing, 1);
-    if (in.gcount() != 0) {
-        error = "binary file has trailing bytes";
-        return false;
+    bool next(vector_db_v3::Record* out, bool* eof, std::string* error) {
+        if (out == nullptr || eof == nullptr) {
+            if (error != nullptr) {
+                *error = "binary reader invalid output pointers";
+            }
+            return false;
+        }
+        if (!opened_) {
+            if (error != nullptr) {
+                *error = "binary reader not open";
+            }
+            return false;
+        }
+        if (remaining_ == 0U) {
+            *eof = true;
+            return true;
+        }
+        in_.read(reinterpret_cast<char*>(row_.data()), static_cast<std::streamsize>(row_.size()));
+        if (!in_ || in_.gcount() != static_cast<std::streamsize>(row_.size())) {
+            if (error != nullptr) {
+                *error = "binary record truncated";
+            }
+            return false;
+        }
+        out->embedding_id = vector_db_v3::codec::load_le_u64(row_.data());
+        out->vector.resize(vector_db_v3::kVectorDim);
+        for (std::size_t d = 0; d < vector_db_v3::kVectorDim; ++d) {
+            out->vector[d] = vector_db_v3::codec::load_le_f32(row_.data() + 8U + d * sizeof(float));
+        }
+        --remaining_;
+        *eof = remaining_ == 0U;
+        if (*eof) {
+            char trailing = 0;
+            in_.read(&trailing, 1);
+            if (in_.gcount() != 0) {
+                if (error != nullptr) {
+                    *error = "binary file has trailing bytes";
+                }
+                return false;
+            }
+        }
+        return true;
     }
-    return true;
+
+private:
+    std::string path_;
+    std::ifstream in_;
+    std::uint64_t remaining_ = 0U;
+    bool opened_ = false;
+    std::vector<std::uint8_t> row_;
+};
+
+vector_db_v3::Status run_ingest_pipeline(
+    vector_db_v3::VectorStore* store,
+    std::uint32_t batch_size,
+    const vector_db_v3::ingest::BatchProducer& producer,
+    std::size_t* inserted_out,
+    std::size_t* batches_out) {
+    if (store == nullptr || inserted_out == nullptr || batches_out == nullptr) {
+        return vector_db_v3::Status::Error("ingest pipeline: invalid outputs");
+    }
+    vector_db_v3::ingest::PipelineOptions opts{};
+    opts.batch_size = batch_size;
+    opts.async_enabled = env_truthy(std::getenv("VECTOR_DB_V3_INGEST_ASYNC_MODE"));
+    opts.request_pinned = env_truthy(std::getenv("VECTOR_DB_V3_INGEST_PINNED"));
+    vector_db_v3::ingest::PipelineStats stats{};
+    const vector_db_v3::Status st = vector_db_v3::ingest::run_pipeline(store, opts, producer, &stats);
+    if (!st.ok) {
+        return st;
+    }
+    *inserted_out = stats.records_committed;
+    *batches_out = stats.batches_committed;
+    return vector_db_v3::Status::Ok();
 }
 
 }  // namespace
@@ -374,39 +453,33 @@ int main(int argc, char** argv) {
         }
         std::size_t inserted = 0;
         std::size_t batches = 0;
-        std::vector<vector_db_v3::Record> chunk;
-        chunk.reserve(batch_size);
-        std::string line;
         std::size_t line_no = 0;
-        while (std::getline(in, line)) {
-            ++line_no;
-            const std::string t = trim(line);
-            if (t.empty()) {
-                continue;
+        auto producer = [&](std::vector<vector_db_v3::Record>* out_batch, bool* eof) -> vector_db_v3::Status {
+            if (out_batch == nullptr || eof == nullptr) {
+                return vector_db_v3::Status::Error("jsonl producer invalid outputs");
             }
-            vector_db_v3::Record rec{};
-            std::string parse_error;
-            if (!parse_jsonl_record(t, rec, parse_error)) {
-                return emit_usage_error(parse_error + " at line " + std::to_string(line_no));
-            }
-            chunk.push_back(std::move(rec));
-            if (chunk.size() >= batch_size) {
-                const auto s = store.insert_batch(chunk);
-                if (!s.ok) {
-                    return emit_runtime_error(s.message);
+            out_batch->clear();
+            out_batch->reserve(batch_size);
+            std::string line;
+            while (out_batch->size() < batch_size && std::getline(in, line)) {
+                ++line_no;
+                const std::string t = trim(line);
+                if (t.empty()) {
+                    continue;
                 }
-                inserted += chunk.size();
-                ++batches;
-                chunk.clear();
+                vector_db_v3::Record rec{};
+                std::string parse_error;
+                if (!parse_jsonl_record(t, rec, parse_error)) {
+                    return vector_db_v3::Status::Error(parse_error + " at line " + std::to_string(line_no), 2);
+                }
+                out_batch->push_back(std::move(rec));
             }
-        }
-        if (!chunk.empty()) {
-            const auto s = store.insert_batch(chunk);
-            if (!s.ok) {
-                return emit_runtime_error(s.message);
-            }
-            inserted += chunk.size();
-            ++batches;
+            *eof = in.eof();
+            return vector_db_v3::Status::Ok();
+        };
+        const auto s = run_ingest_pipeline(&store, batch_size, producer, &inserted, &batches);
+        if (!s.ok) {
+            return s.code == 2 ? emit_usage_error(s.message) : emit_runtime_error(s.message);
         }
         std::cout << "{\"status\":\"ok\",\"command\":\"bulk-insert\",\"inserted\":" << inserted
                   << ",\"batches\":" << batches << "}\n";
@@ -431,35 +504,36 @@ int main(int argc, char** argv) {
             batch_size = tmp;
         }
 
-        std::vector<vector_db_v3::Record> records;
-        std::string parse_error;
-        if (!parse_binary_records(input, records, parse_error)) {
-            return emit_usage_error(parse_error);
-        }
-
         std::size_t inserted = 0;
         std::size_t batches = 0;
-        std::vector<vector_db_v3::Record> chunk;
-        chunk.reserve(batch_size);
-        for (auto& rec : records) {
-            chunk.push_back(std::move(rec));
-            if (chunk.size() >= batch_size) {
-                const auto s = store.insert_batch(chunk);
-                if (!s.ok) {
-                    return emit_runtime_error(s.message);
-                }
-                inserted += chunk.size();
-                ++batches;
-                chunk.clear();
-            }
+        BinaryRecordStreamReader reader(input);
+        std::string reader_error;
+        if (!reader.open(&reader_error)) {
+            return emit_usage_error(reader_error);
         }
-        if (!chunk.empty()) {
-            const auto s = store.insert_batch(chunk);
-            if (!s.ok) {
-                return emit_runtime_error(s.message);
+        auto producer = [&](std::vector<vector_db_v3::Record>* out_batch, bool* eof) -> vector_db_v3::Status {
+            if (out_batch == nullptr || eof == nullptr) {
+                return vector_db_v3::Status::Error("binary producer invalid outputs");
             }
-            inserted += chunk.size();
-            ++batches;
+            out_batch->clear();
+            out_batch->reserve(batch_size);
+            bool reached_eof = false;
+            while (out_batch->size() < batch_size && !reached_eof) {
+                vector_db_v3::Record rec{};
+                std::string parse_error;
+                if (!reader.next(&rec, &reached_eof, &parse_error)) {
+                    return vector_db_v3::Status::Error(parse_error, 2);
+                }
+                if (!reached_eof || !rec.vector.empty()) {
+                    out_batch->push_back(std::move(rec));
+                }
+            }
+            *eof = reached_eof;
+            return vector_db_v3::Status::Ok();
+        };
+        const auto s = run_ingest_pipeline(&store, batch_size, producer, &inserted, &batches);
+        if (!s.ok) {
+            return s.code == 2 ? emit_usage_error(s.message) : emit_runtime_error(s.message);
         }
 
         std::cout << "{\"status\":\"ok\",\"command\":\"bulk-insert-bin\",\"inserted\":" << inserted

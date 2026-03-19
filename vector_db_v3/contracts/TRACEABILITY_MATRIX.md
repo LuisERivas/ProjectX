@@ -21,6 +21,9 @@ Provide requirement-to-contract-to-test mapping for M1 implementation governance
 | Precision consistency by ID-alignment across FP32/FP16/INT8 artifacts (no quant sidecar metadata requirement) | `ARTIFACT_CONTRACT.md`, `BINARY_FORMATS.md`, `TERMINAL_EVENT_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G3, G7 |
 | Internal precision shard lifecycle (FP32 canonical + FP16/INT8 derived) and deterministic repair/fallback behavior | `ARTIFACT_CONTRACT.md`, `BINARY_FORMATS.md`, `TEST_GATE_CONTRACT.md` | G1, G3, G6 |
 | Card 4 validation runner evidence (`run_card4_validation.py`) for targeted correctness + AB checks | `TEST_GATE_CONTRACT.md`, `TRACEABILITY_MATRIX.md` | G1, G3, G4, G5, G6, G7 |
+| Async ingest pipeline parity and streamed binary ingest behavior (`bulk-insert-bin` without full materialization) | `CLI_CONTRACT.md`, `M1_SCOPE_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G1, G3 |
+| Async ingest durability/failure-boundary replay behavior | `M1_SCOPE_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G1, G2, G6 |
+| Card 5 validation runner evidence (`run_card5_validation.py`) for ingest build/test/perf suite | `TEST_GATE_CONTRACT.md`, `TRACEABILITY_MATRIX.md` | G1, G3, G4, G5, G6, G7 |
 | Terminal JSONL lifecycle events | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | Active pipeline terminal reporting and previous-run timing baseline | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | CUDA/Tensor/Ampere compliance | `COMPLIANCE_CONTRACT.md` | G5, G6 |
