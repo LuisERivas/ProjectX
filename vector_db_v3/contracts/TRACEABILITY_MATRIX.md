@@ -24,6 +24,8 @@ Provide requirement-to-contract-to-test mapping for M1 implementation governance
 | Async ingest pipeline parity and streamed binary ingest behavior (`bulk-insert-bin` without full materialization) | `CLI_CONTRACT.md`, `M1_SCOPE_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G1, G3 |
 | Async ingest durability/failure-boundary replay behavior | `M1_SCOPE_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G1, G2, G6 |
 | Card 5 validation runner evidence (`run_card5_validation.py`) for ingest build/test/perf suite | `TEST_GATE_CONTRACT.md`, `TRACEABILITY_MATRIX.md` | G1, G3, G4, G5, G6, G7 |
+| Single-process full pipeline composite command parity against legacy stage-by-stage orchestration | `CLI_CONTRACT.md`, `TERMINAL_EVENT_CONTRACT.md`, `TEST_GATE_CONTRACT.md` | G1, G3, G7 |
+| Card 6 validation runner evidence (`run_card6_validation.py`) for build/test/parity/perf suite | `TEST_GATE_CONTRACT.md`, `TRACEABILITY_MATRIX.md` | G1, G3, G4, G5, G6, G7 |
 | Terminal JSONL lifecycle events | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | Active pipeline terminal reporting and previous-run timing baseline | `TERMINAL_EVENT_CONTRACT.md` | G7 |
 | CUDA/Tensor/Ampere compliance | `COMPLIANCE_CONTRACT.md` | G5, G6 |

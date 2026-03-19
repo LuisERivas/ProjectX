@@ -433,6 +433,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run full Step-4 ordered pipeline stages after dataset generation.",
     )
     parser.add_argument(
+        "--orchestration-mode",
+        choices=["legacy", "composite"],
+        default="legacy",
+        help="Choose legacy multi-process or composite single-process execution path.",
+    )
+    parser.add_argument(
         "--with-search-sanity",
         action="store_true",
         help="Append optional search sanity stage when --run-full-pipeline is enabled.",
@@ -578,6 +584,8 @@ def build_pipeline_stages(
     dataset_path: Path,
     input_format: str,
     batch_size: int,
+    seed: int | None,
+    orchestration_mode: str,
     with_search_sanity: bool,
     with_cluster_stats: bool,
     query_vec_path: Path | None,
@@ -606,6 +614,29 @@ def build_pipeline_stages(
         ]
     else:
         raise ValueError(f"unsupported input format: {input_format}")
+
+    if orchestration_mode == "composite":
+        full_cmd = [
+            str(cli_binary),
+            "run-full-pipeline",
+            "--path",
+            str(data_dir),
+            "--input",
+            str(dataset_path),
+            "--input-format",
+            input_format,
+            "--batch-size",
+            str(batch_size),
+            "--seed",
+            str(seed if seed is not None else 1234),
+        ]
+        if with_search_sanity:
+            if query_vec_path is None:
+                raise ValueError("query vector path is required when with_search_sanity is enabled")
+            full_cmd += ["--with-search-sanity", "true", "--query-vec", str(query_vec_path)]
+        if with_cluster_stats:
+            full_cmd += ["--with-cluster-stats", "true"]
+        return [("run-full-pipeline", full_cmd)]
 
     stages: list[tuple[str, list[str]]] = [
         ("init", [str(cli_binary), "init", "--path", str(data_dir)]),
@@ -796,6 +827,8 @@ def main() -> int:
                     dataset_path=dataset_path,
                     input_format=args.input_format,
                     batch_size=int(args.batch_size),
+                    seed=args.seed,
+                    orchestration_mode=args.orchestration_mode,
                     with_search_sanity=bool(args.with_search_sanity),
                     with_cluster_stats=bool(args.with_cluster_stats),
                     query_vec_path=query_vec_path,
@@ -825,7 +858,7 @@ def main() -> int:
                     )
                     break
                 pipeline_stage_results.append(stage_result_row(stage_name, stage_command, stage_result))
-                if stage_name == "ingest":
+                if stage_name in {"ingest", "run-full-pipeline"}:
                     ingest_stage_result = stage_result
 
         if failure_detail is None:
@@ -855,6 +888,7 @@ def main() -> int:
         "batch_size": int(args.batch_size),
         "input_format": args.input_format,
         "run_full_pipeline": bool(args.run_full_pipeline),
+        "orchestration_mode": args.orchestration_mode,
         "runner_smoke": bool(args.runner_smoke),
         "with_search_sanity": bool(args.with_search_sanity),
         "with_cluster_stats": bool(args.with_cluster_stats),

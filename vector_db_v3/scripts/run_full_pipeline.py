@@ -34,6 +34,8 @@ def main() -> int:
         "--input-format",
         "bin",
         "--run-full-pipeline",
+        "--orchestration-mode",
+        "composite",
     ]
 
     rc = run(configure_cmd, repo_root)

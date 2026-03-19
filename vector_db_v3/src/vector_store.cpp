@@ -2779,12 +2779,20 @@ bool env_truthy(const char* value) {
     return s == "1" || s == "true" || s == "yes" || s == "on";
 }
 
-Status run_stage_with_telemetry(
+struct StageRunSpec {
+    std::string stage_id;
+    std::string stage_name;
+    std::uint32_t seed = 1234;
+};
+
+Status run_stages_with_telemetry(
     const fs::path& data_dir,
-    const std::string& stage_id,
-    const std::string& stage_name,
     const std::map<std::uint64_t, Record>& rows,
-    std::uint32_t seed) {
+    const std::vector<StageRunSpec>& stage_specs,
+    FullPipelineRunStats* stats_out) {
+    if (stage_specs.empty()) {
+        return Status::Error("run_stages_with_telemetry: no stages configured");
+    }
     using steady_clock = std::chrono::steady_clock;
     const auto pipeline_start = steady_clock::now();
     const std::string pipeline_started_ts = telemetry::now_ts();
@@ -2811,9 +2819,9 @@ Status run_stage_with_telemetry(
         return telemetry::monotonic_ms(elapsed, &last_pipeline_elapsed_ms);
     };
 
-    auto stage_prev_extra = [&]() -> std::vector<std::pair<std::string, std::string>> {
+    auto stage_prev_extra = [&](const std::string& current_stage_id) -> std::vector<std::pair<std::string, std::string>> {
         std::vector<std::pair<std::string, std::string>> extra;
-        const auto prev_it = previous_stage_elapsed_ms.find(stage_id);
+        const auto prev_it = previous_stage_elapsed_ms.find(current_stage_id);
         const bool has_prev = previous_run_available && prev_it != previous_stage_elapsed_ms.end();
         extra.push_back({"previous_run_available", has_prev ? "true" : "false"});
         if (has_prev) {
@@ -2840,277 +2848,310 @@ Status run_stage_with_telemetry(
         0.0,
         0.0,
         "running",
-        stage_prev_extra());
+        stage_prev_extra(stage_specs.front().stage_id));
 
-    const auto stage_start_steady = steady_clock::now();
-    const std::string stage_started_ts = telemetry::now_ts();
-    {
-        std::vector<std::pair<std::string, std::string>> extra = stage_prev_extra();
-        extra.push_back({"stage_started_ts", stage_started_ts});
-        extra.push_back({"stage_elapsed_ms", "0.000"});
+    std::size_t stages_completed = 0U;
+    std::size_t stages_failed = 0U;
+    std::size_t stages_skipped = 0U;
+    std::size_t records_processed_total = 0U;
+    std::string failed_stage;
+    Status pipeline_status = Status::Ok();
+
+    for (const auto& stage : stage_specs) {
+        const std::string& stage_id = stage.stage_id;
+        const std::string& stage_name = stage.stage_name;
+        const std::uint32_t seed = stage.seed;
+        const auto stage_start_steady = steady_clock::now();
+        const std::string stage_started_ts = telemetry::now_ts();
+        {
+            std::vector<std::pair<std::string, std::string>> extra = stage_prev_extra(stage_id);
+            extra.push_back({"stage_started_ts", stage_started_ts});
+            extra.push_back({"stage_elapsed_ms", "0.000"});
+            telemetry::emit_event(
+                std::cout,
+                telemetry::EventType::StageStart,
+                stage_id,
+                stage_name,
+                "running",
+                stage_started_ts,
+                std::nullopt,
+                0.0,
+                pipeline_elapsed_now_ms(),
+                "running",
+                extra);
+        }
+
+        const bool force_skip = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_SKIP"));
+        const bool force_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_FAIL"));
+        const bool force_compliance_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_COMPLIANCE_FAIL"));
+        StageCompliance compliance = evaluate_stage_compliance(stage_id);
+        codec::PrecisionShardSelectionInfo default_precision{};
+        default_precision.observed = true;
+        default_precision.source_embedding_artifact = "embeddings_fp32.bin";
+        default_precision.compute_precision = "fp32";
+        default_precision.alignment_check_status = "pass";
+        default_precision.alignment_mismatch_count = 0;
+        default_precision.alignment_failure_reason = "none";
+        default_precision.fallback_reason = "none";
+        set_last_precision_selection(default_precision);
+        std::shared_ptr<kmeans::CudaPipelineContext> pipeline_context;
+        if (stage_id == "top" || stage_id == "mid") {
+            pipeline_context = kmeans::CudaPipelineContext::create_from_env();
+            if (pipeline_context != nullptr) {
+                pipeline_context->reset_stage();
+            }
+        }
+
+        std::vector<std::pair<std::string, std::string>> compliance_extra;
+        append_compliance_fields(&compliance_extra, compliance, true);
+        append_precision_fields(&compliance_extra, last_precision_selection());
         telemetry::emit_event(
             std::cout,
-            telemetry::EventType::StageStart,
+            telemetry::EventType::ComplianceCheck,
             stage_id,
             stage_name,
-            "running",
+            compliance.compliance_status,
             stage_started_ts,
             std::nullopt,
             0.0,
             pipeline_elapsed_now_ms(),
             "running",
-            extra);
-    }
+            compliance_extra);
 
-    const bool force_skip = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_SKIP"));
-    const bool force_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_STAGE_FAIL"));
-    const bool force_compliance_fail = env_truthy(std::getenv("VECTOR_DB_V3_FORCE_COMPLIANCE_FAIL"));
-    StageCompliance compliance = evaluate_stage_compliance(stage_id);
-    codec::PrecisionShardSelectionInfo default_precision{};
-    default_precision.observed = true;
-    default_precision.source_embedding_artifact = "embeddings_fp32.bin";
-    default_precision.compute_precision = "fp32";
-    default_precision.alignment_check_status = "pass";
-    default_precision.alignment_mismatch_count = 0;
-    default_precision.alignment_failure_reason = "none";
-    default_precision.fallback_reason = "none";
-    set_last_precision_selection(default_precision);
-    std::shared_ptr<kmeans::CudaPipelineContext> pipeline_context;
-    if (stage_id == "top" || stage_id == "mid") {
-        pipeline_context = kmeans::CudaPipelineContext::create_from_env();
-        if (pipeline_context != nullptr) {
-            pipeline_context->reset_stage();
-        }
-    }
+        std::string final_status = "completed";
+        telemetry::EventType terminal_event_type = telemetry::EventType::StageEnd;
+        Status stage_status = Status::Ok();
+        std::vector<std::pair<std::string, std::string>> terminal_extra = stage_prev_extra(stage_id);
+        std::size_t records_processed = 0;
+        std::uint32_t chosen_k = 0U;
 
-    std::vector<std::pair<std::string, std::string>> compliance_extra;
-    append_compliance_fields(&compliance_extra, compliance, true);
-    append_precision_fields(&compliance_extra, last_precision_selection());
-    telemetry::emit_event(
-        std::cout,
-        telemetry::EventType::ComplianceCheck,
-        stage_id,
-        stage_name,
-        compliance.compliance_status,
-        stage_started_ts,
-        std::nullopt,
-        0.0,
-        pipeline_elapsed_now_ms(),
-        "running",
-        compliance_extra);
-
-    std::string final_status = "completed";
-    telemetry::EventType terminal_event_type = telemetry::EventType::StageEnd;
-    Status stage_status = Status::Ok();
-    std::vector<std::pair<std::string, std::string>> terminal_extra = stage_prev_extra();
-    std::size_t records_processed = 0;
-    std::uint32_t chosen_k = 0U;
-
-    if (force_skip) {
-        final_status = "skipped";
-        terminal_event_type = telemetry::EventType::StageSkip;
-        append_compliance_fields(&terminal_extra, compliance, false);
-    } else if (force_compliance_fail) {
-        compliance.compliance_status = "fail";
-        compliance.fallback_reason = "forced_compliance_failure";
-        compliance.non_compliance_stage = stage_id;
-        compliance.error_code = "compliance_fail_fast";
-        compliance.error_message = "forced compliance failure";
-        final_status = "failed";
-        terminal_event_type = telemetry::EventType::StageFail;
-        stage_status = Status::Error("forced compliance failure");
-        terminal_extra.push_back({"error_code", compliance.error_code});
-        terminal_extra.push_back({"error_message", compliance.error_message});
-        append_compliance_fields(&terminal_extra, compliance, true);
-    } else if (compliance.compliance_status == "fail") {
-        final_status = "failed";
-        terminal_event_type = telemetry::EventType::StageFail;
-        const std::string reason = compliance.fallback_reason.empty() ? "unknown_reason" : compliance.fallback_reason;
-        stage_status = Status::Error("compliance fail-fast: " + reason);
-        terminal_extra.push_back({"error_code", compliance.error_code.empty() ? "compliance_fail_fast" : compliance.error_code});
-        terminal_extra.push_back({"error_message", compliance.error_message.empty() ? reason : compliance.error_message});
-        append_compliance_fields(&terminal_extra, compliance, true);
-    } else if (force_fail) {
-        final_status = "failed";
-        terminal_event_type = telemetry::EventType::StageFail;
-        stage_status = Status::Error("forced runtime failure");
-        terminal_extra.push_back({"error_code", "runtime_error"});
-        terminal_extra.push_back({"error_message", "forced runtime failure"});
-        append_compliance_fields(&terminal_extra, compliance, false);
-    } else {
-        if (stage_id == "top") {
-            auto emit_step = [&](telemetry::EventType step_type,
-                                 const std::string& step_status,
-                                 const std::vector<std::pair<std::string, std::string>>& extra) {
-                telemetry::emit_event(
-                    std::cout,
-                    step_type,
-                    stage_id,
-                    stage_name,
-                    step_status,
-                    stage_started_ts,
-                    std::nullopt,
-                    0.0,
-                    pipeline_elapsed_now_ms(),
-                    "running",
-                    extra);
-            };
-            stage_status = emit_top_layer_artifacts(
-                data_dir,
-                rows,
-                seed,
-                pipeline_context.get(),
-                emit_step,
-                &chosen_k,
-                &records_processed);
-            if (!stage_status.ok) {
-                final_status = "failed";
-                terminal_event_type = telemetry::EventType::StageFail;
-                terminal_extra.push_back({"error_code", "top_layer_build_failed"});
-                terminal_extra.push_back({"error_message", stage_status.message});
-            }
-        } else if (stage_id == "mid") {
-            auto emit_step = [&](telemetry::EventType step_type,
-                                 const std::string& step_status,
-                                 const std::vector<std::pair<std::string, std::string>>& extra) {
-                telemetry::emit_event(
-                    std::cout,
-                    step_type,
-                    stage_id,
-                    stage_name,
-                    step_status,
-                    stage_started_ts,
-                    std::nullopt,
-                    0.0,
-                    pipeline_elapsed_now_ms(),
-                    "running",
-                    extra);
-            };
-            stage_status = emit_mid_layer_artifacts(
-                data_dir,
-                rows,
-                seed,
-                pipeline_context.get(),
-                emit_step,
-                &chosen_k,
-                &records_processed);
-            if (!stage_status.ok) {
-                final_status = "failed";
-                terminal_event_type = telemetry::EventType::StageFail;
-                terminal_extra.push_back({"error_code", "mid_layer_build_failed"});
-                terminal_extra.push_back({"error_message", stage_status.message});
-            }
-        } else if (stage_id == "lower") {
-            auto emit_step = [&](telemetry::EventType step_type,
-                                 const std::string& step_status,
-                                 const std::vector<std::pair<std::string, std::string>>& extra) {
-                telemetry::emit_event(
-                    std::cout,
-                    step_type,
-                    stage_id,
-                    stage_name,
-                    step_status,
-                    stage_started_ts,
-                    std::nullopt,
-                    0.0,
-                    pipeline_elapsed_now_ms(),
-                    "running",
-                    extra);
-            };
-            stage_status = emit_lower_layer_artifacts(
-                data_dir,
-                rows,
-                seed,
-                emit_step,
-                &chosen_k,
-                &records_processed);
-            if (!stage_status.ok) {
-                final_status = "failed";
-                terminal_event_type = telemetry::EventType::StageFail;
-                terminal_extra.push_back({"error_code", "lower_layer_build_failed"});
-                terminal_extra.push_back({"error_message", stage_status.message});
-            }
-        } else if (stage_id == "final") {
-            auto emit_step = [&](telemetry::EventType step_type,
-                                 const std::string& step_status,
-                                 const std::vector<std::pair<std::string, std::string>>& extra) {
-                telemetry::emit_event(
-                    std::cout,
-                    step_type,
-                    stage_id,
-                    stage_name,
-                    step_status,
-                    stage_started_ts,
-                    std::nullopt,
-                    0.0,
-                    pipeline_elapsed_now_ms(),
-                    "running",
-                    extra);
-            };
-            stage_status = emit_final_layer_artifacts(
-                data_dir,
-                rows,
-                seed,
-                emit_step,
-                &chosen_k,
-                &records_processed);
-            if (!stage_status.ok) {
-                final_status = "failed";
-                terminal_event_type = telemetry::EventType::StageFail;
-                terminal_extra.push_back({"error_code", "final_layer_build_failed"});
-                terminal_extra.push_back({"error_message", stage_status.message});
-            }
-        }
-        apply_runtime_info_to_compliance(stage_id, &compliance);
-        if (!stage_status.ok && compliance.compliance_status != "fail" && tensor_required_for_stage(stage_id) &&
-            !compliance.tensor_core_active) {
+        if (force_skip) {
+            final_status = "skipped";
+            terminal_event_type = telemetry::EventType::StageSkip;
+            append_compliance_fields(&terminal_extra, compliance, false);
+        } else if (force_compliance_fail) {
             compliance.compliance_status = "fail";
-            compliance.error_code = "compliance_fail_fast";
-            if (compliance.fallback_reason.empty()) {
-                compliance.fallback_reason = "tensor_core_required_but_inactive";
-            }
-            compliance.error_message = compliance.fallback_reason;
+            compliance.fallback_reason = "forced_compliance_failure";
             compliance.non_compliance_stage = stage_id;
+            compliance.error_code = "compliance_fail_fast";
+            compliance.error_message = "forced compliance failure";
+            final_status = "failed";
+            terminal_event_type = telemetry::EventType::StageFail;
+            stage_status = Status::Error("forced compliance failure");
+            terminal_extra.push_back({"error_code", compliance.error_code});
+            terminal_extra.push_back({"error_message", compliance.error_message});
+            append_compliance_fields(&terminal_extra, compliance, true);
+        } else if (compliance.compliance_status == "fail") {
+            final_status = "failed";
+            terminal_event_type = telemetry::EventType::StageFail;
+            const std::string reason = compliance.fallback_reason.empty() ? "unknown_reason" : compliance.fallback_reason;
+            stage_status = Status::Error("compliance fail-fast: " + reason);
+            terminal_extra.push_back({"error_code", compliance.error_code.empty() ? "compliance_fail_fast" : compliance.error_code});
+            terminal_extra.push_back({"error_message", compliance.error_message.empty() ? reason : compliance.error_message});
+            append_compliance_fields(&terminal_extra, compliance, true);
+        } else if (force_fail) {
+            final_status = "failed";
+            terminal_event_type = telemetry::EventType::StageFail;
+            stage_status = Status::Error("forced runtime failure");
+            terminal_extra.push_back({"error_code", "runtime_error"});
+            terminal_extra.push_back({"error_message", "forced runtime failure"});
+            append_compliance_fields(&terminal_extra, compliance, false);
+        } else {
+            if (stage_id == "top") {
+                auto emit_step = [&](telemetry::EventType step_type,
+                                     const std::string& step_status,
+                                     const std::vector<std::pair<std::string, std::string>>& extra) {
+                    telemetry::emit_event(
+                        std::cout,
+                        step_type,
+                        stage_id,
+                        stage_name,
+                        step_status,
+                        stage_started_ts,
+                        std::nullopt,
+                        0.0,
+                        pipeline_elapsed_now_ms(),
+                        "running",
+                        extra);
+                };
+                stage_status = emit_top_layer_artifacts(
+                    data_dir,
+                    rows,
+                    seed,
+                    pipeline_context.get(),
+                    emit_step,
+                    &chosen_k,
+                    &records_processed);
+                if (!stage_status.ok) {
+                    final_status = "failed";
+                    terminal_event_type = telemetry::EventType::StageFail;
+                    terminal_extra.push_back({"error_code", "top_layer_build_failed"});
+                    terminal_extra.push_back({"error_message", stage_status.message});
+                }
+            } else if (stage_id == "mid") {
+                auto emit_step = [&](telemetry::EventType step_type,
+                                     const std::string& step_status,
+                                     const std::vector<std::pair<std::string, std::string>>& extra) {
+                    telemetry::emit_event(
+                        std::cout,
+                        step_type,
+                        stage_id,
+                        stage_name,
+                        step_status,
+                        stage_started_ts,
+                        std::nullopt,
+                        0.0,
+                        pipeline_elapsed_now_ms(),
+                        "running",
+                        extra);
+                };
+                stage_status = emit_mid_layer_artifacts(
+                    data_dir,
+                    rows,
+                    seed,
+                    pipeline_context.get(),
+                    emit_step,
+                    &chosen_k,
+                    &records_processed);
+                if (!stage_status.ok) {
+                    final_status = "failed";
+                    terminal_event_type = telemetry::EventType::StageFail;
+                    terminal_extra.push_back({"error_code", "mid_layer_build_failed"});
+                    terminal_extra.push_back({"error_message", stage_status.message});
+                }
+            } else if (stage_id == "lower") {
+                auto emit_step = [&](telemetry::EventType step_type,
+                                     const std::string& step_status,
+                                     const std::vector<std::pair<std::string, std::string>>& extra) {
+                    telemetry::emit_event(
+                        std::cout,
+                        step_type,
+                        stage_id,
+                        stage_name,
+                        step_status,
+                        stage_started_ts,
+                        std::nullopt,
+                        0.0,
+                        pipeline_elapsed_now_ms(),
+                        "running",
+                        extra);
+                };
+                stage_status = emit_lower_layer_artifacts(
+                    data_dir,
+                    rows,
+                    seed,
+                    emit_step,
+                    &chosen_k,
+                    &records_processed);
+                if (!stage_status.ok) {
+                    final_status = "failed";
+                    terminal_event_type = telemetry::EventType::StageFail;
+                    terminal_extra.push_back({"error_code", "lower_layer_build_failed"});
+                    terminal_extra.push_back({"error_message", stage_status.message});
+                }
+            } else if (stage_id == "final") {
+                auto emit_step = [&](telemetry::EventType step_type,
+                                     const std::string& step_status,
+                                     const std::vector<std::pair<std::string, std::string>>& extra) {
+                    telemetry::emit_event(
+                        std::cout,
+                        step_type,
+                        stage_id,
+                        stage_name,
+                        step_status,
+                        stage_started_ts,
+                        std::nullopt,
+                        0.0,
+                        pipeline_elapsed_now_ms(),
+                        "running",
+                        extra);
+                };
+                stage_status = emit_final_layer_artifacts(
+                    data_dir,
+                    rows,
+                    seed,
+                    emit_step,
+                    &chosen_k,
+                    &records_processed);
+                if (!stage_status.ok) {
+                    final_status = "failed";
+                    terminal_event_type = telemetry::EventType::StageFail;
+                    terminal_extra.push_back({"error_code", "final_layer_build_failed"});
+                    terminal_extra.push_back({"error_message", stage_status.message});
+                }
+            } else {
+                stage_status = Status::Error("unsupported stage id: " + stage_id);
+                final_status = "failed";
+                terminal_event_type = telemetry::EventType::StageFail;
+                terminal_extra.push_back({"error_code", "unsupported_stage"});
+                terminal_extra.push_back({"error_message", stage_status.message});
+            }
+            apply_runtime_info_to_compliance(stage_id, &compliance);
+            if (!stage_status.ok && compliance.compliance_status != "fail" && tensor_required_for_stage(stage_id) &&
+                !compliance.tensor_core_active) {
+                compliance.compliance_status = "fail";
+                compliance.error_code = "compliance_fail_fast";
+                if (compliance.fallback_reason.empty()) {
+                    compliance.fallback_reason = "tensor_core_required_but_inactive";
+                }
+                compliance.error_message = compliance.fallback_reason;
+                compliance.non_compliance_stage = stage_id;
+            }
+            terminal_extra.push_back({"records_processed", std::to_string(records_processed)});
+            terminal_extra.push_back({"chosen_k", std::to_string(chosen_k)});
+            append_residency_fields(&terminal_extra, kmeans::last_runtime_info());
+            append_compliance_fields(&terminal_extra, compliance, false);
         }
-        terminal_extra.push_back({"records_processed", std::to_string(records_processed)});
-        terminal_extra.push_back({"chosen_k", std::to_string(chosen_k)});
-        append_residency_fields(&terminal_extra, kmeans::last_runtime_info());
-        append_compliance_fields(&terminal_extra, compliance, false);
-    }
-    append_precision_fields(&terminal_extra, last_precision_selection());
+        append_precision_fields(&terminal_extra, last_precision_selection());
 
-    const auto stage_end_steady = steady_clock::now();
-    const double raw_stage_elapsed_ms =
-        std::chrono::duration<double, std::milli>(stage_end_steady - stage_start_steady).count();
-    const double stage_elapsed_ms = raw_stage_elapsed_ms >= 0.0 && std::isfinite(raw_stage_elapsed_ms) ?
-        raw_stage_elapsed_ms : 0.0;
-    current_stage_elapsed_ms[stage_id] = stage_elapsed_ms;
+        const auto stage_end_steady = steady_clock::now();
+        const double raw_stage_elapsed_ms =
+            std::chrono::duration<double, std::milli>(stage_end_steady - stage_start_steady).count();
+        const double stage_elapsed_ms = raw_stage_elapsed_ms >= 0.0 && std::isfinite(raw_stage_elapsed_ms) ?
+            raw_stage_elapsed_ms : 0.0;
+        current_stage_elapsed_ms[stage_id] = stage_elapsed_ms;
 
-    {
-        std::ostringstream stage_elapsed_os;
-        stage_elapsed_os << std::fixed << std::setprecision(3) << stage_elapsed_ms;
-        terminal_extra.push_back({"stage_started_ts", stage_started_ts});
-        terminal_extra.push_back({"stage_elapsed_ms", stage_elapsed_os.str()});
+        {
+            std::ostringstream stage_elapsed_os;
+            stage_elapsed_os << std::fixed << std::setprecision(3) << stage_elapsed_ms;
+            terminal_extra.push_back({"stage_started_ts", stage_started_ts});
+            terminal_extra.push_back({"stage_elapsed_ms", stage_elapsed_os.str()});
+        }
+        telemetry::emit_event(
+            std::cout,
+            terminal_event_type,
+            stage_id,
+            stage_name,
+            final_status,
+            stage_started_ts,
+            telemetry::now_ts(),
+            stage_elapsed_ms,
+            pipeline_elapsed_now_ms(),
+            final_status,
+            terminal_extra);
+
+        records_processed_total += records_processed;
+        if (terminal_event_type == telemetry::EventType::StageSkip) {
+            stages_skipped += 1U;
+        } else if (stage_status.ok) {
+            stages_completed += 1U;
+        } else {
+            stages_failed += 1U;
+            failed_stage = stage_id;
+            pipeline_status = stage_status;
+            break;
+        }
     }
-    telemetry::emit_event(
-        std::cout,
-        terminal_event_type,
-        stage_id,
-        stage_name,
-        final_status,
-        stage_started_ts,
-        telemetry::now_ts(),
-        stage_elapsed_ms,
-        pipeline_elapsed_now_ms(),
-        final_status,
-        terminal_extra);
 
     std::vector<std::pair<std::string, std::string>> summary_extra = {
-        {"stages_completed", stage_status.ok && !force_skip ? "1" : "0"},
-        {"stages_failed", stage_status.ok ? "0" : "1"},
-        {"stages_skipped", force_skip ? "1" : "0"},
-        {"records_processed_total", std::to_string(records_processed)},
-        {"final_output_status", stage_status.ok ? (force_skip ? "skipped" : "success") : "failed"},
+        {"pipeline_mode", "single_process_composite"},
+        {"stages_planned", std::to_string(stage_specs.size())},
+        {"stages_completed", std::to_string(stages_completed)},
+        {"stages_failed", std::to_string(stages_failed)},
+        {"stages_skipped", std::to_string(stages_skipped)},
+        {"records_processed_total", std::to_string(records_processed_total)},
+        {"failed_stage", failed_stage.empty() ? "none" : failed_stage},
+        {"final_output_status", pipeline_status.ok ? "success" : "failed"},
         {"summary_version", "1"},
     };
     if (!previous_run_available) {
@@ -3124,19 +3165,36 @@ Status run_stage_with_telemetry(
         telemetry::EventType::PipelineSummary,
         "pipeline",
         "Pipeline",
-        stage_status.ok ? "completed" : "failed",
+        pipeline_status.ok ? "completed" : "failed",
         pipeline_started_ts,
         telemetry::now_ts(),
         pipeline_elapsed_now_ms(),
         pipeline_elapsed_now_ms(),
-        stage_status.ok ? "completed" : "failed",
+        pipeline_status.ok ? "completed" : "failed",
         summary_extra);
 
     const Status baseline_write = telemetry::write_stage_baseline(baseline_path, current_stage_elapsed_ms);
-    if (!baseline_write.ok && stage_status.ok) {
+    if (!baseline_write.ok && pipeline_status.ok) {
         return baseline_write;
     }
-    return stage_status;
+    if (stats_out != nullptr) {
+        stats_out->stages_planned = stage_specs.size();
+        stats_out->stages_executed = stages_completed + stages_failed + stages_skipped;
+        stats_out->stages_completed = stages_completed;
+        stats_out->elapsed_ms_total = pipeline_elapsed_now_ms();
+        stats_out->failed_stage = failed_stage;
+    }
+    return pipeline_status;
+}
+
+Status run_stage_with_telemetry(
+    const fs::path& data_dir,
+    const std::string& stage_id,
+    const std::string& stage_name,
+    const std::map<std::uint64_t, Record>& rows,
+    std::uint32_t seed) {
+    std::vector<StageRunSpec> stages = {{stage_id, stage_name, seed}};
+    return run_stages_with_telemetry(data_dir, rows, stages, nullptr);
 }
 
 Status VectorStore::build_top_clusters(std::uint32_t seed) {
@@ -3165,6 +3223,19 @@ Status VectorStore::build_final_layer_clusters(std::uint32_t seed) {
         return Status::Error("store not open");
     }
     return run_stage_with_telemetry(impl_->data_dir, "final", "Final Layer", impl_->rows, seed);
+}
+
+Status VectorStore::run_full_pipeline_clustering(std::uint32_t seed, FullPipelineRunStats* stats_out) {
+    if (!impl_->opened) {
+        return Status::Error("store not open");
+    }
+    const std::vector<StageRunSpec> stages = {
+        {"top", "Top Layer", seed},
+        {"mid", "Mid Layer", seed},
+        {"lower", "Lower Layer", seed},
+        {"final", "Final Layer", seed},
+    };
+    return run_stages_with_telemetry(impl_->data_dir, impl_->rows, stages, stats_out);
 }
 
 }  // namespace vector_db_v3

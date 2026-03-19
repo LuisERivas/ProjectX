@@ -20,6 +20,7 @@ Define stable CLI commands, output behavior, and failure semantics for M1.
 - `build-mid-layer-clusters --path ... [--seed <u32>]`
 - `build-lower-layer-clusters --path ... [--seed <u32>]`
 - `build-final-layer-clusters --path ... [--seed <u32>]`
+- `run-full-pipeline --path ... --input <jsonl_or_bin> --input-format <jsonl|bin> [--batch-size <u32>] [--seed <u32>] [--with-search-sanity <bool> --query-vec <file_or_csv>] [--with-cluster-stats <bool>]`
 - `cluster-stats --path ...`
 - `cluster-health --path ...`
 
@@ -48,6 +49,18 @@ Define stable CLI commands, output behavior, and failure semantics for M1.
 - Existing output keys must not silently change meaning.
 - New keys must be additive.
 - Breaking changes require explicit migration note and version bump.
+
+## Composite Pipeline Command (Card 6 additive)
+
+- `run-full-pipeline` is additive and does not replace existing per-stage commands.
+- It executes: init -> ingest -> top -> mid -> lower -> final in one process.
+- It preserves stage-level telemetry emissions and fail-fast behavior.
+- On success, final command payload remains machine-readable JSON and includes additive summary fields:
+  - `stages_planned`
+  - `stages_executed`
+  - `stages_completed`
+  - `failed_stage` (nullable)
+  - `elapsed_ms_total`
 
 ## Binary Ingest Feed (M1 additive)
 

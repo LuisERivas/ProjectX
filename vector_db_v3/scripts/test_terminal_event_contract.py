@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,45 @@ def assert_exact_lifecycle(events: list[dict], terminal_event: str) -> None:
     expected = ["pipeline_start", "stage_start", terminal_event, "pipeline_summary"]
     if order != expected:
         raise AssertionError(f"unexpected event order: got={order}, expected={expected}")
+
+
+def assert_composite_lifecycle(events: list[dict]) -> None:
+    starts = [e for e in events if e.get("event_type") == "pipeline_start"]
+    summaries = [e for e in events if e.get("event_type") == "pipeline_summary"]
+    if len(starts) != 1 or len(summaries) != 1:
+        raise AssertionError("composite run must emit exactly one pipeline_start and one pipeline_summary")
+    stage_starts = [e for e in events if e.get("event_type") == "stage_start"]
+    order = [str(e.get("stage_id", "")) for e in stage_starts]
+    expected = ["top", "mid", "lower", "final"]
+    if order != expected:
+        raise AssertionError(f"composite stage_start order mismatch: got={order}, expected={expected}")
+    terminal_by_stage: dict[str, int] = {}
+    for event in events:
+        if event.get("event_type") in {"stage_end", "stage_fail", "stage_skip"}:
+            stage_id = str(event.get("stage_id", ""))
+            terminal_by_stage[stage_id] = terminal_by_stage.get(stage_id, 0) + 1
+    for stage_id in expected:
+        if terminal_by_stage.get(stage_id, 0) != 1:
+            raise AssertionError(f"composite lifecycle terminal count mismatch for stage={stage_id}")
+
+
+def write_bulk_bin(path: Path, rows: list[tuple[int, float]]) -> None:
+    dim = 1024
+    record_size = 8 + dim * 4
+    header = bytearray(18)
+    header[0:4] = (0x49423356).to_bytes(4, "little", signed=False)
+    header[4:6] = (1).to_bytes(2, "little", signed=False)
+    header[6:10] = record_size.to_bytes(4, "little", signed=False)
+    header[10:18] = len(rows).to_bytes(8, "little", signed=False)
+    with path.open("wb") as f:
+        f.write(header)
+        for embedding_id, value in rows:
+            row = bytearray(record_size)
+            row[0:8] = int(embedding_id).to_bytes(8, "little", signed=False)
+            packed = struct.pack("<f", float(value))
+            for i in range(dim):
+                row[8 + i * 4 : 12 + i * 4] = packed
+            f.write(row)
 
 
 def assert_compliance_fields(events: list[dict], expect_status: str) -> None:
@@ -380,6 +420,47 @@ def main() -> int:
         return fail(f"final run telemetry contract mismatch: {exc}", out, err)
     if not cmd or cmd.get("status") != "ok":
         return fail("final command JSON missing for successful final build stage", out, err)
+
+    # Composite command success path.
+    composite_dir = Path(tempfile.gettempdir()) / "vectordb_v3_terminal_event_contract_composite"
+    if composite_dir.exists():
+        shutil.rmtree(composite_dir)
+    composite_dir.mkdir(parents=True, exist_ok=True)
+    composite_bin = composite_dir / "bulk.bin"
+    write_bulk_bin(composite_bin, [(10000 + i, 0.0001 * ((i % 17) + 1)) for i in range(192)])
+    code, out, err = run(
+        [
+            str(cli),
+            "run-full-pipeline",
+            "--path",
+            str(composite_dir),
+            "--input",
+            str(composite_bin),
+            "--input-format",
+            "bin",
+            "--batch-size",
+            "64",
+            "--seed",
+            "7",
+        ],
+        root,
+        env=env_pass,
+    )
+    if code != 0:
+        return fail("run-full-pipeline should succeed", out, err)
+    events, cmd = parse_lines(out)
+    try:
+        assert_common_fields(events)
+        assert_monotonic_pipeline_elapsed(events)
+        assert_composite_lifecycle(events)
+        assert_top_stage_sub_events(events)
+        assert_mid_stage_sub_events(events)
+        assert_lower_stage_sub_events(events)
+        assert_final_stage_sub_events(events)
+    except Exception as exc:
+        return fail(f"composite telemetry contract mismatch: {exc}", out, err)
+    if not cmd or cmd.get("status") != "ok" or cmd.get("command") != "run-full-pipeline":
+        return fail("final command JSON missing for composite pipeline", out, err)
 
     # Forced runtime failure path.
     env_fail = dict(os.environ)

@@ -143,6 +143,48 @@ def main() -> int:
     if payload.get("command") != "bulk-insert-bin" or payload.get("inserted") != 2:
         return fail("bulk-insert-bin payload mismatch", out, err)
 
+    pipeline_dir = Path(tempfile.gettempdir()) / "vectordb_v3_cli_contract_pipeline"
+    if pipeline_dir.exists():
+        shutil.rmtree(pipeline_dir)
+    pipeline_dir.mkdir(parents=True, exist_ok=True)
+    pipeline_bin = pipeline_dir / "bulk_pipeline.bin"
+    write_bulk_bin(pipeline_bin, [(1000 + i, 0.0001 * ((i % 31) + 1)) for i in range(256)])
+    code, out, err = run(
+        [
+            str(cli),
+            "run-full-pipeline",
+            "--path",
+            str(pipeline_dir),
+            "--input",
+            str(pipeline_bin),
+            "--input-format",
+            "bin",
+            "--batch-size",
+            "64",
+            "--seed",
+            "7",
+        ],
+        root,
+        env=env_pass,
+    )
+    if code != 0:
+        return fail("run-full-pipeline should succeed", out, err)
+    payload = parse_final_command_json(out)
+    if payload.get("command") != "run-full-pipeline" or payload.get("status") != "ok":
+        return fail("run-full-pipeline payload mismatch", out, err)
+    if payload.get("inserted") != 256 or payload.get("stages_completed") != 4:
+        return fail("run-full-pipeline inserted/stage counts mismatch", out, err)
+
+    code, out, err = run(
+        [str(cli), "run-full-pipeline", "--path", str(pipeline_dir), "--input", str(pipeline_bin)],
+        root,
+        env=env_pass,
+    )
+    if code != 2:
+        return fail("run-full-pipeline missing --input-format should be usage error (2)", out, err)
+    if not err.startswith("error: "):
+        return fail("run-full-pipeline usage stderr format mismatch", out, err)
+
     bad_bin = data_dir / "bulk_bad.bin"
     bad_bin.write_bytes(b"\x00\x00\x00\x00")
     code, out, err = run(

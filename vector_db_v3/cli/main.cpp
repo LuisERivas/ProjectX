@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -63,6 +64,7 @@ void print_usage() {
               << "  build-mid-layer-clusters --path ... [--seed <u32>]\n"
               << "  build-lower-layer-clusters --path ... [--seed <u32>]\n"
               << "  build-final-layer-clusters --path ... [--seed <u32>]\n"
+              << "  run-full-pipeline --path ... --input <jsonl_or_bin> --input-format <jsonl|bin> [--batch-size <u32>] [--seed <u32>]\n"
               << "  cluster-stats --path ...\n"
               << "  cluster-health --path ...\n";
 }
@@ -562,6 +564,152 @@ int main(int argc, char** argv) {
 
         std::cout << "{\"status\":\"ok\",\"command\":\"bulk-insert-bin\",\"inserted\":" << inserted
                   << ",\"batches\":" << batches << "}\n";
+        return 0;
+    }
+
+    if (command == "run-full-pipeline") {
+        const auto input = get_arg(args, "--input");
+        const auto input_format = get_arg(args, "--input-format");
+        const auto batch_size_arg = get_arg(args, "--batch-size");
+        const auto seed_arg = get_arg(args, "--seed");
+        const auto with_search_sanity_arg = get_arg(args, "--with-search-sanity");
+        const auto with_cluster_stats_arg = get_arg(args, "--with-cluster-stats");
+        const auto query_vec_arg = get_arg(args, "--query-vec");
+        if (input.empty()) {
+            return emit_usage_error("run-full-pipeline requires --input <jsonl_or_bin>");
+        }
+        if (input_format != "jsonl" && input_format != "bin") {
+            return emit_usage_error("run-full-pipeline requires --input-format <jsonl|bin>");
+        }
+        std::uint32_t batch_size = 1000;
+        if (!batch_size_arg.empty()) {
+            std::uint32_t tmp = 0;
+            if (!parse_u32(batch_size_arg, tmp) || tmp == 0) {
+                return emit_usage_error("--batch-size must be >= 1");
+            }
+            batch_size = tmp;
+        }
+        std::uint32_t seed = 1234;
+        if (!seed_arg.empty() && !parse_u32(seed_arg, seed)) {
+            return emit_usage_error("--seed must be a valid u32");
+        }
+        const bool with_search_sanity = env_truthy(with_search_sanity_arg.c_str());
+        const bool with_cluster_stats = env_truthy(with_cluster_stats_arg.c_str());
+        if (with_search_sanity && query_vec_arg.empty()) {
+            return emit_usage_error("--with-search-sanity requires --query-vec <file_or_csv>");
+        }
+
+        const auto init_status = store.init();
+        if (!init_status.ok) {
+            return emit_runtime_error(init_status.message);
+        }
+        if (!open_or_fail()) {
+            return 1;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        std::size_t inserted = 0;
+        std::size_t batches = 0;
+        vector_db_v3::Status ingest_status = vector_db_v3::Status::Ok();
+
+        if (input_format == "jsonl") {
+            std::ifstream in(input, std::ios::binary);
+            if (!in) {
+                return emit_usage_error("unable to open input jsonl file");
+            }
+            std::size_t line_no = 0;
+            auto producer = [&](std::vector<vector_db_v3::Record>* out_batch, bool* eof) -> vector_db_v3::Status {
+                if (out_batch == nullptr || eof == nullptr) {
+                    return vector_db_v3::Status::Error("jsonl producer invalid outputs");
+                }
+                out_batch->clear();
+                std::string line;
+                while (out_batch->size() < batch_size && std::getline(in, line)) {
+                    ++line_no;
+                    const std::string t = trim(line);
+                    if (t.empty()) {
+                        continue;
+                    }
+                    vector_db_v3::Record rec{};
+                    std::string parse_error;
+                    if (!parse_jsonl_record(t, rec, parse_error)) {
+                        return vector_db_v3::Status::Error(parse_error + " at line " + std::to_string(line_no), 2);
+                    }
+                    out_batch->push_back(std::move(rec));
+                }
+                *eof = in.eof();
+                return vector_db_v3::Status::Ok();
+            };
+            ingest_status = run_ingest_pipeline(&store, batch_size, producer, &inserted, &batches);
+        } else {
+            BinaryRecordStreamReader reader(input);
+            std::string reader_error;
+            if (!reader.open(&reader_error)) {
+                return emit_usage_error(reader_error);
+            }
+            auto producer = [&](std::vector<vector_db_v3::Record>* out_batch, bool* eof) -> vector_db_v3::Status {
+                if (out_batch == nullptr || eof == nullptr) {
+                    return vector_db_v3::Status::Error("binary producer invalid outputs");
+                }
+                out_batch->clear();
+                bool reached_eof = false;
+                while (out_batch->size() < batch_size && !reached_eof) {
+                    vector_db_v3::Record rec{};
+                    std::string parse_error;
+                    if (!reader.next(&rec, &reached_eof, &parse_error)) {
+                        return vector_db_v3::Status::Error(parse_error, 2);
+                    }
+                    if (!reached_eof || !rec.vector.empty()) {
+                        out_batch->push_back(std::move(rec));
+                    }
+                }
+                *eof = reached_eof;
+                return vector_db_v3::Status::Ok();
+            };
+            ingest_status = run_ingest_pipeline(&store, batch_size, producer, &inserted, &batches);
+        }
+        if (!ingest_status.ok) {
+            return ingest_status.code == 2 ? emit_usage_error(ingest_status.message) : emit_runtime_error(ingest_status.message);
+        }
+
+        vector_db_v3::FullPipelineRunStats pipeline_stats{};
+        const auto pipeline_status = store.run_full_pipeline_clustering(seed, &pipeline_stats);
+        if (!pipeline_status.ok) {
+            return emit_runtime_error(pipeline_status.message);
+        }
+
+        std::vector<float> query;
+        if (with_search_sanity) {
+            std::string parse_error;
+            if (!parse_vec_arg_1024(query_vec_arg, query, parse_error)) {
+                return emit_usage_error(parse_error);
+            }
+            const auto sanity = store.search_exact(query, 5U);
+            if (sanity.empty()) {
+                return emit_runtime_error("search sanity query returned no results");
+            }
+        }
+
+        const auto elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        std::cout << "{\"status\":\"ok\",\"command\":\"run-full-pipeline\""
+                  << ",\"inserted\":" << inserted
+                  << ",\"batches\":" << batches
+                  << ",\"seed\":" << seed
+                  << ",\"stages_planned\":" << pipeline_stats.stages_planned
+                  << ",\"stages_executed\":" << pipeline_stats.stages_executed
+                  << ",\"stages_completed\":" << pipeline_stats.stages_completed
+                  << ",\"failed_stage\":" << (pipeline_stats.failed_stage.empty() ? "null" : ("\"" + json_escape(pipeline_stats.failed_stage) + "\""))
+                  << ",\"elapsed_ms_total\":" << std::fixed << std::setprecision(3) << elapsed_ms;
+        if (with_search_sanity) {
+            std::cout << ",\"search_sanity\":\"ok\"";
+        }
+        if (with_cluster_stats) {
+            const auto st = store.cluster_stats();
+            std::cout << ",\"cluster_stats_snapshot\":{\"available\":" << (st.available ? "true" : "false")
+                      << ",\"vectors_indexed\":" << st.vectors_indexed
+                      << ",\"chosen_k\":" << st.chosen_k << "}";
+        }
+        std::cout << "}\n";
         return 0;
     }
 

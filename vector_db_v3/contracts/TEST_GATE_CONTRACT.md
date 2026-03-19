@@ -29,6 +29,7 @@ Define mandatory automated gates for M1 readiness.
 - `id_estimate.bin` decoding/validation (record size, bounds invariants, non-zero values).
 - End-of-pipeline `k_search_bounds_batch.bin` validation (row count, sort order, per-level semantics, bounds invariants).
 - End-of-pipeline `post_cluster_membership.bin` validation (record count equals live embeddings, sorted/unique IDs, per-level ID mapping resolvability).
+- Single-process composite full pipeline parity versus legacy stage-by-stage orchestration (same stage order, deterministic fail propagation, and equivalent final manifests/cluster stats).
 - Per-cluster final artifact reconciliation with aggregate summary.
 - CUDA critical-path best-practice compliance validation (parallelized critical path, minimized host-device transfers, launch configuration/utilization checks, coalesced global-memory access checks, redundant global-access reduction checks, divergence-aware kernel checks).
 - Precision artifact ID-alignment validation (duplicate ID rejection, sorted-order validation, cardinality match across FP32/FP16/INT8 variants, exact ID-membership match across variants).

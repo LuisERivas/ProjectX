@@ -291,4 +291,11 @@ if(Python3_Interpreter_FOUND)
     add_test(
         NAME vectordb_v3_card5_ingest_async_tests
         COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_card5_ingest_async.py")
+    add_test(
+        NAME vectordb_v3_card6_single_process_tests
+        COMMAND
+            ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_card6_single_process_pipeline.py"
+            --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+            --report-out "${CMAKE_CURRENT_BINARY_DIR}/gate_evidence/card6_ctest/parity_report.json")
 endif()

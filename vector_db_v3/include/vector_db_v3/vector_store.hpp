@@ -66,6 +66,14 @@ struct ClusterHealth {
     double mean_centroid_drift = 0.0;
 };
 
+struct FullPipelineRunStats {
+    std::size_t stages_planned = 0;
+    std::size_t stages_executed = 0;
+    std::size_t stages_completed = 0;
+    double elapsed_ms_total = 0.0;
+    std::string failed_stage;
+};
+
 class VectorStore {
 public:
     explicit VectorStore(std::string data_dir);
@@ -93,6 +101,7 @@ public:
     Status build_mid_layer_clusters(std::uint32_t seed = 1234);
     Status build_lower_layer_clusters(std::uint32_t seed = 1234);
     Status build_final_layer_clusters(std::uint32_t seed = 1234);
+    Status run_full_pipeline_clustering(std::uint32_t seed, FullPipelineRunStats* stats_out);
 
 private:
     struct Impl;
