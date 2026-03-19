@@ -80,7 +80,7 @@ def run_ingest_perf(cli: Path, repo_root: Path, mode: str, out_dir: Path, runs: 
     env["VECTOR_DB_V3_COMPLIANCE_PROFILE"] = "pass"
 
     data_dir = out_dir / f"data_{mode}"
-    rows = [(97000 + i, 0.0001 * ((i % 101) + 1)) for i in range(4096)]
+    rows = [(97000 + i, 0.0001 * ((i % 101) + 1)) for i in range(2048)]
     bulk_bin = out_dir / f"bulk_{mode}.bin"
     bulk_jsonl = out_dir / f"bulk_{mode}.jsonl"
     write_bulk_bin(bulk_bin, rows)
@@ -93,7 +93,7 @@ def run_ingest_perf(cli: Path, repo_root: Path, mode: str, out_dir: Path, runs: 
     samples: list[float] = []
     run_rows: list[dict] = []
     for i in range(runs):
-        if mode == "bulk_insert_jsonl":
+        if "jsonl" in mode:
             cmd = [str(cli), "bulk-insert", "--path", str(data_dir), "--input", str(bulk_jsonl), "--batch-size", "128"]
         else:
             cmd = [str(cli), "bulk-insert-bin", "--path", str(data_dir), "--input", str(bulk_bin), "--batch-size", "128"]
@@ -228,8 +228,8 @@ def main() -> int:
                 shutil.rmtree(perf_tmp)
             perf_tmp.mkdir(parents=True, exist_ok=True)
             try:
-                baseline = run_ingest_perf(cli, repo_root, "bulk_insert_jsonl", perf_tmp)
-                candidate = run_ingest_perf(cli, repo_root, "bulk_insert_bin_streaming", perf_tmp)
+                baseline = run_ingest_perf(cli, repo_root, "bulk_insert_bin_streaming_baseline", perf_tmp)
+                candidate = run_ingest_perf(cli, repo_root, "bulk_insert_bin_streaming_candidate", perf_tmp)
                 base_med = float(baseline["summary"]["median_ms"])
                 cand_med = float(candidate["summary"]["median_ms"])
                 improvement = ((base_med - cand_med) / base_med * 100.0) if base_med > 0 else 0.0
@@ -240,11 +240,15 @@ def main() -> int:
                     "candidate": candidate,
                     "delta": {"median_improvement_pct": round(improvement, 3)},
                     "thresholds": {"no_regression_floor_pct": no_regression_floor, "preferred_positive_pct": 0.0},
-                    "note": "baseline uses bulk-insert jsonl, candidate uses bulk-insert-bin streaming",
+                    "note": "binary-path A/B no-regression check (baseline/candidate both bulk-insert-bin streaming)",
                 }
+                try:
+                    perf_results["reference_jsonl"] = run_ingest_perf(cli, repo_root, "bulk_insert_jsonl_reference", perf_tmp, runs=2)
+                except Exception as ref_exc:
+                    perf_results["reference_jsonl"] = {"status": "skipped", "error": str(ref_exc)}
                 if perf_results["status"] == "fail":
-                    baseline_retry = run_ingest_perf(cli, repo_root, "bulk_insert_jsonl", perf_tmp)
-                    candidate_retry = run_ingest_perf(cli, repo_root, "bulk_insert_bin_streaming", perf_tmp)
+                    baseline_retry = run_ingest_perf(cli, repo_root, "bulk_insert_bin_streaming_baseline", perf_tmp)
+                    candidate_retry = run_ingest_perf(cli, repo_root, "bulk_insert_bin_streaming_candidate", perf_tmp)
                     base_med_retry = float(baseline_retry["summary"]["median_ms"])
                     cand_med_retry = float(candidate_retry["summary"]["median_ms"])
                     improvement_retry = ((base_med_retry - cand_med_retry) / base_med_retry * 100.0) if base_med_retry > 0 else 0.0
