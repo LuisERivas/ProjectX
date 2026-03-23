@@ -1,1 +1,4 @@
 .aider*
+
+# Local Jetson env reports (Step 2)
+embeddingCreation/jetson_env_report.json

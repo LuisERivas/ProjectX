@@ -1,0 +1,199 @@
+================================================================================
+ProjectX — Sentence embedding binary format (Step 1 contract)
+================================================================================
+
+Purpose
+-------
+Single source of truth for the binary file produced by the local ingestion
+pipeline (voyage-4-nano, Sentence Transformers, ICU sentence split). All
+writers and readers must match this spec.
+
+This format is independent of vector_db_v3 binary artifacts; see
+vector_db_v3/contracts/BINARY_FORMATS.md for that stack.
+
+Global rules
+------------
+- Endianness: little-endian for all multi-byte integers and for IEEE-754
+  binary16 (float16) scalars in records.
+- The file has **no header**: it is a contiguous sequence of fixed-width
+  records from byte 0 to EOF.
+- No padding between records.
+- Embedding geometry is fixed: each record contains exactly 2048 float16
+  (binary16) values after the id.
+
+
+================================================================================
+1. FILE LAYOUT
+================================================================================
+
+  file = record[0] || record[1] || ... || record[N-1]
+
+- **Empty file (N = 0):** 0 bytes (valid if the writer allows no sentences).
+- **Record index k** (0-based) starts at file offset **k * 4100**.
+
+
+================================================================================
+2. RECORD LAYOUT (fixed width per record: 4100 bytes)
+================================================================================
+
+Field        Type              Size        Notes
+-----        ----              ----        -----
+id           u32               4 bytes     Per-sentence id (see ID policy).
+embedding    float16[2048]     4096 bytes  2048 dimensions in IEEE binary16;
+                                        L2-normalized then float16; index 0..2047.
+
+Record size derivation
+----------------------
+  4 + (2048 * 2) = 4 + 4096 = 4100 bytes per record.
+
+Dimension and dtype (normative)
+-------------------------------
+- **Dimension:** 2048 components per embedding, fixed by this format.
+- **Scalar type:** IEEE-754 binary16 (float16), little-endian per component.
+- Geometry is implicit from this specification (nothing is prefixed on the file).
+
+
+================================================================================
+3. PIPELINE / INGEST CONTRACT (component boundaries)
+================================================================================
+
+Sentence input
+--------------
+- Type: Python str (text decoded as UTF-8 from source files).
+- After segmentation: strip surrounding whitespace per sentence.
+- Empty strings after strip are omitted and do not receive an id or record.
+
+Batch input to embedder
+-----------------------
+- Type: list[str], ordered sequence of non-empty sentences.
+- Batch size is configurable elsewhere (Step 6); contract only requires that
+  order is preserved: batch output row k corresponds to input sentence k
+  within that batch.
+
+Embedding output (logical, before binary write)
+-----------------------------------------------
+- One vector per sentence, length **2048** (same as record payload width).
+- L2 normalization is applied (high-precision compute, e.g. float32 after
+  model output) before casting each component to float16 for storage.
+
+Sentence Transformers contract (reference for later steps)
+---------------------------------------------------------
+- Use plain encode(...) only (not encode_query / encode_document).
+- normalize_embeddings=True for every encode call.
+
+
+================================================================================
+4. FILE DISCOVERY POLICY
+================================================================================
+
+Default: non-recursive — only entries in the configured top-level directory
+are considered (no descent into subdirectories).
+
+Optional future behavior: a pipeline configuration flag `recursive: bool`
+(default false). When true, implementations may include files in nested
+directories; exact filtering rules remain defined in Step 5.
+
+
+================================================================================
+5. ID POLICY
+================================================================================
+
+Per-record id (in each record’s first four bytes):
+- Type: uint32 (u32), little-endian.
+- First assigned id: 0.
+- Increment: add 1 for each stored sentence (after empty-sentence drops),
+  monotonically increasing within a single pipeline run.
+- Uniqueness: ids must be unique for all records written in one output file
+  for that run.
+- Overflow: if the next id would exceed 2^32 - 1, the implementation must
+  fail with an explicit error (no wrap).
+
+
+================================================================================
+6. FILE SIZE
+================================================================================
+
+Let N = number of records.
+
+  file_bytes = N * 4100
+
+Examples:
+- N = 0  -> 0 bytes.
+- N = 1  -> 4100 bytes.
+- N = 2  -> 8200 bytes.
+
+Readers may validate: **file size modulo 4100 == 0** (for non-empty files,
+or including empty file as a special case).
+
+
+================================================================================
+7. RELATIONSHIP TO vector_db_v3
+================================================================================
+
+vector_db_v3 uses separate binary layouts (see BINARY_FORMATS.md). This
+embedding file format is not required to match those layouts; any import
+into vector_db_v3 would be a separate adapter step unless a future contract
+links them explicitly.
+
+
+================================================================================
+8. OPERATIONAL NOTE (non-normative for Step 1)
+================================================================================
+
+For production writers, a temp-file write followed by atomic rename is
+recommended (Step 9); not required for format validity.
+
+
+================================================================================
+APPENDIX A — Step 1 tests: manual size checks
+================================================================================
+
+A.1 Record size
+---------------
+  id:           4 bytes
+  embedding:    2048 float16 = 4096 bytes
+  Total:        4100 bytes per record.
+
+A.2 File size formula
+---------------------
+  file_bytes = N * 4100
+
+
+================================================================================
+APPENDIX B — Hex example: two fake records (no file header)
+================================================================================
+
+IEEE binary16 reference:
+  0.0  -> 0x0000  (bytes 00 00 in little-endian)
+  1.0  -> 0x3C00  (bytes 00 3C in little-endian)
+
+B.1 Record 0 (id = 0, first component 1.0, rest 0.0) at file offset 0
+----------------------------------------------------------------------
+  id u32 0:                    00 00 00 00
+  embedding[0] = 1.0:          00 3C
+  embedding[1] = 0.0:          00 00
+  ... (2046 more half zeros)   (00 00 repeated)
+
+First 24 bytes of file (start of record 0):
+  00 00 00 00 00 3C 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  |-- id=0 --| |1.0| |----- eight zeros (float16) -----|
+
+B.2 Record 1 (id = 1, first component 0.0, second 1.0, rest 0.0) at offset 4100
+-------------------------------------------------------------------------------
+  id u32 1:                    01 00 00 00
+  embedding[0] = 0.0:          00 00
+  embedding[1] = 1.0:          00 3C
+  embedding[2..2047] = 0.0:    00 00 each
+
+First 24 bytes of record 1 (file offset 4100):
+  01 00 00 00 00 00 00 3C 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  |-- id=1 --| |0.0| |1.0| |----- seven zeros -----|
+
+B.3 File layout summary for N = 2
+-----------------------------------
+  Bytes 0..4099     : record 0 (4100 bytes; B.1 shows start)
+  Bytes 4100..8199  : record 1 (4100 bytes; B.2 shows start)
+
+  Total file size: 2 * 4100 = 8200 bytes.
+
+================================================================================

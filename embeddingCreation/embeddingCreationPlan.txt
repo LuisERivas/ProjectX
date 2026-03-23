@@ -1,0 +1,355 @@
+Project Goal:
+Build a local ingestion pipeline that:
+- reads multiple text files
+- splits text into sentences with ICU
+- batches sentences
+- generates normalized 2048-dim embeddings with local voyage-4-nano using sentence-transformers plain encode(...)
+- stores each embedding as float16
+- writes records to a binary file as: uint32 id + 2048 fp16 embedding
+- keeps the model loaded until explicit shutdown
+
+Step 1: Define the binary file format and pipeline contract
+Goal:
+Lock the file format and component boundaries before implementation.
+
+Tasks:
+- Define the file layout: no header; contiguous fixed-width records only.
+- Define the fixed-width record layout (dimension implicit in spec):
+  - uint32 per-sentence id
+  - 2048 float16 values per embedding
+- Define endianness explicitly.
+- Define the ingest contract between components:
+  - sentence input format
+  - batch input format
+  - embedding output format
+- Define whether file traversal is recursive or non-recursive.
+- Define the starting ID value and increment policy.
+
+Tests:
+- Write a small format spec example with 2 fake records.
+- Manually calculate the expected byte size of one record.
+- Manually calculate the expected file size for N records (N * record size).
+
+Expected Results:
+- A stable binary format spec exists before coding begins.
+- One record size is known exactly: 4100 bytes.
+- All later code can be validated against this spec.
+
+Step 2: Set up the Jetson runtime for local model inference
+Goal:
+Prepare the Orin Nano environment so local voyage-4-nano embeddings can run on CUDA.
+
+Tasks:
+- Add a read-only prerequisite check script that confirms everything needed for the
+  pipeline is on the system (JetPack, Python, CUDA/torch, required packages,
+  voyage-4-nano loadability); write results to JSON and print to the terminal.
+  It must not install or upgrade packages.
+- Add a second script that reads that JSON and runs only when something is missing:
+  pip-install only what failed the check (where safe); print manual remediation
+  (e.g. Jetson PyTorch wheel) when automatic install is not appropriate; no-op if
+  the report is already all green.
+- If the check still fails after pip remediation, install Jetson-compatible PyTorch
+  for JetPack 6.2.1 per NVIDIA docs (system Python), then re-run the check.
+- If needed, install transformers, sentence-transformers, safetensors,
+  huggingface_hub via the second script or re-check loop—not before the first check.
+- Confirm the Hugging Face model can be downloaded or loaded locally.
+- Confirm CUDA is available to PyTorch.
+- Confirm the model can be constructed with:
+  - trust_remote_code=True
+  - attn_implementation="sdpa"
+  - torch_dtype=bfloat16 preferred
+
+Tests:
+- Run the prerequisite check script first; confirm JSON and terminal output; if
+  already all green, confirm the install script no-ops.
+- If anything failed, run the install-from-report script, then re-run the check until
+  gaps are closed.
+- Run a Python smoke test that imports torch and sentence_transformers.
+- Check torch.cuda.is_available().
+- Load voyage-4-nano once and print the resolved device.
+- Print the model’s sentence embedding dimension if exposed.
+
+Expected Results:
+- PyTorch sees CUDA successfully.
+- voyage-4-nano loads without crashing.
+- The runtime is capable of local embedding generation on the Jetson.
+
+Step 3: Build the model-hosting embedding service/process
+Goal:
+Create the long-lived embedding runtime that loads the model once and keeps it resident.
+
+Tasks:
+- Implement a Python embedding worker process.
+- Load SentenceTransformer once at startup.
+- Keep the model alive until explicit shutdown.
+- Expose a simple interface for:
+  - init
+  - encode batch
+  - shutdown
+- Use plain encode(...), not encode_document(...) or encode_query(...).
+- Enable normalize_embeddings=True for every encode operation.
+- Ensure output embeddings are converted to float16 only after normalization.
+
+Tests:
+- Start the embedding worker and keep it idle for a short period.
+- Send one test sentence and verify one embedding comes back.
+- Send two batches in sequence and confirm the model is not reloaded.
+- Send an explicit shutdown command and confirm the process exits cleanly.
+
+Expected Results:
+- The model is loaded exactly once.
+- The same process can embed multiple batches without reinitializing.
+- Shutdown is explicit and clean.
+
+Step 4: Implement sentence splitting with ICU
+Goal:
+Create robust sentence segmentation using ICU instead of regex-based splitting.
+
+Tasks:
+- Implement ICU-based sentence boundary detection in the ingestion side.
+- Trim whitespace from each resulting sentence.
+- Drop empty sentences.
+- Preserve sentence order exactly as found in the source file.
+- Decide how to handle very short fragments and whitespace-only outputs.
+
+Tests:
+- Feed in normal prose with periods, question marks, and exclamation marks.
+- Feed in text with abbreviations like "Dr." and "Mr.".
+- Feed in multiline text with blank lines.
+- Feed in multilingual or punctuation-heavy examples if relevant to your corpus.
+
+Expected Results:
+- Sentence boundaries are materially better than naive period splitting.
+- Empty outputs are removed.
+- Sentence order remains stable and deterministic.
+
+Step 5: Build text file discovery and reading
+Goal:
+Create the file ingestion layer that discovers and reads source documents safely.
+
+Tasks:
+- Implement folder traversal.
+- Filter for text file types you intend to support.
+- Open and read files as text.
+- Normalize line endings before sentence splitting.
+- Skip unreadable or empty files with clear logging.
+- Decide whether traversal is recursive.
+
+Tests:
+- Run on a folder with multiple valid text files.
+- Include an empty file.
+- Include a non-text file or malformed file.
+- Include nested folders if recursion is enabled.
+
+Expected Results:
+- Valid text files are discovered and read.
+- Empty and unreadable files do not crash the pipeline.
+- The ingest set is deterministic and understandable from logs.
+
+Step 6: Add batching logic for sentence encoding
+Goal:
+Batch sentences before embedding to improve throughput while preserving one-output-per-sentence behavior.
+
+Tasks:
+- Implement a batch builder that accumulates sentences up to a configurable batch size.
+- Preserve the mapping between each sentence and its assigned uint32 ID.
+- Flush the last partial batch at end of file processing.
+- Make batch size configurable.
+- Start with a conservative default appropriate for Jetson, such as 4 or 8.
+
+Tests:
+- Run with batch size 1.
+- Run with batch size 4.
+- Run with a corpus whose total sentence count is not divisible by the batch size.
+- Verify that IDs still line up correctly with returned embeddings.
+
+Expected Results:
+- The pipeline supports both single-sentence and batched operation.
+- No sentence is dropped or duplicated.
+- Final partial batches are processed correctly.
+
+Step 7: Validate embedding properties
+Goal:
+Ensure the embedding outputs match the required shape, normalization, and storage type.
+
+Tasks:
+- For each batch result, verify the embedding count matches the sentence count.
+- Verify each embedding is 2048 dimensions.
+- Verify normalization is enabled.
+- Verify embeddings are converted to float16 only after normalization.
+- Decide and document acceptable tolerance for norm checks after fp16 conversion.
+
+Tests:
+- Check the shape of a single returned embedding.
+- Check the shape of a batch result.
+- Measure vector L2 norm before conversion to float16.
+- Measure vector L2 norm after conversion to float16 and verify it stays near 1.0 within a reasonable tolerance.
+
+Expected Results:
+- Every embedding is 2048-dimensional.
+- Normalization is consistently applied.
+- Stored vectors are fp16 and approximately unit-length.
+
+Step 8: Implement uint32 ID generation
+Goal:
+Create a simple, reliable ID system with no sidecar manifest.
+
+Tasks:
+- Use a monotonically increasing uint32 counter.
+- Increment once per stored sentence.
+- Detect and fail if the counter would exceed uint32 max.
+- Keep the ID generation deterministic within a single run.
+
+Tests:
+- Generate IDs for a small batch and verify they increase sequentially.
+- Run across multiple files and verify IDs remain unique.
+- Simulate a near-overflow condition if practical.
+
+Expected Results:
+- Every stored sentence gets a unique uint32 ID.
+- IDs are simple, compact, and fast to generate.
+- Overflow is guarded against explicitly.
+
+Step 9: Implement the binary writer
+Goal:
+Write the final normalized fp16 embeddings and uint32 IDs into the binary output format.
+
+Tasks:
+- Open the output file and append one fixed-width record per embedding (no
+  separate header).
+- Write the uint32 ID first, then the 2048 fp16 values.
+- Ensure byte order matches the format spec.
+- Flush and close cleanly.
+
+Tests:
+- Write a tiny file with 1 record.
+- Write a tiny file with 3 records.
+- Verify file size matches: record_count * 4100
+- Hex-inspect the first bytes to confirm record 0 (id + start of embedding).
+
+Expected Results:
+- The binary file matches the declared format exactly.
+- Record count and file size line up.
+- The file is readable by a future reader implementation.
+
+Step 10: Build a binary reader/verifier utility
+Goal:
+Create a simple validation tool that reads the binary back and proves the format is correct.
+
+Tasks:
+- Implement a reader that opens the file.
+- Validate file size is a multiple of 4100 bytes (and matches expected count).
+- Read records sequentially.
+- Reconstruct uint32 IDs and 2048-value fp16 vectors.
+- Optionally upcast vectors to float32 for verification.
+
+Tests:
+- Read back a file written by the writer.
+- Verify the number of records matches expectation.
+- Verify the first and last IDs.
+- Verify each embedding length is 2048.
+- Verify norms remain near unit length after reading back.
+
+Expected Results:
+- Written files can be read back with no ambiguity.
+- IDs and embeddings survive round-trip serialization.
+- The file format is proven correct before large-scale ingestion.
+
+Step 11: Integrate the full ingestion pipeline end to end
+Goal:
+Connect file discovery, ICU sentence splitting, batching, embedding generation, and binary writing into one flow.
+
+Tasks:
+- Wire file reader to ICU splitter.
+- Wire sentence stream to batch builder.
+- Wire batch builder to the embedding worker.
+- Wire embedding results to the binary writer.
+- Keep the model process alive throughout the full run.
+- Add logging for:
+  - files processed
+  - sentences produced
+  - batches encoded
+  - records written
+
+Tests:
+- Run on a small folder with 2–5 sample text files.
+- Confirm the total sentences split equals the total records written.
+- Confirm the output binary is readable by the verifier.
+- Confirm the model loads once at startup and unloads once at shutdown.
+
+Expected Results:
+- The complete pipeline works from folder to final binary.
+- Sentence count, embedding count, and record count all match.
+- No component needs manual intervention during a normal run.
+
+Step 12: Performance tuning on Jetson
+Goal:
+Tune for stable throughput on the Orin Nano without breaking correctness.
+
+Tasks:
+- Benchmark different batch sizes such as 1, 4, 8, and 16 if memory allows.
+- Monitor RAM and GPU behavior during long runs.
+- Confirm sdpa is used and the model stays on CUDA.
+- Compare bfloat16 versus float16 internal compute if necessary.
+- Choose a default batch size that is stable on your device.
+
+Tests:
+- Run the same sample corpus with several batch sizes.
+- Record throughput in sentences/sec.
+- Record whether any configuration causes OOM or instability.
+- Verify output correctness remains unchanged across tested batch sizes.
+
+Expected Results:
+- A stable production batch size is selected.
+- The Jetson uses GPU-backed inference successfully.
+- Performance tuning does not change embedding shape or file format.
+
+Step 13: Add failure recovery and operational safeguards
+Goal:
+Make the ingestion pipeline safe to run on larger corpora.
+
+Tasks:
+- Add clear startup validation.
+- Add graceful handling for bad files.
+- Add explicit failure messages for model load failure, dimension mismatch, and binary write failure.
+- Decide whether partial outputs are allowed or if the run should abort on first hard error.
+- Add clean shutdown logic for the model process.
+
+Tests:
+- Force a bad input file.
+- Force an invalid model path or model load failure.
+- Force a write failure if practical.
+- Verify the pipeline shuts down cleanly and does not leave the model process hanging.
+
+Expected Results:
+- Failure modes are predictable.
+- Errors are visible and actionable.
+- The system can be trusted on non-trivial corpora.
+
+Step 14: Create a final acceptance test
+Goal:
+Prove the system meets the exact final requirements.
+
+Tasks:
+- Prepare a small known test corpus.
+- Run the full ingestion pipeline from start to finish.
+- Verify:
+  - local voyage-4-nano is used
+  - sentence-transformers plain encode(...) is used
+  - ICU is used for sentence splitting
+  - embeddings are normalized
+  - embeddings are 2048 dimensions
+  - embeddings are stored as fp16
+  - IDs are uint32
+  - records are written to the binary
+  - model is loaded once and shut down explicitly
+
+Tests:
+- Acceptance run on the known corpus.
+- Binary round-trip verification.
+- Norm and dimension spot checks on random records.
+- Log inspection to confirm single model load and explicit shutdown.
+
+Expected Results:
+- All final design requirements are satisfied simultaneously.
+- The pipeline is ready for real document ingestion.
