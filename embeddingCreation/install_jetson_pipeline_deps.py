@@ -66,7 +66,18 @@ def _needs_numpy_pin(report: dict) -> bool:
 def _needs_scipy_stack(report: dict) -> bool:
     st = (report.get("packages") or {}).get("sentence_transformers") or {}
     err = (st.get("error") or "") + str(st.get("message") or "")
-    if any(x in err for x in ("_ARRAY_API", "multiarray", "scipy", "sklearn", "numpy.core")):
+    if any(
+        x in err
+        for x in (
+            "_ARRAY_API",
+            "multiarray",
+            "scipy",
+            "sklearn",
+            "numpy.core",
+            "dtype size changed",
+            "binary incompatibility",
+        )
+    ):
         return True
     return bool(st.get("ok") is False and _needs_numpy_pin(report))
 

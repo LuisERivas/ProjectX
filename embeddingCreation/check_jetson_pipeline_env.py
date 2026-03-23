@@ -310,7 +310,8 @@ def _environment_warnings(
             if major >= 2:
                 warnings.append(
                     "NumPy 2.x with Debian/apt SciPy in /usr/lib/python3/dist-packages often breaks "
-                    "sentence_transformers/sklearn (AttributeError _ARRAY_API, numpy.core.multiarray). "
+                    "sentence_transformers/sklearn (AttributeError _ARRAY_API, numpy.core.multiarray, "
+                    "or ValueError numpy.dtype size changed / binary incompatibility). "
                     "Fix: pip install --user 'numpy>=1.26,<2' 'scipy' 'scikit-learn' --upgrade, "
                     "then re-run this check."
                 )
