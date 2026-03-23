@@ -14,6 +14,7 @@ import argparse
 import importlib
 import json
 import platform
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,44 +79,83 @@ def _probe_python() -> dict[str, Any]:
 
 
 def _probe_import(name: str) -> dict[str, Any]:
+    """Import in a **subprocess** so a broken SciPy/NumPy/sklearn chain cannot crash this script."""
     pip = PIP_BY_IMPORT.get(name, name)
-    try:
-        mod = importlib.import_module(name)
-        ver = getattr(mod, "__version__", None)
-        return {"ok": True, "version": ver, "pip_spec": pip}
-    except Exception as e:  # noqa: BLE001 — report any import failure
-        return {"ok": False, "error": repr(e), "pip_spec": pip}
+    code = (
+        "import importlib, sys\n"
+        f"try:\n"
+        f"    m = importlib.import_module({name!r})\n"
+        f"    v = getattr(m, '__version__', '') or ''\n"
+        f"    print(v)\n"
+        f"except Exception as e:\n"
+        f"    print(repr(e), file=sys.stderr)\n"
+        f"    sys.exit(1)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        return {"ok": False, "error": err[-8000:], "pip_spec": pip}
+    ver = (proc.stdout or "").strip()
+    return {"ok": True, "version": ver if ver else None, "pip_spec": pip}
 
 
 def _probe_cuda() -> dict[str, Any]:
-    t = _probe_import("torch")
-    if not t.get("ok"):
+    """Run CUDA probe in a subprocess (isolated from package import order in the parent)."""
+    code = (
+        "import json, sys\n"
+        "try:\n"
+        "    import torch\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({\n"
+        "        'ok': False,\n"
+        "        'message': 'torch not importable; CUDA probe skipped.',\n"
+        "        'torch_import': {'ok': False, 'error': repr(e)},\n"
+        "    }))\n"
+        "    sys.exit(0)\n"
+        "avail = torch.cuda.is_available()\n"
+        "out = {\n"
+        "    'ok': avail,\n"
+        "    'torch_cuda_available': avail,\n"
+        "    'torch_version': torch.__version__,\n"
+        "    'torch_cuda_version': getattr(torch.version, 'cuda', None),\n"
+        "    'device_count': torch.cuda.device_count() if avail else 0,\n"
+        "}\n"
+        "if avail and torch.cuda.device_count() > 0:\n"
+        "    try:\n"
+        "        out['device_0_name'] = torch.cuda.get_device_name(0)\n"
+        "    except Exception as e:\n"
+        "        out['device_0_name_error'] = repr(e)\n"
+        "if not avail:\n"
+        "    out['message'] = 'torch.cuda.is_available() is False'\n"
+        "print(json.dumps(out))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    raw = (proc.stdout or "").strip()
+    if not raw:
         return {
             "ok": False,
-            "message": "torch not importable; CUDA probe skipped.",
-            "torch_import": t,
+            "message": "CUDA subprocess produced no output",
+            "stderr": (proc.stderr or "")[-2000:],
         }
     try:
-        import torch
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "message": repr(e)}
-
-    avail = torch.cuda.is_available()
-    out: dict[str, Any] = {
-        "ok": avail,
-        "torch_cuda_available": avail,
-        "torch_version": torch.__version__,
-        "torch_cuda_version": getattr(torch.version, "cuda", None),
-        "device_count": torch.cuda.device_count() if avail else 0,
-    }
-    if avail and torch.cuda.device_count() > 0:
-        try:
-            out["device_0_name"] = torch.cuda.get_device_name(0)
-        except Exception as e:  # noqa: BLE001
-            out["device_0_name_error"] = repr(e)
-    if not avail:
-        out["message"] = "torch.cuda.is_available() is False"
-    return out
+        return json.loads(raw.splitlines()[-1])
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "message": "failed to parse CUDA probe JSON",
+            "stdout": raw[-4000:],
+            "stderr": (proc.stderr or "")[-2000:],
+        }
 
 
 def _model_in_hf_cache() -> bool:
@@ -134,7 +174,53 @@ def _model_in_hf_cache() -> bool:
     return False
 
 
-def _probe_model_voyage() -> dict[str, Any]:
+def _probe_model_voyage_subprocess_load() -> dict[str, Any]:
+    """Load SentenceTransformer in a subprocess so import failures never kill the checker."""
+    code = (
+        "import json, sys, torch\n"
+        "from sentence_transformers import SentenceTransformer\n"
+        f"MODEL_ID = {MODEL_ID!r}\n"
+        "kwargs = {\n"
+        "    'trust_remote_code': True,\n"
+        "    'truncate_dim': 2048,\n"
+        "    'model_kwargs': {\n"
+        "        'local_files_only': True,\n"
+        "        'attn_implementation': 'sdpa',\n"
+        "        'torch_dtype': torch.bfloat16,\n"
+        "    },\n"
+        "}\n"
+        "try:\n"
+        "    model = SentenceTransformer(MODEL_ID, **kwargs)\n"
+        "    print(json.dumps({\n"
+        "        'ok': True,\n"
+        "        'status': 'loaded_local_only',\n"
+        "        'device': str(model.device),\n"
+        "        'message': 'SentenceTransformer with local_files_only=True.',\n"
+        "    }))\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'ok': False, 'status': 'load_failed', 'message': repr(e)}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    raw = (proc.stdout or "").strip()
+    line = raw.splitlines()[-1] if raw else ""
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "status": "load_failed",
+            "message": "subprocess load parse error",
+            "stdout": raw[-4000:],
+            "stderr": (proc.stderr or "")[-2000:],
+        }
+
+
+def _probe_model_voyage(cuda: dict[str, Any]) -> dict[str, Any]:
     st = _probe_import("sentence_transformers")
     if not st.get("ok"):
         return {
@@ -151,12 +237,7 @@ def _probe_model_voyage() -> dict[str, Any]:
             "pip_automatable": True,
         }
 
-    try:
-        import torch
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "message": repr(e), "pip_automatable": True}
-
-    if not torch.cuda.is_available():
+    if cuda.get("torch_cuda_available") is not True:
         return {
             "ok": False,
             "status": "cuda_required",
@@ -176,33 +257,7 @@ def _probe_model_voyage() -> dict[str, Any]:
             "pip_automatable": False,
         }
 
-    try:
-        from sentence_transformers import SentenceTransformer
-
-        kwargs: dict[str, Any] = {
-            "trust_remote_code": True,
-            "truncate_dim": 2048,
-            "model_kwargs": {
-                "local_files_only": True,
-                "attn_implementation": "sdpa",
-                "torch_dtype": torch.bfloat16,
-            },
-        }
-        model = SentenceTransformer(MODEL_ID, **kwargs)
-        dev = model.device
-        return {
-            "ok": True,
-            "status": "loaded_local_only",
-            "device": str(dev),
-            "message": "SentenceTransformer constructed with local_files_only=True.",
-        }
-    except Exception as e:  # noqa: BLE001
-        return {
-            "ok": False,
-            "status": "load_failed",
-            "message": repr(e),
-            "pip_automatable": False,
-        }
+    return _probe_model_voyage_subprocess_load()
 
 
 def _probe_soft_icu() -> dict[str, Any]:
@@ -242,14 +297,45 @@ def _disk_note() -> dict[str, Any]:
         return {"note": "huggingface_hub not installed or HF cache path unknown."}
 
 
+def _environment_warnings(
+    jetpack: dict[str, Any],
+    packages: dict[str, Any],
+    cuda: dict[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+    np_entry = packages.get("numpy") or {}
+    if np_entry.get("ok") and np_entry.get("version"):
+        try:
+            major = int(str(np_entry["version"]).split(".")[0])
+            if major >= 2:
+                warnings.append(
+                    "NumPy 2.x with Debian/apt SciPy in /usr/lib/python3/dist-packages often breaks "
+                    "sentence_transformers/sklearn (AttributeError _ARRAY_API, numpy.core.multiarray). "
+                    "Fix: pip install --user 'numpy>=1.26,<2' 'scipy' 'scikit-learn' --upgrade, "
+                    "then re-run this check."
+                )
+        except (ValueError, IndexError):
+            pass
+    tv = (cuda or {}).get("torch_version") or ""
+    if tv and "+cu" in str(tv) and jetpack.get("status") == "ok":
+        if not (cuda or {}).get("torch_cuda_available"):
+            warnings.append(
+                "PyTorch looks like a desktop CUDA wheel (e.g. +cu130). On Jetson, use the NVIDIA "
+                "Jetson PyTorch build for your JetPack from https://developer.nvidia.com/embedded/downloads — "
+                "PyPI CUDA wheels often mismatch the Jetson driver and report CUDA init errors."
+            )
+    return warnings
+
+
 def build_report() -> dict[str, Any]:
     jetpack = _probe_jetpack()
     python_info = _probe_python()
     packages = {name: _probe_import(name) for name in PIP_BY_IMPORT}
     cuda = _probe_cuda()
-    model = _probe_model_voyage()
+    model = _probe_model_voyage(cuda)
     soft = {"icu": _probe_soft_icu()}
     disk = _disk_note()
+    env_warnings = _environment_warnings(jetpack, packages, cuda)
 
     packages_ok = all(p.get("ok") for p in packages.values())
     cuda_ok = cuda.get("ok") is True
@@ -273,6 +359,7 @@ def build_report() -> dict[str, Any]:
         "model_voyage_4_nano": model,
         "soft_future": soft,
         "disk": disk,
+        "environment_warnings": env_warnings,
         "overall_ok": overall_ok,
     }
 

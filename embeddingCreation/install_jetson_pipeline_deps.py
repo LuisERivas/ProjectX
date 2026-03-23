@@ -3,7 +3,8 @@
 Install missing pipeline dependencies based on jetson_env_report.json (Step 2).
 
 If overall_ok is true: no-op. Otherwise pip-installs only packages that failed import
-checks. Does not guess a generic torch wheel; prints NVIDIA Jetson PyTorch guidance.
+checks. May add numpy>=1.26,<2 and scipy/scikit-learn when NumPy 2.x / SciPy ABI issues
+are detected. Does not guess a generic torch wheel; prints NVIDIA Jetson PyTorch guidance.
 
 Re-run check_jetson_pipeline_env.py after this script (until overall_ok).
 """
@@ -44,6 +45,32 @@ def load_report(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _numpy_major(version: str | None) -> int | None:
+    if not version:
+        return None
+    try:
+        return int(str(version).split(".")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _needs_numpy_pin(report: dict) -> bool:
+    """Jetson: NumPy 2.x often breaks apt SciPy; pin to 1.x for sklearn/sentence_transformers."""
+    p = (report.get("packages") or {}).get("numpy") or {}
+    if not p.get("ok"):
+        return True
+    maj = _numpy_major(p.get("version"))
+    return maj is not None and maj >= 2
+
+
+def _needs_scipy_stack(report: dict) -> bool:
+    st = (report.get("packages") or {}).get("sentence_transformers") or {}
+    err = (st.get("error") or "") + str(st.get("message") or "")
+    if any(x in err for x in ("_ARRAY_API", "multiarray", "scipy", "sklearn", "numpy.core")):
+        return True
+    return bool(st.get("ok") is False and _needs_numpy_pin(report))
+
+
 def pip_specs_to_install(report: dict) -> list[str]:
     """Collect pip install targets for failed imports. Never auto-install `torch` (use NVIDIA Jetson wheel)."""
     specs: list[str] = []
@@ -59,6 +86,14 @@ def pip_specs_to_install(report: dict) -> list[str]:
         pip_spec = entry.get("pip_spec") or key
         if pip_spec not in specs:
             specs.append(pip_spec)
+
+    if _needs_numpy_pin(report):
+        specs = [s for s in specs if s not in ("numpy", "numpy>=1.26,<2")]
+        specs.insert(0, "numpy>=1.26,<2")
+    if _needs_scipy_stack(report):
+        for extra in ("scipy", "scikit-learn"):
+            if extra not in specs:
+                specs.append(extra)
     return specs
 
 
