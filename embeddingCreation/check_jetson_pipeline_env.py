@@ -325,6 +325,16 @@ def _environment_warnings(
                 "Jetson PyTorch build for your JetPack from https://developer.nvidia.com/embedded/downloads — "
                 "PyPI CUDA wheels often mismatch the Jetson driver and report CUDA init errors."
             )
+    st_err = ((packages.get("sentence_transformers") or {}).get("error") or "") + str(
+        (packages.get("sentence_transformers") or {}).get("message") or ""
+    )
+    if any(x in st_err for x in ("PreTrainedModel", "requirements defined correctly")):
+        warnings.append(
+            "sentence_transformers failed to import PreTrainedModel / dynamic HF modules — usually a "
+            "version skew between sentence-transformers, transformers, and huggingface_hub (common with "
+            "transformers 5.x). Fix: pip install --user --upgrade sentence-transformers transformers "
+            "huggingface_hub (or run install_jetson_pipeline_deps.py after refreshing the report)."
+        )
     return warnings
 
 

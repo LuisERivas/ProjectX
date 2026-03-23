@@ -82,6 +82,13 @@ def _needs_scipy_stack(report: dict) -> bool:
     return bool(st.get("ok") is False and _needs_numpy_pin(report))
 
 
+def _needs_hf_stack_compat_upgrade(report: dict) -> bool:
+    """transformers 5.x + older sentence-transformers often breaks dynamic PreTrainedModel imports."""
+    st = (report.get("packages") or {}).get("sentence_transformers") or {}
+    err = (st.get("error") or "") + str(st.get("message") or "")
+    return any(x in err for x in ("PreTrainedModel", "requirements defined correctly"))
+
+
 def pip_specs_to_install(report: dict) -> list[str]:
     """Collect pip install targets for failed imports. Never auto-install `torch` (use NVIDIA Jetson wheel)."""
     specs: list[str] = []
@@ -144,7 +151,34 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    ran_hf_upgrade = False
+    if _needs_hf_stack_compat_upgrade(report):
+        ran_hf_upgrade = True
+        up_cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "sentence-transformers",
+            "transformers",
+            "huggingface-hub",
+        ]
+        print("Running (upgrade HF stack for PreTrainedModel / ST compatibility):", " ".join(up_cmd))
+        up_proc = subprocess.run(up_cmd, check=False)
+        if up_proc.returncode != 0:
+            print("HF stack upgrade failed.", file=sys.stderr)
+            return up_proc.returncode
+        prune = {"sentence-transformers", "transformers", "huggingface-hub"}
+        specs = [s for s in specs if s not in prune]
+
     if not specs:
+        if ran_hf_upgrade:
+            print(
+                "HF stack upgraded. Re-run: python3 check_jetson_pipeline_env.py",
+                file=sys.stderr,
+            )
+            return 0
         print(
             "No automatable pip packages listed as failed imports; "
             "fix manual steps above, then re-run the check script.",
