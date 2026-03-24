@@ -115,6 +115,18 @@ def pip_specs_to_install(report: dict) -> list[str]:
     return specs
 
 
+NUMPY_SCIPY_PRUNE = frozenset({"numpy", "numpy>=1.26,<2", "scipy", "scikit-learn"})
+
+
+def _split_numpy_phase(report: dict, specs: list[str]) -> tuple[list[str], list[str]]:
+    """First phase: pin NumPy 1.x + pip SciPy/sklearn so ABI matches before HF packages."""
+    if not (_needs_numpy_pin(report) or _needs_scipy_stack(report)):
+        return [], specs
+    phase = ["numpy>=1.26,<2", "scipy", "scikit-learn"]
+    rest = [s for s in specs if s not in NUMPY_SCIPY_PRUNE]
+    return phase, rest
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -151,6 +163,22 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    ran_numpy_phase = False
+    phase_numpy, specs = _split_numpy_phase(report, specs)
+    if phase_numpy:
+        ran_numpy_phase = True
+        np_entry = (report.get("packages") or {}).get("numpy") or {}
+        force = _needs_numpy_pin(report) and (_numpy_major(np_entry.get("version")) or 0) >= 2
+        np_cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+        if force:
+            np_cmd.extend(["--force-reinstall", "--no-cache-dir"])
+        np_cmd.extend(phase_numpy)
+        print("Running (NumPy/SciPy stack first — fixes dtype / sklearn ABI on Jetson):", " ".join(np_cmd))
+        np_proc = subprocess.run(np_cmd, check=False)
+        if np_proc.returncode != 0:
+            print("NumPy/SciPy install failed.", file=sys.stderr)
+            return np_proc.returncode
+
     ran_hf_upgrade = False
     if _needs_hf_stack_compat_upgrade(report):
         ran_hf_upgrade = True
@@ -173,9 +201,9 @@ def main() -> int:
         specs = [s for s in specs if s not in prune]
 
     if not specs:
-        if ran_hf_upgrade:
+        if ran_hf_upgrade or ran_numpy_phase:
             print(
-                "HF stack upgraded. Re-run: python3 check_jetson_pipeline_env.py",
+                "Pip phases finished. Re-run: python3 check_jetson_pipeline_env.py",
                 file=sys.stderr,
             )
             return 0
