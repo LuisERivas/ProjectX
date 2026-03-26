@@ -200,6 +200,13 @@ class EmbeddingWorker:
             if not np.isfinite(result).all():
                 raise EmbeddingError("non-finite values in fp32 embedding output")
 
+            # Keep normalize_embeddings=True in encode() per contract, then enforce
+            # strict fp32 normalization here for deterministic tolerance checks.
+            denom = np.linalg.norm(result, axis=1, keepdims=True)
+            if np.any(~np.isfinite(denom)) or np.any(denom <= 0):
+                raise EmbeddingError("invalid norms encountered during fp32 normalization")
+            result = result / denom
+
             norms = np.linalg.norm(result, axis=1)
             if not np.all((norms >= PRE_CAST_NORM_MIN) & (norms <= PRE_CAST_NORM_MAX)):
                 raise EmbeddingError(
