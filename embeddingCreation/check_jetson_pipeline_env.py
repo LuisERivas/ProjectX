@@ -131,6 +131,51 @@ def _probe_import(name: str) -> dict[str, Any]:
     return {"ok": True, "version": ver if ver else None, "pip_spec": pip}
 
 
+def _probe_pillow() -> dict[str, Any]:
+    """Debian apt Pillow is often <9.1 and lacks PIL.Image.Resampling; transformers 5.x then breaks PreTrainedModel import."""
+    code = (
+        "import json, sys\n"
+        "try:\n"
+        "    from PIL import Image\n"
+        "    from importlib.metadata import version, PackageNotFoundError\n"
+        "    try:\n"
+        "        pv = version('pillow')\n"
+        "    except PackageNotFoundError:\n"
+        "        pv = None\n"
+        "    has_resampling = hasattr(Image, 'Resampling')\n"
+        "    out = {\n"
+        "        'ok': has_resampling,\n"
+        "        'version': pv,\n"
+        "        'pip_spec': 'pillow',\n"
+        "        'pil_image_file': getattr(Image, '__file__', None),\n"
+        "    }\n"
+        "    if not has_resampling:\n"
+        "        out['error'] = (\n"
+        "            'PIL.Image.Resampling missing (system Pillow too old for transformers 5.x). '\n"
+        "            'pip install --user --upgrade \"pillow>=9.1\"'\n"
+        "        )\n"
+        "    print(json.dumps(out))\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'ok': False, 'error': repr(e), 'pip_spec': 'pillow'}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    raw = (proc.stdout or "").strip()
+    line = raw.splitlines()[-1] if raw else ""
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "error": (raw or (proc.stderr or ""))[-4000:],
+            "pip_spec": "pillow",
+        }
+
+
 def _probe_cuda() -> dict[str, Any]:
     """Run CUDA probe in a subprocess (isolated from package import order in the parent)."""
     code = (
@@ -345,6 +390,12 @@ def _environment_warnings(
         except (ValueError, IndexError):
             pass
     tv = (cuda or {}).get("torch_version") or ""
+    if tv and "+cpu" in str(tv) and jetpack.get("status") == "ok":
+        warnings.append(
+            "PyTorch is a PyPI CPU-only build (+cpu). On Jetson, uninstall it and install the NVIDIA "
+            "Jetson CUDA PyTorch wheel for your JetPack from https://developer.nvidia.com/embedded/downloads — "
+            "otherwise torch.cuda.is_available() stays false."
+        )
     if tv and "+cu" in str(tv) and jetpack.get("status") == "ok":
         if not (cuda or {}).get("torch_cuda_available"):
             warnings.append(
@@ -355,7 +406,14 @@ def _environment_warnings(
     st_err = ((packages.get("sentence_transformers") or {}).get("error") or "") + str(
         (packages.get("sentence_transformers") or {}).get("message") or ""
     )
-    if any(x in st_err for x in ("PreTrainedModel", "requirements defined correctly")):
+    pl = (packages.get("pillow") or {})
+    if pl.get("ok") is not True:
+        warnings.append(
+            "Pillow (PIL) is missing or too old for transformers 5.x — Debian apt Pillow often lacks "
+            "PIL.Image.Resampling, which surfaces as ModuleNotFoundError PreTrainedModel. "
+            "Fix: python3 -m pip install --user --upgrade 'pillow>=9.1' (then re-run this check)."
+        )
+    elif any(x in st_err for x in ("PreTrainedModel", "requirements defined correctly")):
         warnings.append(
             "sentence_transformers failed to import PreTrainedModel / dynamic HF modules — often broken "
             "or mixed installs (apt python3-* plus pip, or stale wheels). Fix: remove conflicting apt "
@@ -371,6 +429,7 @@ def build_report() -> dict[str, Any]:
     jetpack = _probe_jetpack()
     python_info = _probe_python()
     packages = {name: _probe_import(name) for name in PIP_BY_IMPORT}
+    packages["pillow"] = _probe_pillow()
     cuda = _probe_cuda()
     model = _probe_model_voyage(cuda)
     soft = {"icu": _probe_soft_icu()}

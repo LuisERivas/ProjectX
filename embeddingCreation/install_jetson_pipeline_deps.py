@@ -4,7 +4,7 @@ Install missing pipeline dependencies based on jetson_env_report.json (Step 2).
 
 If overall_ok is true: no-op. Otherwise pip-installs only packages that failed import
 checks. May add numpy>=1.26,<2 and scipy/scikit-learn when NumPy 2.x / SciPy ABI issues
-are detected. Does not put `torch` on the pip install list; when the report says torch imports OK,
+are detected. May install pillow>=9.1 when system PIL lacks Image.Resampling (transformers 5.x). Does not put `torch` on the pip install list; when the report says torch imports OK,
 passes `-c` constraints so pip does not replace Jetson torch with a PyPI CUDA wheel.
 Otherwise prints NVIDIA Jetson PyTorch guidance.
 
@@ -26,6 +26,7 @@ DEFAULT_REPORT = Path(__file__).resolve().parent / "jetson_env_report.json"
 # pip packages to install when the corresponding import failed (from report.packages)
 PACKAGE_KEYS = (
     "torch",
+    "pillow",
     "transformers",
     "sentence_transformers",
     "safetensors",
@@ -56,6 +57,10 @@ def _torch_pip_constraint_args(report: dict) -> tuple[list[str], Path | None]:
         return [], None
     ver = (t.get("version") or "").strip()
     if not ver:
+        return [], None
+    jp = report.get("jetpack") or {}
+    if jp.get("status") == "ok" and "+cpu" in ver:
+        # Pinning torch==...+cpu would lock a useless PyPI CPU build on Jetson.
         return [], None
     fd, raw = tempfile.mkstemp(suffix="-torch-constraint.txt", text=True)
     path = Path(raw)
@@ -142,6 +147,15 @@ def pip_specs_to_install(report: dict) -> list[str]:
 
 
 NUMPY_SCIPY_PRUNE = frozenset({"numpy", "numpy>=1.26,<2", "scipy", "scikit-learn"})
+PILLOW_PRUNE = frozenset({"pillow", "pillow>=9.1"})
+
+
+def _needs_pillow_upgrade(report: dict) -> bool:
+    """System Debian Pillow is often too old for transformers 5.x (needs PIL.Image.Resampling)."""
+    pl = (report.get("packages") or {}).get("pillow")
+    if pl is None:
+        return False
+    return pl.get("ok") is not True
 
 
 def _split_numpy_phase(report: dict, specs: list[str]) -> tuple[list[str], list[str]]:
@@ -216,6 +230,30 @@ def main() -> int:
             _cleanup_constraint()
             return np_proc.returncode
 
+    ran_pillow_phase = False
+    if _needs_pillow_upgrade(report):
+        ran_pillow_phase = True
+        p_cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--no-cache-dir",
+            *constraint_args,
+            "pillow>=9.1",
+        ]
+        print(
+            "Running (Pillow>=9.1 — transformers 5.x needs PIL.Image.Resampling):",
+            " ".join(p_cmd),
+        )
+        p_proc = subprocess.run(p_cmd, check=False)
+        if p_proc.returncode != 0:
+            print("Pillow install failed.", file=sys.stderr)
+            _cleanup_constraint()
+            return p_proc.returncode
+        specs = [s for s in specs if s not in PILLOW_PRUNE]
+
     ran_hf_upgrade = False
     if _needs_hf_stack_compat_upgrade(report):
         ran_hf_upgrade = True
@@ -245,7 +283,7 @@ def main() -> int:
         specs = [s for s in specs if s not in prune]
 
     if not specs:
-        if ran_hf_upgrade or ran_numpy_phase:
+        if ran_hf_upgrade or ran_numpy_phase or ran_pillow_phase:
             print(
                 "Pip phases finished. Re-run: python3 check_jetson_pipeline_env.py",
                 file=sys.stderr,
