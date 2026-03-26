@@ -78,6 +78,29 @@ def _probe_python() -> dict[str, Any]:
     }
 
 
+def _distribution_version(dist_name: str) -> str | None:
+    """PyPI distribution version even when `import module` fails (broken/cached install)."""
+    code = (
+        "import sys\n"
+        "try:\n"
+        "    from importlib.metadata import version\n"
+        f"    print(version({dist_name!r}))\n"
+        "except Exception as e:\n"
+        "    print(repr(e), file=sys.stderr)\n"
+        "    sys.exit(1)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip()
+    return out if out else None
+
+
 def _probe_import(name: str) -> dict[str, Any]:
     """Import in a **subprocess** so a broken SciPy/NumPy/sklearn chain cannot crash this script."""
     pip = PIP_BY_IMPORT.get(name, name)
@@ -99,7 +122,11 @@ def _probe_import(name: str) -> dict[str, Any]:
     )
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
-        return {"ok": False, "error": err[-8000:], "pip_spec": pip}
+        out: dict[str, Any] = {"ok": False, "error": err[-8000:], "pip_spec": pip}
+        dist_ver = _distribution_version(pip)
+        if dist_ver:
+            out["distribution_version"] = dist_ver
+        return out
     ver = (proc.stdout or "").strip()
     return {"ok": True, "version": ver if ver else None, "pip_spec": pip}
 
@@ -330,10 +357,12 @@ def _environment_warnings(
     )
     if any(x in st_err for x in ("PreTrainedModel", "requirements defined correctly")):
         warnings.append(
-            "sentence_transformers failed to import PreTrainedModel / dynamic HF modules — usually a "
-            "version skew between sentence-transformers, transformers, and huggingface_hub (common with "
-            "transformers 5.x). Fix: pip install --user --upgrade sentence-transformers transformers "
-            "huggingface_hub (or run install_jetson_pipeline_deps.py after refreshing the report)."
+            "sentence_transformers failed to import PreTrainedModel / dynamic HF modules — often broken "
+            "or mixed installs (apt python3-* plus pip, or stale wheels). Fix: remove conflicting apt "
+            "packages if any (`apt list --installed | grep -i sentence`); then "
+            "`python3 -m pip install --upgrade --force-reinstall --no-cache-dir sentence-transformers "
+            "transformers huggingface-hub`. Or run install_jetson_pipeline_deps.py (uses force-reinstall "
+            "for this error)."
         )
     return warnings
 

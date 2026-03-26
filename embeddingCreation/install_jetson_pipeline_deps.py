@@ -188,11 +188,16 @@ def main() -> int:
             "pip",
             "install",
             "--upgrade",
+            "--force-reinstall",
+            "--no-cache-dir",
             "sentence-transformers",
             "transformers",
             "huggingface-hub",
         ]
-        print("Running (upgrade HF stack for PreTrainedModel / ST compatibility):", " ".join(up_cmd))
+        print(
+            "Running (HF stack force-reinstall for PreTrainedModel / ST compatibility):",
+            " ".join(up_cmd),
+        )
         up_proc = subprocess.run(up_cmd, check=False)
         if up_proc.returncode != 0:
             print("HF stack upgrade failed.", file=sys.stderr)
