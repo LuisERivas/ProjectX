@@ -4,7 +4,9 @@ Install missing pipeline dependencies based on jetson_env_report.json (Step 2).
 
 If overall_ok is true: no-op. Otherwise pip-installs only packages that failed import
 checks. May add numpy>=1.26,<2 and scipy/scikit-learn when NumPy 2.x / SciPy ABI issues
-are detected. Does not guess a generic torch wheel; prints NVIDIA Jetson PyTorch guidance.
+are detected. Does not put `torch` on the pip install list; when the report says torch imports OK,
+passes `-c` constraints so pip does not replace Jetson torch with a PyPI CUDA wheel.
+Otherwise prints NVIDIA Jetson PyTorch guidance.
 
 Re-run check_jetson_pipeline_env.py after this script (until overall_ok).
 """
@@ -13,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 DEFAULT_REPORT = Path(__file__).resolve().parent / "jetson_env_report.json"
@@ -43,6 +47,28 @@ def load_report(path: Path) -> dict:
         print(f"error: report not found: {path}", file=sys.stderr)
         sys.exit(2)
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _torch_pip_constraint_args(report: dict) -> tuple[list[str], Path | None]:
+    """If torch already imports OK, pin it so pip never swaps Jetson torch for PyPI CUDA wheels."""
+    t = (report.get("packages") or {}).get("torch") or {}
+    if t.get("ok") is not True:
+        return [], None
+    ver = (t.get("version") or "").strip()
+    if not ver:
+        return [], None
+    fd, raw = tempfile.mkstemp(suffix="-torch-constraint.txt", text=True)
+    path = Path(raw)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"torch=={ver}\n")
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return [], None
+    return ["-c", str(path)], path
 
 
 def _numpy_major(version: str | None) -> int | None:
@@ -143,6 +169,15 @@ def main() -> int:
         print("All pipeline prerequisites satisfied per report; nothing to install.")
         return 0
 
+    constraint_args, constraint_path = _torch_pip_constraint_args(report)
+
+    def _cleanup_constraint() -> None:
+        if constraint_path is not None:
+            try:
+                constraint_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     specs = pip_specs_to_install(report)
     cuda = report.get("cuda") or {}
     torch_entry = (report.get("packages") or {}).get("torch") or {}
@@ -172,11 +207,13 @@ def main() -> int:
         np_cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
         if force:
             np_cmd.extend(["--force-reinstall", "--no-cache-dir"])
+        np_cmd.extend(constraint_args)
         np_cmd.extend(phase_numpy)
         print("Running (NumPy/SciPy stack first — fixes dtype / sklearn ABI on Jetson):", " ".join(np_cmd))
         np_proc = subprocess.run(np_cmd, check=False)
         if np_proc.returncode != 0:
             print("NumPy/SciPy install failed.", file=sys.stderr)
+            _cleanup_constraint()
             return np_proc.returncode
 
     ran_hf_upgrade = False
@@ -190,6 +227,7 @@ def main() -> int:
             "--upgrade",
             "--force-reinstall",
             "--no-cache-dir",
+            *constraint_args,
             "sentence-transformers",
             "transformers",
             "huggingface-hub",
@@ -201,6 +239,7 @@ def main() -> int:
         up_proc = subprocess.run(up_cmd, check=False)
         if up_proc.returncode != 0:
             print("HF stack upgrade failed.", file=sys.stderr)
+            _cleanup_constraint()
             return up_proc.returncode
         prune = {"sentence-transformers", "transformers", "huggingface-hub"}
         specs = [s for s in specs if s not in prune]
@@ -211,23 +250,33 @@ def main() -> int:
                 "Pip phases finished. Re-run: python3 check_jetson_pipeline_env.py",
                 file=sys.stderr,
             )
+            _cleanup_constraint()
             return 0
         print(
             "No automatable pip packages listed as failed imports; "
             "fix manual steps above, then re-run the check script.",
             file=sys.stderr,
         )
+        _cleanup_constraint()
         return 1
 
-    cmd = [sys.executable, "-m", "pip", "install", *specs]
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    # After pinning NumPy 1.x, wheels built against NumPy 2 (e.g. sentence-transformers,
+    # tokenizers) must be reinstalled or pip leaves "Requirement already satisfied".
+    if ran_numpy_phase:
+        cmd.extend(["--force-reinstall", "--no-cache-dir"])
+    cmd.extend(constraint_args)
+    cmd.extend(specs)
     print("Running:", " ".join(cmd))
 
     proc = subprocess.run(cmd, check=False)
     if proc.returncode != 0:
         print("pip install failed.", file=sys.stderr)
+        _cleanup_constraint()
         return proc.returncode
 
     print("pip install finished. Re-run: python3 check_jetson_pipeline_env.py")
+    _cleanup_constraint()
     return 0
 
 
