@@ -69,14 +69,14 @@ def _build_fake_modules(
             self.device = "cpu" if force_cpu_device else "cuda:0"
 
         def encode(self, sentences, normalize_embeddings=True, show_progress_bar=False):
-            if encode_oom:
+            if encode_oom and not isinstance(sentences, str):
                 raise RuntimeError("CUDA out of memory")
             if isinstance(sentences, str):
                 return _normalized_vec(len(sentences))
             out = []
             for i, sentence in enumerate(sentences):
                 # deterministic and order-sensitive vectors
-                out.append(_normalized_vec(i + len(sentence)))
+                out.append(_normalized_vec((i * 997) + len(sentence)))
             return np.stack(out, axis=0)
 
     st_mod.SentenceTransformer = SentenceTransformer
