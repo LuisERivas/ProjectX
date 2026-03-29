@@ -3,19 +3,15 @@
 Step 4: ICU-based sentence splitting for the embedding pipeline.
 
 Splits raw document text into ordered, trimmed, non-empty sentences using
-ICU BreakIterator with abbreviation suppression via FilteredBreakIteratorBuilder.
+ICU BreakIterator with post-merge abbreviation suppression.
 Conforms to embedding_format_spec.txt Section 3 contract.
 """
 
 from __future__ import annotations
 
-import logging
-
 import icu
 
-LOGGER = logging.getLogger("sentence_splitter")
-
-SUPPRESSIONS: tuple[str, ...] = (
+SUPPRESSIONS: frozenset[str] = frozenset({
     "Dr.", "Mr.", "Mrs.", "Ms.", "Prof.", "Sr.", "Jr.",
     "vs.", "etc.", "approx.",
     "e.g.", "i.e.", "vol.", "dept.",
@@ -25,43 +21,15 @@ SUPPRESSIONS: tuple[str, ...] = (
     "U.S.", "U.K.",
     "No.", "Fig.", "Ref.",
     "a.m.", "p.m.",
-)
-
-_USE_FILTERED: bool | None = None
+})
 
 
-def _create_sentence_iterator(locale: str) -> icu.BreakIterator:
-    """Build a sentence BreakIterator with abbreviation suppression.
-
-    Falls back to a plain BreakIterator if FilteredBreakIteratorBuilder
-    is not available in the installed PyICU version.
-    """
-    global _USE_FILTERED
-
-    loc = icu.Locale(locale)
-    bi = icu.BreakIterator.createSentenceInstance(loc)
-
-    if _USE_FILTERED is False:
-        return bi
-
-    try:
-        builder = icu.FilteredBreakIteratorBuilder.createInstance(loc)
-        for abbr in SUPPRESSIONS:
-            builder.suppressBreakAfter(abbr)
-        filtered = builder.build(bi)
-        if _USE_FILTERED is None:
-            _USE_FILTERED = True
-            LOGGER.info("using FilteredBreakIteratorBuilder with %d suppressions", len(SUPPRESSIONS))
-        return filtered
-    except (AttributeError, TypeError, icu.ICUError) as exc:
-        if _USE_FILTERED is None:
-            _USE_FILTERED = False
-            LOGGER.warning(
-                "FilteredBreakIteratorBuilder not available; "
-                "falling back to plain BreakIterator: %s",
-                exc,
-            )
-        return bi
+def _ends_with_suppression(sentence: str) -> bool:
+    """True if the sentence is or ends with a suppressed abbreviation."""
+    for abbr in SUPPRESSIONS:
+        if sentence == abbr or sentence.endswith(" " + abbr):
+            return True
+    return False
 
 
 def split_sentences(
@@ -71,7 +39,8 @@ def split_sentences(
 ) -> list[str]:
     """Split text into sentences using ICU BreakIterator.
 
-    - Suppresses false breaks after common abbreviations (Dr., Mr., etc.).
+    - Merges fragments that end with suppressed abbreviations (Dr., Mr., etc.)
+      back into the following sentence to prevent false breaks.
     - Normalizes line endings (\\r\\n, \\r -> \\n).
     - Strips whitespace from each sentence.
     - Drops empty strings after stripping.
@@ -94,14 +63,23 @@ def split_sentences(
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    bi = _create_sentence_iterator(locale)
+    bi = icu.BreakIterator.createSentenceInstance(icu.Locale(locale))
     bi.setText(text)
+
+    boundaries: list[int] = list(bi)
 
     sentences: list[str] = []
     start = 0
-    for end in bi:
+    i = 0
+    while i < len(boundaries):
+        end = boundaries[i]
         chunk = text[start:end].strip()
+        while _ends_with_suppression(chunk) and i + 1 < len(boundaries):
+            i += 1
+            end = boundaries[i]
+            chunk = text[start:end].strip()
         if chunk:
             sentences.append(chunk)
         start = end
+        i += 1
     return sentences
