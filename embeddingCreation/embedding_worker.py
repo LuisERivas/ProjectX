@@ -19,6 +19,7 @@ from enum import Enum
 from typing import Any
 
 import numpy as np
+from embedding_validator import EmbeddingValidationError, validate_embeddings
 
 MODEL_ID = "voyageai/voyage-4-nano"
 EXPECTED_DIM = 2048
@@ -189,36 +190,18 @@ class EmbeddingWorker:
             if result.ndim == 1:
                 result = result.reshape(1, -1)
 
-            if result.shape[0] != len(sentences):
-                raise EmbeddingError(
-                    f"embedding count mismatch: got {result.shape[0]}, expected {len(sentences)}"
+            try:
+                result_fp16 = validate_embeddings(
+                    result,
+                    expected_count=len(sentences),
+                    expected_dim=EXPECTED_DIM,
+                    pre_cast_norm_min=PRE_CAST_NORM_MIN,
+                    pre_cast_norm_max=PRE_CAST_NORM_MAX,
+                    post_cast_norm_min=POST_CAST_NORM_MIN,
+                    post_cast_norm_max=POST_CAST_NORM_MAX,
                 )
-            if result.shape[1] != EXPECTED_DIM:
-                raise EmbeddingError(
-                    f"embedding dim mismatch: got {result.shape[1]}, expected {EXPECTED_DIM}"
-                )
-            if not np.isfinite(result).all():
-                raise EmbeddingError("non-finite values in fp32 embedding output")
-
-            # Keep normalize_embeddings=True in encode() per contract, then enforce
-            # strict fp32 normalization here for deterministic tolerance checks.
-            denom = np.linalg.norm(result, axis=1, keepdims=True)
-            if np.any(~np.isfinite(denom)) or np.any(denom <= 0):
-                raise EmbeddingError("invalid norms encountered during fp32 normalization")
-            result = result / denom
-
-            norms = np.linalg.norm(result, axis=1)
-            if not np.all((norms >= PRE_CAST_NORM_MIN) & (norms <= PRE_CAST_NORM_MAX)):
-                raise EmbeddingError(
-                    f"fp32 norm check failed; expected in [{PRE_CAST_NORM_MIN}, {PRE_CAST_NORM_MAX}]"
-                )
-
-            result_fp16 = result.astype(np.float16)
-            post_norms = np.linalg.norm(result_fp16.astype(np.float32), axis=1)
-            if not np.all((post_norms >= POST_CAST_NORM_MIN) & (post_norms <= POST_CAST_NORM_MAX)):
-                raise EmbeddingError(
-                    f"fp16 norm check failed; expected in [{POST_CAST_NORM_MIN}, {POST_CAST_NORM_MAX}]"
-                )
+            except EmbeddingValidationError as exc:
+                raise EmbeddingError(str(exc)) from exc
 
             elapsed = time.perf_counter() - t0
             self._metrics.total_batches += 1
