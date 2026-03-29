@@ -134,6 +134,25 @@ class TestBatchBuilder(unittest.TestCase):
         with self.assertRaises(OverflowError):
             list(batch_sentences(s, batch_size=2, start_id=UINT32_MAX - 1))
 
+    def test_exact_uint32_max_boundary_succeeds(self) -> None:
+        batches = list(batch_sentences(["last"], batch_size=1, start_id=UINT32_MAX))
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0].ids, [UINT32_MAX])
+        self.assertEqual(batches[0].sentences, ["last"])
+
+    def test_exact_uint32_max_plus_one_overflows(self) -> None:
+        with self.assertRaises(OverflowError):
+            list(batch_sentences(["ok", "boom"], batch_size=4, start_id=UINT32_MAX))
+
+    def test_deterministic_same_input_same_output(self) -> None:
+        s = [f"s{i}" for i in range(7)]
+        run1 = list(batch_sentences(s, batch_size=3))
+        run2 = list(batch_sentences(s, batch_size=3))
+        self.assertEqual(len(run1), len(run2))
+        for b1, b2 in zip(run1, run2):
+            self.assertEqual(b1.ids, b2.ids)
+            self.assertEqual(b1.sentences, b2.sentences)
+
     def test_generator_laziness(self) -> None:
         tracked = _TrackedIterable(["a", "b", "c", "d", "e"])
         gen = batch_sentences(tracked, batch_size=2)
