@@ -11,7 +11,6 @@ See embeddingCreationPlan.txt Step 2. Output: JSON file + stdout.
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import platform
 import subprocess
@@ -20,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MODEL_ID = "voyageai/voyage-4-nano"
 DEFAULT_REPORT = Path(__file__).resolve().parent / "jetson_env_report.json"
 TEGRA_RELEASE = Path("/etc/nv_tegra_release")
@@ -34,6 +33,7 @@ PIP_BY_IMPORT = {
     "huggingface_hub": "huggingface-hub",
     "numpy": "numpy",
     "tokenizers": "tokenizers",
+    "icu": "PyICU",
 }
 
 
@@ -332,25 +332,6 @@ def _probe_model_voyage(cuda: dict[str, Any]) -> dict[str, Any]:
     return _probe_model_voyage_subprocess_load()
 
 
-def _probe_soft_icu() -> dict[str, Any]:
-    for mod in ("icu", "PyICU"):
-        try:
-            importlib.import_module(mod)
-            return {
-                "ok": True,
-                "module": mod,
-                "not_required_for_step2": True,
-                "message": "ICU bindings present (optional for Step 4).",
-            }
-        except Exception:
-            continue
-    return {
-        "ok": True,
-        "not_required_for_step2": True,
-        "message": "No icu/PyICU (optional until Step 4).",
-    }
-
-
 def _disk_note() -> dict[str, Any]:
     import os
 
@@ -422,6 +403,13 @@ def _environment_warnings(
             "transformers huggingface-hub`. Or run install_jetson_pipeline_deps.py (uses force-reinstall "
             "for this error)."
         )
+    icu_entry = packages.get("icu") or {}
+    if icu_entry.get("ok") is not True:
+        warnings.append(
+            "ICU bindings (PyICU) are required for sentence splitting (Step 4). "
+            "Install with: sudo apt install python3-icu (or pip install PyICU after "
+            "sudo apt install pkg-config libicu-dev)."
+        )
     return warnings
 
 
@@ -432,7 +420,6 @@ def build_report() -> dict[str, Any]:
     packages["pillow"] = _probe_pillow()
     cuda = _probe_cuda()
     model = _probe_model_voyage(cuda)
-    soft = {"icu": _probe_soft_icu()}
     disk = _disk_note()
     env_warnings = _environment_warnings(jetpack, packages, cuda)
 
@@ -456,7 +443,7 @@ def build_report() -> dict[str, Any]:
         "packages": packages,
         "cuda": cuda,
         "model_voyage_4_nano": model,
-        "soft_future": soft,
+        "soft_future": {},
         "disk": disk,
         "environment_warnings": env_warnings,
         "overall_ok": overall_ok,

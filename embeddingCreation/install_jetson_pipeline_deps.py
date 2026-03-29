@@ -33,6 +33,7 @@ PACKAGE_KEYS = (
     "huggingface_hub",
     "numpy",
     "tokenizers",
+    "icu",
 )
 
 JETSON_PYTORCH_HINT = """\
@@ -309,6 +310,11 @@ def main() -> int:
 
     proc = subprocess.run(cmd, check=False)
     if proc.returncode != 0:
+        if any(s in ("PyICU",) for s in specs):
+            print(
+                "If PyICU pip install fails, try: sudo apt install python3-icu",
+                file=sys.stderr,
+            )
         print("pip install failed.", file=sys.stderr)
         _cleanup_constraint()
         return proc.returncode
