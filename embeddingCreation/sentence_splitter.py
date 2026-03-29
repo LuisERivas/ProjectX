@@ -3,12 +3,65 @@
 Step 4: ICU-based sentence splitting for the embedding pipeline.
 
 Splits raw document text into ordered, trimmed, non-empty sentences using
-ICU BreakIterator. Conforms to embedding_format_spec.txt Section 3 contract.
+ICU BreakIterator with abbreviation suppression via FilteredBreakIteratorBuilder.
+Conforms to embedding_format_spec.txt Section 3 contract.
 """
 
 from __future__ import annotations
 
+import logging
+
 import icu
+
+LOGGER = logging.getLogger("sentence_splitter")
+
+SUPPRESSIONS: tuple[str, ...] = (
+    "Dr.", "Mr.", "Mrs.", "Ms.", "Prof.", "Sr.", "Jr.",
+    "vs.", "etc.", "approx.",
+    "e.g.", "i.e.", "vol.", "dept.",
+    "Gen.", "Gov.", "Sgt.", "Cpl.", "Pvt.",
+    "St.", "Ave.", "Blvd.",
+    "Jan.", "Feb.", "Mar.", "Apr.", "Aug.", "Sep.", "Oct.", "Nov.", "Dec.",
+    "U.S.", "U.K.",
+    "No.", "Fig.", "Ref.",
+    "a.m.", "p.m.",
+)
+
+_USE_FILTERED: bool | None = None
+
+
+def _create_sentence_iterator(locale: str) -> icu.BreakIterator:
+    """Build a sentence BreakIterator with abbreviation suppression.
+
+    Falls back to a plain BreakIterator if FilteredBreakIteratorBuilder
+    is not available in the installed PyICU version.
+    """
+    global _USE_FILTERED
+
+    loc = icu.Locale(locale)
+    bi = icu.BreakIterator.createSentenceInstance(loc)
+
+    if _USE_FILTERED is False:
+        return bi
+
+    try:
+        builder = icu.FilteredBreakIteratorBuilder.createInstance(loc)
+        for abbr in SUPPRESSIONS:
+            builder.suppressBreakAfter(abbr)
+        filtered = builder.build(bi)
+        if _USE_FILTERED is None:
+            _USE_FILTERED = True
+            LOGGER.info("using FilteredBreakIteratorBuilder with %d suppressions", len(SUPPRESSIONS))
+        return filtered
+    except (AttributeError, TypeError, icu.ICUError) as exc:
+        if _USE_FILTERED is None:
+            _USE_FILTERED = False
+            LOGGER.warning(
+                "FilteredBreakIteratorBuilder not available; "
+                "falling back to plain BreakIterator: %s",
+                exc,
+            )
+        return bi
 
 
 def split_sentences(
@@ -18,6 +71,7 @@ def split_sentences(
 ) -> list[str]:
     """Split text into sentences using ICU BreakIterator.
 
+    - Suppresses false breaks after common abbreviations (Dr., Mr., etc.).
     - Normalizes line endings (\\r\\n, \\r -> \\n).
     - Strips whitespace from each sentence.
     - Drops empty strings after stripping.
@@ -40,7 +94,7 @@ def split_sentences(
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    bi = icu.BreakIterator.createSentenceInstance(icu.Locale(locale))
+    bi = _create_sentence_iterator(locale)
     bi.setText(text)
 
     sentences: list[str] = []

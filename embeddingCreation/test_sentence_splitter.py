@@ -23,14 +23,20 @@ class TestSplitSentences(unittest.TestCase):
     def test_abbreviations_dr_mr(self) -> None:
         text = "Dr. Smith went to Washington. He arrived at 3 p.m."
         result = split_sentences(text)
-        # ICU abbreviation handling varies by version/locale data;
-        # verify output is non-empty, stripped, ordered, and covers all text.
-        self.assertGreaterEqual(len(result), 2)
-        joined = " ".join(result)
-        self.assertIn("Dr.", joined)
-        self.assertIn("Smith", joined)
-        self.assertIn("Washington", joined)
-        self.assertIn("p.m.", joined)
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result[0].startswith("Dr. Smith"))
+        self.assertIn("p.m.", result[1])
+
+    def test_abbreviations_mrs_prof(self) -> None:
+        text = "Mrs. Jones called Prof. Adams. They met at 9 a.m."
+        result = split_sentences(text)
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result[0].startswith("Mrs. Jones"))
+
+    def test_abbreviation_eg_ie(self) -> None:
+        text = "Use a tool, e.g. a hammer. It works, i.e. it is effective."
+        result = split_sentences(text)
+        self.assertEqual(len(result), 2)
 
     def test_exclamation_question_combo(self) -> None:
         text = "Really?! That's amazing!"
