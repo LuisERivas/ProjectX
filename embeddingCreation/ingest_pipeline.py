@@ -34,6 +34,7 @@ from paragraph_splitter import split_into_paragraphs
 LOGGER = logging.getLogger("ingest_pipeline")
 PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128)
 MAX_PENDING_WRITES: int = 2
+CHAR_BUDGET_PER_SENTENCE: int = 256
 
 
 @dataclass(frozen=True)
@@ -312,27 +313,37 @@ def run_pipeline(
                         continue
                     file_metas_sorted = sorted(file_metas, key=lambda m: m.char_len)
                     file_sentences = [m.text for m in file_metas_sorted]
-                    probe_sample = file_sentences[: max(PROBE_CANDIDATE_BATCH_SIZES)]
                     selected_batch_size = (
-                        probe_batch_size(
-                            worker,
-                            probe_sample,
-                            candidates=PROBE_CANDIDATE_BATCH_SIZES,
-                            fallback_batch_size=batch_size,
+                        min(
+                            probe_batch_size(
+                                worker,
+                                file_sentences[: max(PROBE_CANDIDATE_BATCH_SIZES)],
+                                candidates=PROBE_CANDIDATE_BATCH_SIZES,
+                                fallback_batch_size=batch_size,
+                            ),
+                            probe_batch_size(
+                                worker,
+                                file_sentences[-max(PROBE_CANDIDATE_BATCH_SIZES) :],
+                                candidates=PROBE_CANDIDATE_BATCH_SIZES,
+                                fallback_batch_size=batch_size,
+                            ),
                         )
                         if len(file_sentences) >= min(PROBE_CANDIDATE_BATCH_SIZES)
                         else batch_size
                     )
+                    char_budget = selected_batch_size * CHAR_BUDGET_PER_SENTENCE
                     LOGGER.info(
-                        "file batch size selected: file=%s sentences=%d batch_size=%d",
+                        "file batch controls: file=%s sentences=%d batch_size=%d char_budget=%d",
                         path.name,
                         len(file_metas_sorted),
                         selected_batch_size,
+                        char_budget,
                     )
 
                     for batch in batch_sentences(
                         file_metas_sorted,
                         batch_size=selected_batch_size,
+                        char_budget=char_budget,
                     ):
                         total_batches += 1
                         embeddings = worker.encode_batch(batch.sentences)
@@ -356,7 +367,6 @@ def run_pipeline(
                             total_batches,
                             len(batch.sentences),
                         )
-
                 while pending_writes:
                     pending_writes.popleft().result()
             records_written = writer.records_written

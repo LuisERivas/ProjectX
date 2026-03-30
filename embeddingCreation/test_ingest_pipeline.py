@@ -515,7 +515,7 @@ class TestIngestPipeline(unittest.TestCase):
             self.assertTrue(res.success)
             self.assertEqual(res.records_written, 40)
             self.assertEqual(res.total_batches, 4)
-            self.assertEqual(probe_mock.call_count, 2)
+            self.assertEqual(probe_mock.call_count, 4)
 
     def test_file_sentences_sorted_by_char_length_before_encode(self) -> None:
         with TemporaryDirectory() as td:

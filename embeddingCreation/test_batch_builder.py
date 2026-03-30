@@ -108,6 +108,34 @@ class TestBatchBuilder(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(batch_sentences([self._meta("a", 0)], batch_size=-1))
 
+    def test_char_budget_zero_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            list(batch_sentences([self._meta("a", 0)], batch_size=4, char_budget=0))
+
+    def test_char_budget_negative_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            list(batch_sentences([self._meta("a", 0)], batch_size=4, char_budget=-3))
+
+    def test_char_budget_forces_early_flush(self) -> None:
+        s = [
+            self._meta("aa", 0),      # char_len=2
+            self._meta("bbbb", 1),    # char_len=4
+            self._meta("cccccc", 2),  # char_len=6
+            self._meta("ddddd", 3),   # char_len=5
+        ]
+        batches = list(batch_sentences(s, batch_size=4, char_budget=10))
+        self.assertEqual([b.sentences for b in batches], [["aa", "bbbb"], ["cccccc"], ["ddddd"]])
+
+    def test_char_budget_still_respects_batch_size_cap(self) -> None:
+        s = [self._meta("a", i) for i in range(7)]
+        batches = list(batch_sentences(s, batch_size=3, char_budget=999))
+        self.assertEqual([len(b.sentences) for b in batches], [3, 3, 1])
+
+    def test_char_budget_allows_single_long_sentence(self) -> None:
+        s = [self._meta("x" * 20, 0), self._meta("y", 1)]
+        batches = list(batch_sentences(s, batch_size=4, char_budget=8))
+        self.assertEqual([b.sentences for b in batches], [["x" * 20], ["y"]])
+
     def test_deterministic_same_input_same_output(self) -> None:
         s = [self._meta(f"s{i}", i) for i in range(7)]
         run1 = list(batch_sentences(s, batch_size=3))
