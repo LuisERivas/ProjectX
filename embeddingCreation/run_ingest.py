@@ -4,6 +4,7 @@ Minimal CLI runner for the embedding ingestion pipeline.
 
 Usage:
   python3 run_ingest.py --input /path/to/folder --output /path/to/output.bin
+  python3 run_ingest.py --input ... --output ... --batch-size 32
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import argparse
 import logging
 import sys
 
+from batch_builder import DEFAULT_BATCH_SIZE
 from ingest_pipeline import run_pipeline
 
 
@@ -27,16 +29,30 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="path to output .bin file",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        metavar="N",
+        help=(
+            "batch size passed to the pipeline as fallback and probe baseline "
+            f"(default: {DEFAULT_BATCH_SIZE}); per-file probe may choose another ceiling"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.batch_size < 1:
+        print("run_ingest: --batch-size must be >= 1", file=sys.stderr)
+        return 2
     logging.basicConfig(level=logging.INFO)
 
-    result = run_pipeline(args.input, args.output)
+    result = run_pipeline(args.input, args.output, batch_size=args.batch_size)
 
     print("pipeline_result:")
+    print(f"- batch_size: {args.batch_size}")
     print(f"- input_directory: {result.input_directory}")
     print(f"- output_path: {result.output_path}")
     print(f"- files_discovered: {result.files_discovered}")
