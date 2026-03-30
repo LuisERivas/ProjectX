@@ -43,6 +43,7 @@ class _FakeWorker:
     fail_on_encode = False
     fail_on_batch_size_at_or_above: int | None = None
     seen_batch_sizes: list[int] = []
+    seen_batches: list[list[str]] = []
     last_instance: "_FakeWorker | None" = None
 
     def __init__(self) -> None:
@@ -58,6 +59,7 @@ class _FakeWorker:
         cls.fail_on_encode = False
         cls.fail_on_batch_size_at_or_above = None
         cls.seen_batch_sizes = []
+        cls.seen_batches = []
         cls.last_instance = None
 
     @property
@@ -72,6 +74,7 @@ class _FakeWorker:
     def encode_batch(self, sentences: list[str]) -> np.ndarray:
         _FakeWorker.encode_calls += 1
         _FakeWorker.seen_batch_sizes.append(len(sentences))
+        _FakeWorker.seen_batches.append(list(sentences))
         if _FakeWorker.fail_on_encode:
             raise EmbeddingError("forced encode failure")
         if (
@@ -114,7 +117,7 @@ class TestIngestPipeline(unittest.TestCase):
             self.assertTrue(out.exists())
             self.assertEqual(res.total_sentences, 5)
             self.assertEqual(res.records_written, 5)
-            self.assertEqual(out.stat().st_size, 5 * 4100)
+            self.assertEqual(out.stat().st_size, 5 * 4104)
 
     def test_end_to_end_five_files(self) -> None:
         with TemporaryDirectory() as td:
@@ -162,7 +165,7 @@ class TestIngestPipeline(unittest.TestCase):
             self.assertEqual(_FakeWorker.shutdown_calls, 1)
             self.assertEqual(_FakeWorker.last_instance.state, "SHUTDOWN")
 
-    def test_ids_globally_monotonic_and_unique(self) -> None:
+    def test_ids_unique(self) -> None:
         with TemporaryDirectory() as td:
             root = Path(td) / "in"
             out = Path(td) / "out.bin"
@@ -172,7 +175,6 @@ class TestIngestPipeline(unittest.TestCase):
             ):
                 run_pipeline(root, out, batch_size=3)
             ids, _ = read_all(out)
-            self.assertEqual(ids, sorted(ids))
             self.assertEqual(len(ids), len(set(ids)))
 
     def test_batch_size_1_4_16_64(self) -> None:
@@ -514,6 +516,21 @@ class TestIngestPipeline(unittest.TestCase):
             self.assertEqual(res.records_written, 40)
             self.assertEqual(res.total_batches, 4)
             self.assertEqual(probe_mock.call_count, 2)
+
+    def test_file_sentences_sorted_by_char_length_before_encode(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            self._write_texts(root, {"a.txt": "Long sentence here. Mid. S."})
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline._split_text", _simple_splitter
+            ):
+                res = run_pipeline(root, out, batch_size=8)
+            self.assertTrue(res.success)
+            self.assertTrue(_FakeWorker.seen_batches)
+            first_batch = _FakeWorker.seen_batches[0]
+            lengths = [len(s) for s in first_batch]
+            self.assertEqual(lengths, sorted(lengths))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 Step 9 binary writer for embedding records.
 
 Writes records as:
-  uint32 id (little-endian) + float16[2048] embedding (little-endian)
+  uint64 id (little-endian) + float16[2048] embedding (little-endian)
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ from pathlib import Path
 
 import numpy as np
 
-RECORD_SIZE: int = 4100
+RECORD_SIZE: int = 4104
 EXPECTED_DIM: int = 2048
 EMBEDDING_BYTES: int = EXPECTED_DIM * 2  # float16 => 2 bytes each
-UINT32_MAX: int = (2**32) - 1
+UINT64_MAX: int = (2**64) - 1
 
 LOGGER = logging.getLogger("binary_writer")
 
@@ -77,14 +77,14 @@ class EmbeddingWriter:
             raise BinaryWriterError("ids must be int-convertible values") from exc
         if id_arr.ndim != 1 or id_arr.shape[0] != len(ids):
             raise BinaryWriterError("ids must be a flat list of integers")
-        if np.any(id_arr < 0) or np.any(id_arr > UINT32_MAX):
-            bad = int(id_arr[(id_arr < 0) | (id_arr > UINT32_MAX)][0])
-            raise BinaryWriterError(f"id {bad} outside uint32 range")
+        if np.any(id_arr < 0) or np.any(id_arr > UINT64_MAX):
+            bad = int(id_arr[(id_arr < 0) | (id_arr > UINT64_MAX)][0])
+            raise BinaryWriterError(f"id {bad} outside uint64 range")
 
         le_arr = arr.astype("<f2", copy=False)
-        record_dtype = np.dtype([("id", "<u4"), ("emb", ("<f2", EXPECTED_DIM))])
+        record_dtype = np.dtype([("id", "<u8"), ("emb", ("<f2", EXPECTED_DIM))])
         block = np.empty(len(ids), dtype=record_dtype)
-        block["id"] = id_arr.astype("<u4", copy=False)
+        block["id"] = id_arr.astype("<u8", copy=False)
         block["emb"] = le_arr
         payload = block.tobytes()
         if len(payload) != len(ids) * RECORD_SIZE:

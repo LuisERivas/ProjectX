@@ -19,7 +19,7 @@ from binary_writer import (
     EMBEDDING_BYTES,
     EXPECTED_DIM,
     RECORD_SIZE,
-    UINT32_MAX,
+    UINT64_MAX,
     BinaryWriterError,
     EmbeddingWriter,
 )
@@ -48,8 +48,8 @@ def _read_records(path: Path) -> tuple[list[int], np.ndarray]:
     n = len(raw) // RECORD_SIZE
     for i in range(n):
         base = i * RECORD_SIZE
-        rid = struct.unpack("<I", raw[base : base + 4])[0]
-        emb_bytes = raw[base + 4 : base + RECORD_SIZE]
+        rid = struct.unpack("<Q", raw[base : base + 8])[0]
+        emb_bytes = raw[base + 8 : base + RECORD_SIZE]
         emb = np.frombuffer(emb_bytes, dtype="<f2")
         vectors.append(emb.astype(np.float16))
         ids.append(rid)
@@ -67,19 +67,19 @@ class TestBinaryWriter(unittest.TestCase):
             self.assertTrue(out.exists())
             self.assertEqual(out.stat().st_size, 0)
 
-    def test_write_one_record_size_4100(self) -> None:
+    def test_write_one_record_size_4104(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "emb.bin"
             with EmbeddingWriter(out) as w:
                 w.write_batch([0], _unit_embedding(0))
-            self.assertEqual(out.stat().st_size, 4100)
+            self.assertEqual(out.stat().st_size, 4104)
 
-    def test_write_three_records_size_12300(self) -> None:
+    def test_write_three_records_size_12312(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "emb.bin"
             with EmbeddingWriter(out) as w:
                 w.write_batch([0, 1, 2], _unit_batch(3))
-            self.assertEqual(out.stat().st_size, 12300)
+            self.assertEqual(out.stat().st_size, 12312)
 
     def test_hex_record0_matches_appendix_b(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -87,10 +87,10 @@ class TestBinaryWriter(unittest.TestCase):
             with EmbeddingWriter(out) as w:
                 w.write_batch([0], _unit_embedding(0))
             with out.open("rb") as fp:
-                b = fp.read(8)
-            self.assertEqual(b, b"\x00\x00\x00\x00\x00\x3c\x00\x00")
+                b = fp.read(10)
+            self.assertEqual(b, b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x3c")
 
-    def test_hex_record1_offset_4100_matches_appendix_b(self) -> None:
+    def test_hex_record1_offset_4104_matches_appendix_b(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "emb.bin"
             emb = np.zeros((2, EXPECTED_DIM), dtype=np.float16)
@@ -99,9 +99,9 @@ class TestBinaryWriter(unittest.TestCase):
             with EmbeddingWriter(out) as w:
                 w.write_batch([0, 1], emb)
             with out.open("rb") as fp:
-                fp.seek(4100)
-                b = fp.read(8)
-            self.assertEqual(b, b"\x01\x00\x00\x00\x00\x00\x00\x3c")
+                fp.seek(4104)
+                b = fp.read(12)
+            self.assertEqual(b, b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x3c")
 
     def test_round_trip_ids_and_embeddings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -114,13 +114,13 @@ class TestBinaryWriter(unittest.TestCase):
             self.assertEqual(got_ids, ids)
             self.assertTrue(np.array_equal(got_emb, emb))
 
-    def test_uint32_is_little_endian(self) -> None:
+    def test_uint64_is_little_endian(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "emb.bin"
             with EmbeddingWriter(out) as w:
                 w.write_batch([1], _unit_embedding(0))
             with out.open("rb") as fp:
-                self.assertEqual(fp.read(4), b"\x01\x00\x00\x00")
+                self.assertEqual(fp.read(8), b"\x01\x00\x00\x00\x00\x00\x00\x00")
 
     def test_float16_component_is_little_endian(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -128,7 +128,7 @@ class TestBinaryWriter(unittest.TestCase):
             with EmbeddingWriter(out) as w:
                 w.write_batch([0], _unit_embedding(0))
             with out.open("rb") as fp:
-                fp.seek(4)
+                fp.seek(8)
                 self.assertEqual(fp.read(2), b"\x00\x3c")
 
     def test_id_embedding_count_mismatch_raises(self) -> None:
@@ -159,7 +159,7 @@ class TestBinaryWriter(unittest.TestCase):
             out = Path(td) / "emb.bin"
             with EmbeddingWriter(out) as w:
                 w.write_batch(list(range(100)), _unit_batch(100))
-            self.assertEqual(out.stat().st_size, 410000)
+            self.assertEqual(out.stat().st_size, 410400)
 
     def test_multiple_write_batch_calls_accumulate(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -169,7 +169,7 @@ class TestBinaryWriter(unittest.TestCase):
                 w.write_batch([2, 3], _unit_batch(2))
                 w.write_batch([4, 5], _unit_batch(2))
                 self.assertEqual(w.records_written, 6)
-            self.assertEqual(out.stat().st_size, 24600)
+            self.assertEqual(out.stat().st_size, 24624)
 
     def test_file_valid_after_close_size_modulo(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -204,12 +204,12 @@ class TestBinaryWriter(unittest.TestCase):
                 w.write_batch([0], _unit_embedding(0))
             self.assertTrue(out.exists())
 
-    def test_id_out_of_uint32_range_raises(self) -> None:
+    def test_id_out_of_uint64_range_raises(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "emb.bin"
             with EmbeddingWriter(out) as w:
                 with self.assertRaises(BinaryWriterError):
-                    w.write_batch([UINT32_MAX + 1], _unit_embedding(0))
+                    w.write_batch([UINT64_MAX + 1], _unit_embedding(0))
 
     def test_negative_id_raises(self) -> None:
         with tempfile.TemporaryDirectory() as td:

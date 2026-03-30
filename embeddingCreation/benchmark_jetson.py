@@ -27,6 +27,7 @@ from binary_reader import verify_file
 from binary_writer import EmbeddingWriter
 from embedding_worker import EmbeddingError, EmbeddingWorker, MODEL_ID
 from file_reader import read_text_files
+from packed_id import SentenceMeta, clamp_char_len
 
 LOGGER = logging.getLogger("benchmark_jetson")
 EXPECTED_DIM = 2048
@@ -127,6 +128,22 @@ def _load_corpus_from_dir(corpus_dir: str | Path) -> tuple[list[str], int]:
     return sentences, len(rows)
 
 
+def _as_metas(sentences: list[str], *, shard_doc_num: int = 0) -> list[SentenceMeta]:
+    metas: list[SentenceMeta] = []
+    for i, text in enumerate(sentences):
+        metas.append(
+            SentenceMeta(
+                text=text,
+                para_line=i % 256,
+                char_len=clamp_char_len(len(text)),
+                doc_para_num=(i // 256) % 16384,
+                shard_doc_num=shard_doc_num,
+                shard_num=0,
+            )
+        )
+    return metas
+
+
 def _read_rss_bytes() -> int:
     try:
         with open("/proc/self/status", "r", encoding="utf-8") as fh:
@@ -194,6 +211,7 @@ def run_batch_size_benchmark(
     if batch_size <= 0:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
+    sentence_metas = _as_metas(sentences)
     total_candidate_batches = (len(sentences) + batch_size - 1) // batch_size
     warmup_count = min(max(0, warmup_batches), total_candidate_batches)
 
@@ -218,7 +236,7 @@ def run_batch_size_benchmark(
             pass
 
     if warmup_count > 0:
-        for idx, wb in enumerate(batch_sentences(sentences, batch_size=batch_size, start_id=0), 1):
+        for idx, wb in enumerate(batch_sentences(sentence_metas, batch_size=batch_size), 1):
             _ = worker.encode_batch(wb.sentences)
             if idx >= warmup_count:
                 break
@@ -242,12 +260,15 @@ def run_batch_size_benchmark(
         with EmbeddingWriter(output_path) as writer:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 pending_writes: deque[Future[None]] = deque()
-                for batch in batch_sentences(sentences, batch_size=batch_size, start_id=0):
+                next_id = 0
+                for batch in batch_sentences(sentence_metas, batch_size=batch_size):
                     peak_rss = max(peak_rss, _read_rss_bytes())
                     t0 = time.perf_counter()
                     embeddings = worker.encode_batch(batch.sentences)
                     per_batch_latencies.append(time.perf_counter() - t0)
-                    pending_writes.append(pool.submit(writer.write_batch, batch.ids, embeddings))
+                    ids = list(range(next_id, next_id + len(batch.sentences)))
+                    next_id += len(batch.sentences)
+                    pending_writes.append(pool.submit(writer.write_batch, ids, embeddings))
                     if len(pending_writes) >= MAX_PENDING_WRITES:
                         pending_writes.popleft().result()
                     peak_rss = max(peak_rss, _read_rss_bytes())
@@ -383,9 +404,12 @@ def _run_soak_test(
     timeline: list[dict[str, float | int]] = []
 
     with EmbeddingWriter(output_path) as writer:
-        for idx, batch in enumerate(batch_sentences(sentences, batch_size=batch_size, start_id=0), 1):
+        next_id = 0
+        for idx, batch in enumerate(batch_sentences(_as_metas(sentences), batch_size=batch_size), 1):
             embeddings = worker.encode_batch(batch.sentences)
-            writer.write_batch(batch.ids, embeddings)
+            ids = list(range(next_id, next_id + len(batch.sentences)))
+            next_id += len(batch.sentences)
+            writer.write_batch(ids, embeddings)
             if idx % 10 == 0:
                 cuda_alloc = int(torch.cuda.memory_allocated())
                 rss = _read_rss_bytes()

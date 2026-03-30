@@ -3,7 +3,7 @@
 Step 10 binary reader/verifier for embedding records.
 
 Reads records in the format:
-  uint32 id (little-endian) + float16[2048] embedding (little-endian)
+  uint64 id (little-endian) + float16[2048] embedding (little-endian)
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ from typing import Generator
 
 import numpy as np
 
-RECORD_SIZE: int = 4100
+RECORD_SIZE: int = 4104
 EXPECTED_DIM: int = 2048
-ID_BYTES: int = 4
+ID_BYTES: int = 8
 EMBEDDING_BYTES: int = EXPECTED_DIM * 2
 
 LOGGER = logging.getLogger("binary_reader")
@@ -79,7 +79,7 @@ def iter_records(path: str | Path) -> Generator[tuple[int, np.ndarray], None, No
                     raise BinaryReaderError(
                         f"truncated record encountered: expected {RECORD_SIZE} bytes, got {len(block)}"
                     )
-                rid = struct.unpack("<I", block[:ID_BYTES])[0]
+                rid = struct.unpack("<Q", block[:ID_BYTES])[0]
                 emb = np.frombuffer(block[ID_BYTES:], dtype="<f2").astype(np.float16)
                 if emb.shape[0] != EXPECTED_DIM:
                     raise BinaryReaderError(
@@ -122,7 +122,7 @@ def read_record(path: str | Path, index: int) -> tuple[int, np.ndarray]:
         raise BinaryReaderError(
             f"short read at index {index}: expected {RECORD_SIZE}, got {len(block)}"
         )
-    rid = struct.unpack("<I", block[:ID_BYTES])[0]
+    rid = struct.unpack("<Q", block[:ID_BYTES])[0]
     emb = np.frombuffer(block[ID_BYTES:], dtype="<f2").astype(np.float16)
     if emb.shape[0] != EXPECTED_DIM:
         raise BinaryReaderError(
@@ -154,7 +154,12 @@ def verify_file(
     for i in range(len(ids) - 1):
         if not (ids[i] < ids[i + 1]):
             ids_monotonic = False
-            errors.append(f"ids not strictly increasing at index {i}: {ids[i]} -> {ids[i + 1]}")
+            LOGGER.warning(
+                "ids are non-monotonic at index %d: %d -> %d",
+                i,
+                ids[i],
+                ids[i + 1],
+            )
             break
 
     if len(set(ids)) != len(ids):

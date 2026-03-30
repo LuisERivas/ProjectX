@@ -40,7 +40,7 @@ def _unit_batch(count: int) -> np.ndarray:
 def _manual_write(path: Path, ids: list[int], embeddings: np.ndarray) -> None:
     with path.open("wb") as fp:
         for i, rid in enumerate(ids):
-            fp.write(struct.pack("<I", rid))
+            fp.write(struct.pack("<Q", rid))
             fp.write(embeddings[i].astype("<f2", copy=False).tobytes())
 
 
@@ -129,7 +129,7 @@ class TestBinaryReader(unittest.TestCase):
             _manual_write(path, ids, emb)
             report = verify_file(path)
             self.assertFalse(report.ids_monotonic)
-            self.assertFalse(report.ok)
+            self.assertTrue(report.ok)
 
     def test_verify_id_uniqueness_pass(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -21,6 +21,15 @@ from binary_reader import VerificationReport, verify_file
 from binary_writer import BinaryWriterError, EmbeddingWriter
 from embedding_worker import EmbeddingError, EmbeddingWorker, ModelLoadError
 from file_reader import DEFAULT_MAX_FILE_SIZE, discover_files, read_text_files
+from packed_id import (
+    DOC_PARA_MAX,
+    PARA_LINE_MAX,
+    SHARD_DOC_MAX,
+    SentenceMeta,
+    clamp_char_len,
+    pack_id,
+)
+from paragraph_splitter import split_into_paragraphs
 
 LOGGER = logging.getLogger("ingest_pipeline")
 PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128)
@@ -86,25 +95,53 @@ def _file_sentence_stream(
     max_file_size: int,
     counters: dict[str, int],
     splitter: Callable[[str], list[str]],
-) -> Iterable[tuple[Path, list[str]]]:
-    for path, text in read_text_files(
-        input_directory,
-        extensions=extensions,
-        recursive=recursive,
-        encoding=encoding,
-        skip_hidden=skip_hidden,
-        max_file_size_bytes=max_file_size,
+) -> Iterable[tuple[int, Path, list[SentenceMeta]]]:
+    for shard_doc_num, (path, text) in enumerate(
+        read_text_files(
+            input_directory,
+            extensions=extensions,
+            recursive=recursive,
+            encoding=encoding,
+            skip_hidden=skip_hidden,
+            max_file_size_bytes=max_file_size,
+        )
     ):
         counters["files_read"] += 1
         try:
-            sentences = splitter(text)
+            paragraphs = split_into_paragraphs(text)
+            metas: list[SentenceMeta] = []
+            for doc_para_num, paragraph in enumerate(paragraphs):
+                if doc_para_num > DOC_PARA_MAX:
+                    raise ValueError(
+                        f"doc_para_num overflow in {path.name}: {doc_para_num} > {DOC_PARA_MAX}"
+                    )
+                para_sentences = splitter(paragraph)
+                for para_line, sentence in enumerate(para_sentences):
+                    if para_line > PARA_LINE_MAX:
+                        raise ValueError(
+                            f"para_line overflow in {path.name}: {para_line} > {PARA_LINE_MAX}"
+                        )
+                    metas.append(
+                        SentenceMeta(
+                            text=sentence,
+                            para_line=para_line,
+                            char_len=clamp_char_len(len(sentence)),
+                            doc_para_num=doc_para_num,
+                            shard_doc_num=shard_doc_num,
+                            shard_num=0,
+                        )
+                    )
         except Exception as exc:
             counters["files_skipped"] += 1
             LOGGER.warning("[SPLITTER] skipping file %s: %s", path.name, exc)
             continue
-        counters["total_sentences"] += len(sentences)
-        LOGGER.info("split file: path=%s sentences=%d", path.name, len(sentences))
-        yield path, sentences
+        counters["total_sentences"] += len(metas)
+        LOGGER.info("split file: path=%s sentences=%d", path.name, len(metas))
+        if shard_doc_num > SHARD_DOC_MAX:
+            raise ValueError(
+                f"shard_doc_num overflow for file {path.name}: {shard_doc_num} > {SHARD_DOC_MAX}"
+            )
+        yield shard_doc_num, path, metas
 
 
 def probe_batch_size(
@@ -261,9 +298,7 @@ def run_pipeline(
         with EmbeddingWriter(out_path) as writer:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 pending_writes: deque[Future[None]] = deque()
-                next_id = 0
-
-                for path, file_sentences in _file_sentence_stream(
+                for _, path, file_metas in _file_sentence_stream(
                     in_dir,
                     extensions=extensions,
                     recursive=recursive,
@@ -273,8 +308,10 @@ def run_pipeline(
                     counters=counters,
                     splitter=splitter,
                 ):
-                    if not file_sentences:
+                    if not file_metas:
                         continue
+                    file_metas_sorted = sorted(file_metas, key=lambda m: m.char_len)
+                    file_sentences = [m.text for m in file_metas_sorted]
                     probe_sample = file_sentences[: max(PROBE_CANDIDATE_BATCH_SIZES)]
                     selected_batch_size = (
                         probe_batch_size(
@@ -289,19 +326,28 @@ def run_pipeline(
                     LOGGER.info(
                         "file batch size selected: file=%s sentences=%d batch_size=%d",
                         path.name,
-                        len(file_sentences),
+                        len(file_metas_sorted),
                         selected_batch_size,
                     )
 
                     for batch in batch_sentences(
-                        file_sentences,
+                        file_metas_sorted,
                         batch_size=selected_batch_size,
-                        start_id=next_id,
                     ):
                         total_batches += 1
                         embeddings = worker.encode_batch(batch.sentences)
+                        ids = [
+                            pack_id(
+                                m.para_line,
+                                m.char_len,
+                                m.doc_para_num,
+                                m.shard_num,
+                                m.shard_doc_num,
+                            )
+                            for m in batch.metas
+                        ]
                         pending_writes.append(
-                            pool.submit(writer.write_batch, batch.ids, embeddings)
+                            pool.submit(writer.write_batch, ids, embeddings)
                         )
                         if len(pending_writes) >= MAX_PENDING_WRITES:
                             pending_writes.popleft().result()
@@ -310,7 +356,6 @@ def run_pipeline(
                             total_batches,
                             len(batch.sentences),
                         )
-                    next_id += len(file_sentences)
 
                 while pending_writes:
                     pending_writes.popleft().result()
@@ -333,6 +378,11 @@ def run_pipeline(
     except OverflowError as exc:
         success = False
         msg = f"[OVERFLOW] {exc}"
+        errors.append(msg)
+        LOGGER.error(msg)
+    except ValueError as exc:
+        success = False
+        msg = f"[ID] {exc}"
         errors.append(msg)
         LOGGER.error(msg)
     finally:
