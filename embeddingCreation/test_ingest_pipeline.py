@@ -502,33 +502,33 @@ class TestIngestPipeline(unittest.TestCase):
     def test_probe_batch_size_skips_larger_candidates_after_failure(self) -> None:
         worker = _FakeWorker()
         worker.init()
-        _FakeWorker.fail_on_batch_size_at_or_above = 64
+        _FakeWorker.fail_on_batch_size_at_or_above = 256
         picked = probe_batch_size(
             worker,
-            ["s"] * 128,
-            candidates=(16, 32, 64, 128),
+            ["s"] * 512,
+            candidates=(64, 128, 256, 512),
             fallback_batch_size=8,
         )
-        self.assertIn(picked, (16, 32))
-        self.assertIn(64, _FakeWorker.seen_batch_sizes)
-        self.assertNotIn(128, _FakeWorker.seen_batch_sizes)
+        self.assertIn(picked, (64, 128))
+        self.assertIn(256, _FakeWorker.seen_batch_sizes)
+        self.assertNotIn(512, _FakeWorker.seen_batch_sizes)
 
     def test_probe_max_successful_returns_largest_ok_candidate(self) -> None:
         worker = _FakeWorker()
         worker.init()
         picked = probe_batch_size(
             worker,
-            ["s"] * 128,
-            candidates=(16, 32, 64, 128),
+            ["s"] * 512,
+            candidates=(64, 128, 256, 512),
             fallback_batch_size=8,
             strategy=ProbeStrategy.MAX_SUCCESSFUL,
         )
-        self.assertEqual(picked, 128)
+        self.assertEqual(picked, 512)
 
     def test_probe_min_latency_prefers_better_per_sentence(self) -> None:
         worker = _FakeWorker()
         worker.init()
-        # Two perf_counter calls per candidate: start, end. 64 wins on latency/sentence.
+        # Two perf_counter calls per candidate: start, end. 256 wins on latency/sentence.
         perf = [
             0.0,
             0.032,
@@ -538,14 +538,14 @@ class TestIngestPipeline(unittest.TestCase):
         with patch("ingest_pipeline.time.perf_counter", side_effect=perf):
             picked = probe_batch_size(
                 worker,
-                ["s"] * 128,
-                candidates=(64, 128),
+                ["s"] * 512,
+                candidates=(256, 512),
                 fallback_batch_size=8,
                 strategy=ProbeStrategy.MIN_LATENCY_PER_SENT,
             )
-        self.assertEqual(picked, 64)
+        self.assertEqual(picked, 256)
 
-    def test_probe_max_successful_returns_128_when_min_latency_would_pick_64(self) -> None:
+    def test_probe_max_successful_returns_512_when_min_latency_would_pick_256(self) -> None:
         worker = _FakeWorker()
         worker.init()
         perf = [
@@ -557,55 +557,79 @@ class TestIngestPipeline(unittest.TestCase):
         with patch("ingest_pipeline.time.perf_counter", side_effect=perf * 2):
             min_pick = probe_batch_size(
                 worker,
-                ["s"] * 128,
-                candidates=(64, 128),
+                ["s"] * 512,
+                candidates=(256, 512),
                 fallback_batch_size=8,
                 strategy=ProbeStrategy.MIN_LATENCY_PER_SENT,
             )
             max_pick = probe_batch_size(
                 worker,
-                ["s"] * 128,
-                candidates=(64, 128),
+                ["s"] * 512,
+                candidates=(256, 512),
                 fallback_batch_size=8,
                 strategy=ProbeStrategy.MAX_SUCCESSFUL,
             )
-        self.assertEqual(min_pick, 64)
-        self.assertEqual(max_pick, 128)
+        self.assertEqual(min_pick, 256)
+        self.assertEqual(max_pick, 512)
 
     def test_probe_epsilon_prefers_largest_within_band(self) -> None:
         worker = _FakeWorker()
         worker.init()
-        # 64: 0.032/64 = 0.0005/sent; 128: 0.06656/128 = 0.00052/sent (within 5% of 0.0005)
-        perf = [0.0, 0.032, 0.0, 0.06656]
+        # 256: 0.032/256 = 0.000125/sent; 512: 0.066/512 within 5% of best
+        perf = [0.0, 0.032, 0.0, 0.066]
         with patch("ingest_pipeline.time.perf_counter", side_effect=perf):
             picked = probe_batch_size(
                 worker,
-                ["s"] * 128,
-                candidates=(64, 128),
+                ["s"] * 512,
+                candidates=(256, 512),
                 fallback_batch_size=8,
                 strategy=ProbeStrategy.EPSILON,
                 probe_epsilon=0.05,
             )
-        self.assertEqual(picked, 128)
+        self.assertEqual(picked, 512)
 
     def test_resolved_probe_candidates_defaults(self) -> None:
-        self.assertEqual(_resolved_probe_candidates(None, None), (16, 32, 64, 128))
+        self.assertEqual(_resolved_probe_candidates(None, None), (64, 128))
 
     def test_resolved_probe_candidates_max_probe_batch(self) -> None:
-        self.assertEqual(_resolved_probe_candidates(None, 64), (16, 32, 64))
+        self.assertEqual(_resolved_probe_candidates(None, 64), (64,))
         self.assertEqual(
             _resolved_probe_candidates(None, 512),
-            (16, 32, 64, 128, 256, 512),
+            (64, 128, 256, 512),
         )
         self.assertEqual(
             _resolved_probe_candidates(None, 1024),
-            (16, 32, 64, 128, 256, 512, 1024),
+            (64, 128, 256, 512, 1024),
+        )
+        self.assertEqual(
+            _resolved_probe_candidates(None, 16384),
+            (
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+            ),
         )
 
-    def test_resolved_probe_candidates_bucketing_includes_1024(self) -> None:
+    def test_resolved_probe_candidates_bucketing_includes_largest(self) -> None:
         self.assertEqual(
             _resolved_probe_candidates(None, None, char_len_bucketing=True),
-            (16, 32, 64, 128, 256, 512, 1024),
+            (
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+            ),
         )
 
     def test_resolved_probe_candidates_explicit_and_cap(self) -> None:
@@ -675,8 +699,8 @@ class TestIngestPipeline(unittest.TestCase):
     def test_char_len_bucketing_two_buckets_four_probe_calls(self) -> None:
         def _two_band_splitter(text: str, *, locale: str) -> list[str]:
             del text, locale
-            shorts = [f"{i:02d}aaaaaaaaaa." for i in range(16)]
-            longs = [f"{i:02d}" + "b" * 22 + "." for i in range(16)]
+            shorts = [f"{i:03d}aaaaaaaaaa." for i in range(64)]
+            longs = [f"{i:03d}" + "b" * 22 + "." for i in range(64)]
             return shorts + longs
 
         real_pb = ingest_pipeline_mod.probe_batch_size
@@ -704,22 +728,22 @@ class TestIngestPipeline(unittest.TestCase):
                     max_probe_batch=64,
                 )
         self.assertTrue(res.success)
-        self.assertEqual(res.records_written, 32)
+        self.assertEqual(res.records_written, 128)
         self.assertEqual(spy.probe_count, 4)
 
     def test_per_document_probe_applied_to_each_file(self) -> None:
         with TemporaryDirectory() as td:
             root = Path(td) / "in"
             out = Path(td) / "out.bin"
-            doc1 = " ".join(f"D1_{i}." for i in range(20))
-            doc2 = " ".join(f"D2_{i}." for i in range(20))
+            doc1 = " ".join(f"D1_{i}." for i in range(70))
+            doc2 = " ".join(f"D2_{i}." for i in range(70))
             self._write_texts(root, {"a.txt": doc1, "b.txt": doc2})
             with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
                 "ingest_pipeline._split_text", _simple_splitter
-            ), patch("ingest_pipeline.probe_batch_size", return_value=16) as probe_mock:
+            ), patch("ingest_pipeline.probe_batch_size", return_value=64) as probe_mock:
                 res = run_pipeline(root, out, batch_size=4)
             self.assertTrue(res.success)
-            self.assertEqual(res.records_written, 40)
+            self.assertEqual(res.records_written, 140)
             self.assertEqual(res.total_batches, 4)
             self.assertEqual(probe_mock.call_count, 4)
 

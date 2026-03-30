@@ -34,9 +34,19 @@ from packed_id import (
 from paragraph_splitter import split_into_paragraphs
 
 LOGGER = logging.getLogger("ingest_pipeline")
-# Full ladder for use with max_probe_batch / char_len bucketing (cap 1024 when bucketing on).
-FULL_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024)
-PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128)
+# Full ladder for max_probe_batch / char_len bucketing (cap 16384 when bucketing on).
+FULL_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+)
+PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (64, 128)
 DEFAULT_CHAR_LEN_BUCKET_EDGES: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024)
 MAX_PENDING_WRITES: int = 2
 CHAR_BUDGET_PER_SENTENCE: int = 256
@@ -61,7 +71,7 @@ def _resolved_probe_candidates(
     """Ordered distinct positive candidates.
 
     When probe_batch_sizes is None: use FULL_PROBE_CANDIDATE_BATCH_SIZES capped by max_probe_batch,
-    or 128 (non-bucketing) / 1024 (bucketing) when max_probe_batch is None.
+    or 128 (non-bucketing) / 16384 (bucketing) when max_probe_batch is None.
     """
     if max_probe_batch is not None and max_probe_batch < 1:
         raise ValueError(f"max_probe_batch must be >= 1 when set, got {max_probe_batch}")
@@ -73,7 +83,7 @@ def _resolved_probe_candidates(
     if max_probe_batch is not None:
         cap = max_probe_batch
     else:
-        cap = 1024 if char_len_bucketing else 128
+        cap = 16384 if char_len_bucketing else 128
     return tuple(c for c in FULL_PROBE_CANDIDATE_BATCH_SIZES if c <= cap)
 
 

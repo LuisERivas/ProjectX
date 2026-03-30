@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help=(
             "cap probe ladder: when set without --probe-batch-sizes, try batch sizes up to N "
-            "from the built-in ladder (16,32,64,128,256,512,1024). When set with --probe-batch-sizes, "
+            "from the built-in ladder (64..16384 powers-of-two steps). When set with --probe-batch-sizes, "
             "drops candidates above N"
         ),
     )
@@ -95,7 +95,7 @@ def parse_args() -> argparse.Namespace:
         type=_parse_probe_batch_sizes,
         default=None,
         metavar="LIST",
-        help='explicit probe sizes, e.g. "16,32,64,128,256" (comma-separated)',
+        help='explicit probe sizes, e.g. "64,128,256,512" (comma-separated)',
     )
     parser.add_argument(
         "--probe-log-cuda-memory",
@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "split each file into char_len bands (default edges "
             f"{','.join(str(e) for e in DEFAULT_CHAR_LEN_BUCKET_EDGES)}), probe and batch each "
-            "band separately; default probe ladder cap becomes 1024 (many probe encodes; use "
+            "band separately; default probe ladder cap becomes 16384 (many probe encodes; use "
             "--max-probe-batch or --probe-batch-sizes to limit)"
         ),
     )
