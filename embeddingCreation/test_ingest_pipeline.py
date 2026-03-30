@@ -117,7 +117,7 @@ class TestIngestPipeline(unittest.TestCase):
             self.assertTrue(out.exists())
             self.assertEqual(res.total_sentences, 5)
             self.assertEqual(res.records_written, 5)
-            self.assertEqual(out.stat().st_size, 5 * 4104)
+            self.assertEqual(out.stat().st_size, 5 * 4106)
 
     def test_end_to_end_five_files(self) -> None:
         with TemporaryDirectory() as td:

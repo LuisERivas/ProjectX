@@ -25,9 +25,9 @@ except Exception:  # pragma: no cover - handled by requirement gate
     np = None
 
 EXPECTED_MODEL_ID = "voyageai/voyage-4-nano"
-EXPECTED_RECORD_SIZE = 4104
+EXPECTED_RECORD_SIZE = 4106
 EXPECTED_DIM = 2048
-UINT64_MAX = (2**64) - 1
+UINT80_MAX = (2**80) - 1
 SPOTCHECK_SEED = 42
 SPOTCHECK_COUNT = 5
 
@@ -188,7 +188,7 @@ def _run_acceptance(corpus_dir: Path, output_path: Path) -> _AssertionState:
     _assert(
         state,
         size == result.records_written * EXPECTED_RECORD_SIZE,
-        "output file size equals records_written * 4104",
+        "output file size equals records_written * 4106",
         f"{size} vs {result.records_written * EXPECTED_RECORD_SIZE}",
     )
     try:
@@ -233,8 +233,8 @@ def _run_acceptance(corpus_dir: Path, output_path: Path) -> _AssertionState:
     )
     _assert(
         state,
-        report is not None and report.id_max is not None and report.id_max <= UINT64_MAX,
-        "verify_file(output).id_max is <= uint64 max",
+        report is not None and report.id_max is not None and report.id_max <= UINT80_MAX,
+        "verify_file(output).id_max is <= uint80 max",
         str(None if report is None else report.id_max),
     )
 
@@ -265,7 +265,7 @@ def _run_acceptance(corpus_dir: Path, output_path: Path) -> _AssertionState:
             if not (0.95 <= norm <= 1.05):
                 all_spot_ok = False
                 break
-            if not (0 <= rid <= UINT64_MAX):
+            if not (0 <= rid <= UINT80_MAX):
                 all_spot_ok = False
                 break
     _assert(state, all_spot_ok, "random spot checks pass (seed=42, 5 records)")

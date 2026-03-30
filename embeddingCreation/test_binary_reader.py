@@ -8,7 +8,6 @@ Usage:
 
 from __future__ import annotations
 
-import struct
 import subprocess
 import sys
 import tempfile
@@ -40,7 +39,7 @@ def _unit_batch(count: int) -> np.ndarray:
 def _manual_write(path: Path, ids: list[int], embeddings: np.ndarray) -> None:
     with path.open("wb") as fp:
         for i, rid in enumerate(ids):
-            fp.write(struct.pack("<Q", rid))
+            fp.write(int(rid).to_bytes(10, byteorder="little", signed=False))
             fp.write(embeddings[i].astype("<f2", copy=False).tobytes())
 
 

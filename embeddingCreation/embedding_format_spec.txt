@@ -29,22 +29,22 @@ Global rules
   file = record[0] || record[1] || ... || record[N-1]
 
 - **Empty file (N = 0):** 0 bytes (valid if the writer allows no sentences).
-- **Record index k** (0-based) starts at file offset **k * 4104**.
+- **Record index k** (0-based) starts at file offset **k * 4106**.
 
 
 ================================================================================
-2. RECORD LAYOUT (fixed width per record: 4104 bytes)
+2. RECORD LAYOUT (fixed width per record: 4106 bytes)
 ================================================================================
 
 Field        Type              Size        Notes
 -----        ----              ----        -----
-id           u64               8 bytes     Per-sentence packed id (see ID policy).
+id           u80               10 bytes    Per-sentence packed id (see ID policy).
 embedding    float16[2048]     4096 bytes  2048 dimensions in IEEE binary16;
                                         L2-normalized then float16; index 0..2047.
 
 Record size derivation
 ----------------------
-  8 + (2048 * 2) = 8 + 4096 = 4104 bytes per record.
+  10 + (2048 * 2) = 10 + 4096 = 4106 bytes per record.
 
 Dimension and dtype (normative)
 -------------------------------
@@ -98,14 +98,14 @@ directories; exact filtering rules remain defined in Step 5.
 5. ID POLICY
 ================================================================================
 
-Per-record id (in each record's first eight bytes):
-- Type: uint64 (u64), little-endian.
+Per-record id (in each record's first ten bytes):
+- Type: uint80 (u80), little-endian raw bytes.
 - IDs are packed bitfields with this layout:
-  - bits 63..48 (16): shard_doc_num
-  - bits 47..34 (14): shard_num
-  - bits 33..20 (14): doc_para_num
-  - bits 19..8  (12): char_len
-  - bits 7..0   (8): para_line
+  - bits 79..64 (16): shard_doc_num
+  - bits 63..50 (14): shard_num
+  - bits 49..32 (18): doc_para_num
+  - bits 31..16 (16): char_len
+  - bits 15..0  (16): para_line
 - Uniqueness: ids must be unique for all records written in one output file.
 - Ordering: ids are not required to be monotonic.
 
@@ -116,14 +116,14 @@ Per-record id (in each record's first eight bytes):
 
 Let N = number of records.
 
-  file_bytes = N * 4104
+  file_bytes = N * 4106
 
 Examples:
 - N = 0  -> 0 bytes.
-- N = 1  -> 4104 bytes.
-- N = 2  -> 8200 bytes.
+- N = 1  -> 4106 bytes.
+- N = 2  -> 8212 bytes.
 
-Readers may validate: **file size modulo 4104 == 0** (for non-empty files,
+Readers may validate: **file size modulo 4106 == 0** (for non-empty files,
 or including empty file as a special case).
 
 
@@ -151,13 +151,13 @@ APPENDIX A — Step 1 tests: manual size checks
 
 A.1 Record size
 ---------------
-  id:           8 bytes
+  id:           10 bytes
   embedding:    2048 float16 = 4096 bytes
-  Total:        4104 bytes per record.
+  Total:        4106 bytes per record.
 
 A.2 File size formula
 ---------------------
-  file_bytes = N * 4104
+  file_bytes = N * 4106
 
 
 ================================================================================
@@ -170,31 +170,31 @@ IEEE binary16 reference:
 
 B.1 Record 0 (id = 0, first component 1.0, rest 0.0) at file offset 0
 ----------------------------------------------------------------------
-  id u64 0:                    00 00 00 00 00 00 00 00
+  id u80 0:                    00 00 00 00 00 00 00 00 00 00
   embedding[0] = 1.0:          00 3C
   embedding[1] = 0.0:          00 00
   ... (2046 more half zeros)   (00 00 repeated)
 
 First 24 bytes of file (start of record 0):
-  00 00 00 00 00 00 00 00 00 3C 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-  |----- id=0 (u64) -----| |1.0| |----- seven zeros (float16) -----|
+  00 00 00 00 00 00 00 00 00 00 00 3C 00 00 00 00 00 00 00 00 00 00 00 00
+  |------- id=0 (u80) -------| |1.0| |----- six zeros (float16) -----|
 
-B.2 Record 1 (id = 1, first component 0.0, second 1.0, rest 0.0) at offset 4104
+B.2 Record 1 (id = 1, first component 0.0, second 1.0, rest 0.0) at offset 4106
 -------------------------------------------------------------------------------
-  id u64 1:                    01 00 00 00 00 00 00 00
+  id u80 1:                    01 00 00 00 00 00 00 00 00 00
   embedding[0] = 0.0:          00 00
   embedding[1] = 1.0:          00 3C
   embedding[2..2047] = 0.0:    00 00 each
 
-First 24 bytes of record 1 (file offset 4104):
-  01 00 00 00 00 00 00 00 00 00 00 3C 00 00 00 00 00 00 00 00 00 00 00 00
-  |----- id=1 (u64) -----| |0.0| |1.0| |----- six zeros -----|
+First 24 bytes of record 1 (file offset 4106):
+  01 00 00 00 00 00 00 00 00 00 00 00 00 3C 00 00 00 00 00 00 00 00 00 00
+  |------- id=1 (u80) -------| |0.0| |1.0| |----- five zeros -----|
 
 B.3 File layout summary for N = 2
 -----------------------------------
-  Bytes 0..4103     : record 0 (4104 bytes; B.1 shows start)
-  Bytes 4104..8207  : record 1 (4104 bytes; B.2 shows start)
+  Bytes 0..4105     : record 0 (4106 bytes; B.1 shows start)
+  Bytes 4106..8211  : record 1 (4106 bytes; B.2 shows start)
 
-  Total file size: 2 * 4104 = 8208 bytes.
+  Total file size: 2 * 4106 = 8212 bytes.
 
 ================================================================================

@@ -3,13 +3,12 @@
 Step 10 binary reader/verifier for embedding records.
 
 Reads records in the format:
-  uint64 id (little-endian) + float16[2048] embedding (little-endian)
+  uint80 id (10-byte little-endian) + float16[2048] embedding (little-endian)
 """
 
 from __future__ import annotations
 
 import logging
-import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,9 +16,9 @@ from typing import Generator
 
 import numpy as np
 
-RECORD_SIZE: int = 4104
+RECORD_SIZE: int = 4106
 EXPECTED_DIM: int = 2048
-ID_BYTES: int = 8
+ID_BYTES: int = 10
 EMBEDDING_BYTES: int = EXPECTED_DIM * 2
 
 LOGGER = logging.getLogger("binary_reader")
@@ -79,7 +78,7 @@ def iter_records(path: str | Path) -> Generator[tuple[int, np.ndarray], None, No
                     raise BinaryReaderError(
                         f"truncated record encountered: expected {RECORD_SIZE} bytes, got {len(block)}"
                     )
-                rid = struct.unpack("<Q", block[:ID_BYTES])[0]
+                rid = int.from_bytes(block[:ID_BYTES], byteorder="little", signed=False)
                 emb = np.frombuffer(block[ID_BYTES:], dtype="<f2").astype(np.float16)
                 if emb.shape[0] != EXPECTED_DIM:
                     raise BinaryReaderError(
@@ -122,7 +121,7 @@ def read_record(path: str | Path, index: int) -> tuple[int, np.ndarray]:
         raise BinaryReaderError(
             f"short read at index {index}: expected {RECORD_SIZE}, got {len(block)}"
         )
-    rid = struct.unpack("<Q", block[:ID_BYTES])[0]
+    rid = int.from_bytes(block[:ID_BYTES], byteorder="little", signed=False)
     emb = np.frombuffer(block[ID_BYTES:], dtype="<f2").astype(np.float16)
     if emb.shape[0] != EXPECTED_DIM:
         raise BinaryReaderError(

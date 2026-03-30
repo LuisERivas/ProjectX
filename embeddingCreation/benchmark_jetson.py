@@ -134,9 +134,9 @@ def _as_metas(sentences: list[str], *, shard_doc_num: int = 0) -> list[SentenceM
         metas.append(
             SentenceMeta(
                 text=text,
-                para_line=i % 256,
+                para_line=i % 65536,
                 char_len=clamp_char_len(len(text)),
-                doc_para_num=(i // 256) % 16384,
+                doc_para_num=(i // 65536) % 262144,
                 shard_doc_num=shard_doc_num,
                 shard_num=0,
             )

@@ -3,7 +3,7 @@
 Step 9 binary writer for embedding records.
 
 Writes records as:
-  uint64 id (little-endian) + float16[2048] embedding (little-endian)
+  uint80 id (10-byte little-endian) + float16[2048] embedding (little-endian)
 """
 
 from __future__ import annotations
@@ -14,10 +14,11 @@ from pathlib import Path
 
 import numpy as np
 
-RECORD_SIZE: int = 4104
+RECORD_SIZE: int = 4106
 EXPECTED_DIM: int = 2048
 EMBEDDING_BYTES: int = EXPECTED_DIM * 2  # float16 => 2 bytes each
-UINT64_MAX: int = (2**64) - 1
+ID_BYTES: int = 10
+UINT80_MAX: int = (2**80) - 1
 
 LOGGER = logging.getLogger("binary_writer")
 
@@ -71,22 +72,27 @@ class EmbeddingWriter:
                 f"id count ({len(ids)}) != embedding count ({arr.shape[0]})"
             )
 
-        try:
-            id_arr = np.asarray(ids, dtype=np.int64)
-        except Exception as exc:
-            raise BinaryWriterError("ids must be int-convertible values") from exc
-        if id_arr.ndim != 1 or id_arr.shape[0] != len(ids):
-            raise BinaryWriterError("ids must be a flat list of integers")
-        if np.any(id_arr < 0) or np.any(id_arr > UINT64_MAX):
-            bad = int(id_arr[(id_arr < 0) | (id_arr > UINT64_MAX)][0])
-            raise BinaryWriterError(f"id {bad} outside uint64 range")
+        normalized_ids: list[int] = []
+        for rid in ids:
+            try:
+                value = int(rid)
+            except Exception as exc:
+                raise BinaryWriterError("ids must be int-convertible values") from exc
+            if value < 0 or value > UINT80_MAX:
+                raise BinaryWriterError(f"id {value} outside uint80 range")
+            normalized_ids.append(value)
 
         le_arr = arr.astype("<f2", copy=False)
-        record_dtype = np.dtype([("id", "<u8"), ("emb", ("<f2", EXPECTED_DIM))])
-        block = np.empty(len(ids), dtype=record_dtype)
-        block["id"] = id_arr.astype("<u8", copy=False)
-        block["emb"] = le_arr
-        payload = block.tobytes()
+        chunks: list[bytes] = []
+        for i, rid in enumerate(normalized_ids):
+            id_bytes = rid.to_bytes(ID_BYTES, byteorder="little", signed=False)
+            emb_bytes = le_arr[i].tobytes()
+            if len(emb_bytes) != EMBEDDING_BYTES:
+                raise BinaryWriterError(
+                    f"embedding byte size mismatch: got {len(emb_bytes)}, expected {EMBEDDING_BYTES}"
+                )
+            chunks.append(id_bytes + emb_bytes)
+        payload = b"".join(chunks)
         if len(payload) != len(ids) * RECORD_SIZE:
             raise BinaryWriterError(
                 f"record block byte size mismatch: got {len(payload)}, expected {len(ids) * RECORD_SIZE}"
