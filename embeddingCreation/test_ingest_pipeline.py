@@ -8,6 +8,8 @@ Usage:
 
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,7 +17,9 @@ from unittest.mock import patch
 
 import numpy as np
 
+from binary_writer import BinaryWriterError
 from binary_reader import read_all
+from embedding_worker import EmbeddingError, ModelLoadError
 from ingest_pipeline import run_pipeline
 
 try:
@@ -64,7 +68,7 @@ class _FakeWorker:
     def encode_batch(self, sentences: list[str]) -> np.ndarray:
         _FakeWorker.encode_calls += 1
         if _FakeWorker.fail_on_encode:
-            raise RuntimeError("forced encode failure")
+            raise EmbeddingError("forced encode failure")
         arr = np.zeros((len(sentences), 2048), dtype=np.float16)
         for i in range(len(sentences)):
             arr[i, i % 2048] = np.float16(1.0)
@@ -78,6 +82,10 @@ class _FakeWorker:
 class TestIngestPipeline(unittest.TestCase):
     def setUp(self) -> None:
         _FakeWorker.reset()
+        # Most tests patch the worker; bypass startup CUDA checks by default.
+        self._startup_patcher = patch("ingest_pipeline._validate_startup", return_value=None)
+        self._startup_patcher.start()
+        self.addCleanup(self._startup_patcher.stop)
 
     def _write_texts(self, root: Path, files: dict[str, str]) -> None:
         root.mkdir(parents=True, exist_ok=True)
@@ -232,6 +240,7 @@ class TestIngestPipeline(unittest.TestCase):
                 res = run_pipeline(root, out, batch_size=2)
             self.assertEqual(res.files_discovered, 2)
             self.assertEqual(res.files_read, 2)
+            self.assertEqual(res.files_skipped, 0)
             self.assertEqual(res.total_sentences, 3)
             self.assertEqual(res.total_batches, 2)
             self.assertEqual(res.records_written, 3)
@@ -248,11 +257,182 @@ class TestIngestPipeline(unittest.TestCase):
             with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
                 "ingest_pipeline._split_text", _simple_splitter
             ):
-                with self.assertRaises(RuntimeError):
-                    run_pipeline(root, out)
+                res = run_pipeline(root, out)
             self.assertEqual(_FakeWorker.shutdown_calls, 1)
+            self.assertFalse(res.success)
+            self.assertTrue(any(e.startswith("[ENCODE]") for e in res.errors))
             self.assertFalse(tmp.exists())
             self.assertFalse(out.exists())
+
+    def test_startup_input_dir_missing(self) -> None:
+        self._startup_patcher.stop()
+        with TemporaryDirectory() as td:
+            root = Path(td) / "missing_dir"
+            out = Path(td) / "out.bin"
+            res = run_pipeline(root, out)
+            self.assertFalse(res.success)
+            self.assertTrue(res.errors)
+            self.assertIn("[STARTUP]", res.errors[0])
+            self.assertEqual(res.records_written, 0)
+
+    def test_startup_output_path_is_directory(self) -> None:
+        self._startup_patcher.stop()
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            root.mkdir()
+            out_dir = Path(td) / "outdir"
+            out_dir.mkdir()
+            res = run_pipeline(root, out_dir)
+            self.assertFalse(res.success)
+            self.assertIn("[STARTUP]", res.errors[0])
+
+    def test_startup_output_parent_missing(self) -> None:
+        self._startup_patcher.stop()
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            root.mkdir()
+            out = Path(td) / "missing_parent" / "out.bin"
+            res = run_pipeline(root, out)
+            self.assertFalse(res.success)
+            self.assertIn("[STARTUP]", res.errors[0])
+
+    def test_startup_cuda_unavailable(self) -> None:
+        self._startup_patcher.stop()
+        fake_torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: False)
+        )
+        with TemporaryDirectory() as td, patch.dict(sys.modules, {"torch": fake_torch}):
+            root = Path(td) / "in"
+            root.mkdir()
+            out = Path(td) / "out.bin"
+            res = run_pipeline(root, out)
+            self.assertFalse(res.success)
+            self.assertTrue(any(e.startswith("[CUDA]") for e in res.errors))
+
+    def test_model_load_failure_returns_result(self) -> None:
+        class _FailLoadWorker(_FakeWorker):
+            def init(self) -> None:  # type: ignore[override]
+                _FakeWorker.init_calls += 1
+                raise ModelLoadError("model failed to load")
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            self._write_texts(root, {"a.txt": "A. B."})
+            with patch("ingest_pipeline.EmbeddingWorker", _FailLoadWorker), patch(
+                "ingest_pipeline._split_text", _simple_splitter
+            ):
+                res = run_pipeline(root, out)
+            self.assertFalse(res.success)
+            self.assertTrue(any(e.startswith("[MODEL_LOAD]") for e in res.errors))
+            self.assertEqual(_FakeWorker.shutdown_calls, 1)
+            self.assertFalse(out.exists())
+
+    def test_write_failure_returns_result(self) -> None:
+        class _FailWriter:
+            def __init__(self, output_path: Path) -> None:
+                self.output_path = Path(output_path)
+                self.records_written = 0
+
+            def __enter__(self) -> "_FailWriter":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                tmp = self.output_path.with_name(f"{self.output_path.name}.tmp")
+                if tmp.exists():
+                    tmp.unlink()
+                return False
+
+            def write_batch(self, ids: list[int], embeddings: np.ndarray) -> None:
+                del ids, embeddings
+                raise BinaryWriterError("forced write failure")
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            self._write_texts(root, {"a.txt": "A. B."})
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline.EmbeddingWriter", _FailWriter
+            ), patch("ingest_pipeline._split_text", _simple_splitter):
+                res = run_pipeline(root, out)
+            self.assertFalse(res.success)
+            self.assertTrue(any(e.startswith("[WRITE]") for e in res.errors))
+
+    def test_overflow_returns_result(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            self._write_texts(root, {"a.txt": "A. B."})
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline.batch_sentences",
+                side_effect=OverflowError("sentence ID 4294967296 exceeds uint32 max"),
+            ), patch("ingest_pipeline._split_text", _simple_splitter):
+                res = run_pipeline(root, out)
+            self.assertFalse(res.success)
+            self.assertTrue(any(e.startswith("[OVERFLOW]") for e in res.errors))
+
+    def test_splitter_error_skips_file_continues(self) -> None:
+        def _split_with_one_bad(text: str, *, locale: str) -> list[str]:
+            del locale
+            if "BADFILE" in text:
+                raise ValueError("forced splitter failure")
+            return _simple_splitter(text, locale="en_US")
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            self._write_texts(
+                root,
+                {
+                    "a.txt": "A. B.",
+                    "bad.txt": "BADFILE",
+                    "c.txt": "C.",
+                },
+            )
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline._split_text", _split_with_one_bad
+            ):
+                res = run_pipeline(root, out, batch_size=4)
+            self.assertTrue(res.success)
+            self.assertEqual(res.records_written, 3)
+            self.assertEqual(res.files_skipped, 1)
+
+    def test_no_output_file_after_model_load_failure(self) -> None:
+        class _FailLoadWorker(_FakeWorker):
+            def init(self) -> None:  # type: ignore[override]
+                raise ModelLoadError("model failed to load")
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            tmp = Path(td) / "out.bin.tmp"
+            self._write_texts(root, {"a.txt": "A."})
+            with patch("ingest_pipeline.EmbeddingWorker", _FailLoadWorker), patch(
+                "ingest_pipeline._split_text", _simple_splitter
+            ):
+                res = run_pipeline(root, out)
+            self.assertFalse(res.success)
+            self.assertFalse(out.exists())
+            self.assertFalse(tmp.exists())
+
+    def test_files_skipped_counter_in_result(self) -> None:
+        def _split_all_bad(text: str, *, locale: str) -> list[str]:
+            del text, locale
+            raise ValueError("always bad")
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            self._write_texts(root, {"a.txt": "A.", "b.txt": "B."})
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline._split_text", _split_all_bad
+            ):
+                res = run_pipeline(root, out)
+            self.assertTrue(res.success)
+            self.assertEqual(res.files_discovered, 2)
+            self.assertEqual(res.files_read, 2)
+            self.assertEqual(res.files_skipped, 2)
+            self.assertEqual(res.records_written, 0)
 
     @unittest.skipUnless(HAVE_ICU, "PyICU required for real splitter integration test")
     def test_real_splitter_integration(self) -> None:
