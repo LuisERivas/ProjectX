@@ -23,6 +23,7 @@ from binary_writer import BinaryWriterError, EmbeddingWriter
 from embedding_worker import EmbeddingError, EmbeddingWorker, ModelLoadError
 from file_reader import DEFAULT_MAX_FILE_SIZE, discover_files, read_text_files
 from packed_id import (
+    CHAR_LEN_MAX,
     DOC_PARA_MAX,
     PARA_LINE_MAX,
     SHARD_DOC_MAX,
@@ -33,9 +34,10 @@ from packed_id import (
 from paragraph_splitter import split_into_paragraphs
 
 LOGGER = logging.getLogger("ingest_pipeline")
-# Full ladder for use with max_probe_batch; default cap 128 preserves prior default probe set.
-FULL_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128, 256, 512)
+# Full ladder for use with max_probe_batch / char_len bucketing (cap 1024 when bucketing on).
+FULL_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024)
 PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128)
+DEFAULT_CHAR_LEN_BUCKET_EDGES: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024)
 MAX_PENDING_WRITES: int = 2
 CHAR_BUDGET_PER_SENTENCE: int = 256
 DEFAULT_PROBE_EPSILON: float = 0.05
@@ -53,8 +55,14 @@ class ProbeStrategy(str, Enum):
 def _resolved_probe_candidates(
     probe_batch_sizes: tuple[int, ...] | None,
     max_probe_batch: int | None,
+    *,
+    char_len_bucketing: bool = False,
 ) -> tuple[int, ...]:
-    """Ordered distinct positive candidates; default ladder capped at 128 unless max_probe_batch set."""
+    """Ordered distinct positive candidates.
+
+    When probe_batch_sizes is None: use FULL_PROBE_CANDIDATE_BATCH_SIZES capped by max_probe_batch,
+    or 128 (non-bucketing) / 1024 (bucketing) when max_probe_batch is None.
+    """
     if max_probe_batch is not None and max_probe_batch < 1:
         raise ValueError(f"max_probe_batch must be >= 1 when set, got {max_probe_batch}")
     if probe_batch_sizes is not None:
@@ -62,8 +70,73 @@ def _resolved_probe_candidates(
         if max_probe_batch is not None:
             out = tuple(c for c in out if c <= max_probe_batch)
         return out
-    cap = max_probe_batch if max_probe_batch is not None else 128
+    if max_probe_batch is not None:
+        cap = max_probe_batch
+    else:
+        cap = 1024 if char_len_bucketing else 128
     return tuple(c for c in FULL_PROBE_CANDIDATE_BATCH_SIZES if c <= cap)
+
+
+def _validate_char_len_bucket_edges(edges: tuple[int, ...]) -> None:
+    if not edges:
+        raise ValueError("char_len_bucket_edges must be non-empty when bucketing is enabled")
+    prev = -1
+    for e in edges:
+        if e < 1:
+            raise ValueError(f"char_len bucket edge must be >= 1, got {e}")
+        if e > CHAR_LEN_MAX:
+            raise ValueError(
+                f"char_len bucket edge must be <= CHAR_LEN_MAX ({CHAR_LEN_MAX}), got {e}"
+            )
+        if e <= prev:
+            raise ValueError(
+                f"char_len bucket edges must be strictly increasing, got {edges!r}"
+            )
+        prev = e
+
+
+def _split_sorted_metas_by_char_len_edges(
+    metas: list[SentenceMeta], edges: tuple[int, ...]
+) -> list[list[SentenceMeta]]:
+    """Partition metas (sorted by non-decreasing char_len) into non-empty char_len bands."""
+    _validate_char_len_bucket_edges(edges)
+    n = len(metas)
+    if n == 0:
+        return []
+    result: list[list[SentenceMeta]] = []
+    i = 0
+    chunk: list[SentenceMeta] = []
+    while i < n and metas[i].char_len < edges[0]:
+        chunk.append(metas[i])
+        i += 1
+    if chunk:
+        result.append(chunk)
+    for j in range(len(edges) - 1):
+        chunk = []
+        hi = edges[j + 1]
+        while i < n and metas[i].char_len < hi:
+            chunk.append(metas[i])
+            i += 1
+        if chunk:
+            result.append(chunk)
+    chunk = []
+    while i < n:
+        chunk.append(metas[i])
+        i += 1
+    if chunk:
+        result.append(chunk)
+    return result
+
+
+def _char_len_band_label(char_len: int, edges: tuple[int, ...]) -> str:
+    if char_len < edges[0]:
+        return f"[0,{edges[0]})"
+    if char_len >= edges[-1]:
+        return f"[{edges[-1]},inf)"
+    for j in range(len(edges) - 1):
+        if edges[j] <= char_len < edges[j + 1]:
+            return f"[{edges[j]},{edges[j + 1]})"
+    return f"[char_len={char_len}]"
 
 
 def _pick_probe_winner(
@@ -324,6 +397,8 @@ def run_pipeline(
     probe_strategy: ProbeStrategy | str = ProbeStrategy.MIN_LATENCY_PER_SENT,
     probe_epsilon: float = DEFAULT_PROBE_EPSILON,
     probe_log_cuda_memory: bool = False,
+    char_len_bucketing: bool = False,
+    char_len_bucket_edges: tuple[int, ...] | None = None,
 ) -> PipelineResult:
     t0 = time.perf_counter()
     in_dir = Path(input_directory)
@@ -333,7 +408,20 @@ def run_pipeline(
         if isinstance(probe_strategy, ProbeStrategy)
         else ProbeStrategy(probe_strategy)
     )
-    resolved_probe = _resolved_probe_candidates(probe_batch_sizes, max_probe_batch)
+    if char_len_bucketing:
+        edges_eff = (
+            char_len_bucket_edges
+            if char_len_bucket_edges is not None
+            else DEFAULT_CHAR_LEN_BUCKET_EDGES
+        )
+        _validate_char_len_bucket_edges(edges_eff)
+    else:
+        edges_eff = DEFAULT_CHAR_LEN_BUCKET_EDGES
+    resolved_probe = _resolved_probe_candidates(
+        probe_batch_sizes,
+        max_probe_batch,
+        char_len_bucketing=char_len_bucketing,
+    )
     if not resolved_probe:
         raise ValueError(
             "probe candidate list is empty; adjust probe_batch_sizes or max_probe_batch"
@@ -394,26 +482,21 @@ def run_pipeline(
         with EmbeddingWriter(out_path) as writer:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 pending_writes: deque[Future[None]] = deque()
-                for _, path, file_metas in _file_sentence_stream(
-                    in_dir,
-                    extensions=extensions,
-                    recursive=recursive,
-                    encoding=encoding,
-                    skip_hidden=skip_hidden,
-                    max_file_size=max_file_size,
-                    counters=counters,
-                    splitter=splitter,
-                ):
-                    if not file_metas:
-                        continue
-                    file_metas_sorted = sorted(file_metas, key=lambda m: m.char_len)
-                    file_sentences = [m.text for m in file_metas_sorted]
-                    probe_window = max(resolved_probe)
-                    min_sentences_to_probe = min(resolved_probe)
-                    if len(file_sentences) >= min_sentences_to_probe:
+                probe_window = max(resolved_probe)
+                min_sentences_to_probe = min(resolved_probe)
+
+                def _process_metas_slice(
+                    metas_slice: list[SentenceMeta],
+                    *,
+                    log_name: str,
+                    sentence_count: int,
+                ) -> None:
+                    nonlocal total_batches
+                    sentences = [m.text for m in metas_slice]
+                    if len(sentences) >= min_sentences_to_probe:
                         head_ceiling = probe_batch_size(
                             worker,
-                            file_sentences[:probe_window],
+                            sentences[:probe_window],
                             candidates=resolved_probe,
                             fallback_batch_size=batch_size,
                             strategy=strategy,
@@ -422,36 +505,35 @@ def run_pipeline(
                         )
                         tail_ceiling = probe_batch_size(
                             worker,
-                            file_sentences[-probe_window:],
+                            sentences[-probe_window:],
                             candidates=resolved_probe,
                             fallback_batch_size=batch_size,
                             strategy=strategy,
                             probe_epsilon=probe_epsilon,
                             log_cuda_memory_warn=probe_log_cuda_memory,
                         )
-                        selected_batch_size = min(head_ceiling, tail_ceiling)
+                        selected = min(head_ceiling, tail_ceiling)
                         LOGGER.info(
-                            "file probe ceilings: file=%s head=%d tail=%d final=%d",
-                            path.name,
+                            "%s probe ceilings: head=%d tail=%d final=%d",
+                            log_name,
                             head_ceiling,
                             tail_ceiling,
-                            selected_batch_size,
+                            selected,
                         )
                     else:
-                        selected_batch_size = batch_size
-                    char_budget = selected_batch_size * CHAR_BUDGET_PER_SENTENCE
+                        selected = batch_size
+                    char_budget_local = selected * CHAR_BUDGET_PER_SENTENCE
                     LOGGER.info(
-                        "file batch controls: file=%s sentences=%d batch_size=%d char_budget=%d",
-                        path.name,
-                        len(file_metas_sorted),
-                        selected_batch_size,
-                        char_budget,
+                        "%s batch controls: sentences=%d batch_size=%d char_budget=%d",
+                        log_name,
+                        sentence_count,
+                        selected,
+                        char_budget_local,
                     )
-
                     for batch in batch_sentences_dynamic_cap(
-                        file_metas_sorted,
-                        batch_size_ceiling=selected_batch_size,
-                        char_budget=char_budget,
+                        metas_slice,
+                        batch_size_ceiling=selected,
+                        char_budget=char_budget_local,
                     ):
                         total_batches += 1
                         embeddings = worker.encode_batch(batch.sentences)
@@ -474,6 +556,39 @@ def run_pipeline(
                             "batch queued: index=%d size=%d",
                             total_batches,
                             len(batch.sentences),
+                        )
+
+                for _, path, file_metas in _file_sentence_stream(
+                    in_dir,
+                    extensions=extensions,
+                    recursive=recursive,
+                    encoding=encoding,
+                    skip_hidden=skip_hidden,
+                    max_file_size=max_file_size,
+                    counters=counters,
+                    splitter=splitter,
+                ):
+                    if not file_metas:
+                        continue
+                    file_metas_sorted = sorted(file_metas, key=lambda m: m.char_len)
+                    if char_len_bucketing:
+                        buckets = _split_sorted_metas_by_char_len_edges(
+                            file_metas_sorted, edges_eff
+                        )
+                        for bi, bucket_metas in enumerate(buckets):
+                            band = _char_len_band_label(bucket_metas[0].char_len, edges_eff)
+                            _process_metas_slice(
+                                bucket_metas,
+                                log_name=(
+                                    f"file={path.name} bucket_index={bi} band={band}"
+                                ),
+                                sentence_count=len(bucket_metas),
+                            )
+                    else:
+                        _process_metas_slice(
+                            file_metas_sorted,
+                            log_name=f"file={path.name}",
+                            sentence_count=len(file_metas_sorted),
                         )
                 while pending_writes:
                     pending_writes.popleft().result()

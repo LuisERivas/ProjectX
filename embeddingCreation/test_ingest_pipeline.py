@@ -20,12 +20,19 @@ import numpy as np
 from binary_writer import BinaryWriterError
 from binary_reader import read_all
 from embedding_worker import EmbeddingError, ModelLoadError
+from packed_id import SentenceMeta
+from functools import wraps
+
 from ingest_pipeline import (
+    DEFAULT_CHAR_LEN_BUCKET_EDGES,
     ProbeStrategy,
     _resolved_probe_candidates,
+    _split_sorted_metas_by_char_len_edges,
+    _validate_char_len_bucket_edges,
     probe_batch_size,
     run_pipeline,
 )
+import ingest_pipeline as ingest_pipeline_mod
 
 try:
     import icu  # type: ignore
@@ -590,6 +597,16 @@ class TestIngestPipeline(unittest.TestCase):
             _resolved_probe_candidates(None, 512),
             (16, 32, 64, 128, 256, 512),
         )
+        self.assertEqual(
+            _resolved_probe_candidates(None, 1024),
+            (16, 32, 64, 128, 256, 512, 1024),
+        )
+
+    def test_resolved_probe_candidates_bucketing_includes_1024(self) -> None:
+        self.assertEqual(
+            _resolved_probe_candidates(None, None, char_len_bucketing=True),
+            (16, 32, 64, 128, 256, 512, 1024),
+        )
 
     def test_resolved_probe_candidates_explicit_and_cap(self) -> None:
         self.assertEqual(
@@ -605,6 +622,90 @@ class TestIngestPipeline(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 run_pipeline(root, out, probe_batch_sizes=())
             self.assertIn("empty", str(ctx.exception).lower())
+
+    def _meta_char_len(self, char_len: int, *, para_line: int = 0) -> SentenceMeta:
+        text = "a" * char_len if char_len > 0 else ""
+        return SentenceMeta(
+            text=text,
+            para_line=para_line,
+            char_len=char_len,
+            doc_para_num=0,
+            shard_doc_num=0,
+        )
+
+    def test_split_sorted_metas_by_char_len_edges(self) -> None:
+        edges = (16, 32)
+        metas = sorted(
+            [
+                self._meta_char_len(5),
+                self._meta_char_len(20),
+                self._meta_char_len(35),
+            ],
+            key=lambda m: m.char_len,
+        )
+        buckets = _split_sorted_metas_by_char_len_edges(metas, edges)
+        self.assertEqual(len(buckets), 3)
+        self.assertEqual([len(b) for b in buckets], [1, 1, 1])
+        self.assertEqual(buckets[0][0].char_len, 5)
+        self.assertEqual(buckets[1][0].char_len, 20)
+        self.assertEqual(buckets[2][0].char_len, 35)
+
+    def test_split_sorted_metas_empty_returns_empty(self) -> None:
+        self.assertEqual(
+            _split_sorted_metas_by_char_len_edges([], (16, 32)),
+            [],
+        )
+
+    def test_validate_char_len_bucket_edges(self) -> None:
+        with self.assertRaises(ValueError):
+            _validate_char_len_bucket_edges(())
+        with self.assertRaises(ValueError):
+            _validate_char_len_bucket_edges((32, 16))
+        with self.assertRaises(ValueError):
+            _validate_char_len_bucket_edges((0, 16))
+        with self.assertRaises(ValueError):
+            _validate_char_len_bucket_edges((65536,))
+
+    def test_default_char_len_bucket_edges(self) -> None:
+        self.assertEqual(
+            DEFAULT_CHAR_LEN_BUCKET_EDGES,
+            (16, 32, 64, 128, 256, 512, 1024),
+        )
+
+    def test_char_len_bucketing_two_buckets_four_probe_calls(self) -> None:
+        def _two_band_splitter(text: str, *, locale: str) -> list[str]:
+            del text, locale
+            shorts = [f"{i:02d}aaaaaaaaaa." for i in range(16)]
+            longs = [f"{i:02d}" + "b" * 22 + "." for i in range(16)]
+            return shorts + longs
+
+        real_pb = ingest_pipeline_mod.probe_batch_size
+
+        @wraps(real_pb)
+        def spy(*a: object, **k: object) -> int:
+            spy.probe_count += 1
+            return real_pb(*a, **k)
+
+        spy.probe_count = 0
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            root.mkdir()
+            (root / "doc.txt").write_text("x", encoding="utf-8")
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline._split_text", _two_band_splitter
+            ), patch("ingest_pipeline.probe_batch_size", spy):
+                res = run_pipeline(
+                    root,
+                    out,
+                    batch_size=4,
+                    char_len_bucketing=True,
+                    max_probe_batch=64,
+                )
+        self.assertTrue(res.success)
+        self.assertEqual(res.records_written, 32)
+        self.assertEqual(spy.probe_count, 4)
 
     def test_per_document_probe_applied_to_each_file(self) -> None:
         with TemporaryDirectory() as td:

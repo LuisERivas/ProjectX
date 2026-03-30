@@ -15,6 +15,7 @@ import sys
 
 from batch_builder import DEFAULT_BATCH_SIZE
 from ingest_pipeline import (
+    DEFAULT_CHAR_LEN_BUCKET_EDGES,
     DEFAULT_PROBE_EPSILON,
     ProbeStrategy,
     run_pipeline,
@@ -29,6 +30,10 @@ def _parse_probe_batch_sizes(value: str) -> tuple[int, ...]:
         return tuple(int(p) for p in parts)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid integer in probe batch list: {exc}") from exc
+
+
+def _parse_bucket_edges(value: str) -> tuple[int, ...]:
+    return _parse_probe_batch_sizes(value)
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help=(
             "cap probe ladder: when set without --probe-batch-sizes, try batch sizes up to N "
-            "from the built-in ladder (16,32,64,128,256,512). When set with --probe-batch-sizes, "
+            "from the built-in ladder (16,32,64,128,256,512,1024). When set with --probe-batch-sizes, "
             "drops candidates above N"
         ),
     )
@@ -97,6 +102,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="log a CUDA free-memory warning before each probe encode when free < 1 GiB",
     )
+    parser.add_argument(
+        "--char-len-buckets",
+        action="store_true",
+        help=(
+            "split each file into char_len bands (default edges "
+            f"{','.join(str(e) for e in DEFAULT_CHAR_LEN_BUCKET_EDGES)}), probe and batch each "
+            "band separately; default probe ladder cap becomes 1024 (many probe encodes; use "
+            "--max-probe-batch or --probe-batch-sizes to limit)"
+        ),
+    )
+    parser.add_argument(
+        "--bucket-edges",
+        type=_parse_bucket_edges,
+        default=None,
+        metavar="LIST",
+        help=(
+            'char_len bucket upper bounds, comma-separated (strictly increasing), e.g. '
+            '"16,32,64,128,256,512,1024"; requires --char-len-buckets; default is built-in edges'
+        ),
+    )
     return parser.parse_args()
 
 
@@ -111,6 +136,12 @@ def main() -> int:
     if args.max_probe_batch is not None and args.max_probe_batch < 1:
         print("run_ingest: --max-probe-batch must be >= 1 when set", file=sys.stderr)
         return 2
+    if args.bucket_edges is not None and not args.char_len_buckets:
+        print(
+            "run_ingest: --bucket-edges requires --char-len-buckets",
+            file=sys.stderr,
+        )
+        return 2
     logging.basicConfig(level=logging.INFO)
 
     result = run_pipeline(
@@ -122,6 +153,8 @@ def main() -> int:
         probe_strategy=args.probe_strategy,
         probe_epsilon=args.probe_epsilon,
         probe_log_cuda_memory=args.probe_log_cuda_memory,
+        char_len_bucketing=args.char_len_buckets,
+        char_len_bucket_edges=args.bucket_edges,
     )
 
     print("pipeline_result:")
@@ -129,6 +162,8 @@ def main() -> int:
     print(f"- probe_strategy: {args.probe_strategy}")
     print(f"- probe_batch_sizes: {args.probe_batch_sizes}")
     print(f"- max_probe_batch: {args.max_probe_batch}")
+    print(f"- char_len_bucketing: {args.char_len_buckets}")
+    print(f"- bucket_edges: {args.bucket_edges}")
     print(f"- input_directory: {result.input_directory}")
     print(f"- output_path: {result.output_path}")
     print(f"- files_discovered: {result.files_discovered}")
