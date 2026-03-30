@@ -20,7 +20,12 @@ import numpy as np
 from binary_writer import BinaryWriterError
 from binary_reader import read_all
 from embedding_worker import EmbeddingError, ModelLoadError
-from ingest_pipeline import probe_batch_size, run_pipeline
+from ingest_pipeline import (
+    ProbeStrategy,
+    _resolved_probe_candidates,
+    probe_batch_size,
+    run_pipeline,
+)
 
 try:
     import icu  # type: ignore
@@ -500,6 +505,106 @@ class TestIngestPipeline(unittest.TestCase):
         self.assertIn(picked, (16, 32))
         self.assertIn(64, _FakeWorker.seen_batch_sizes)
         self.assertNotIn(128, _FakeWorker.seen_batch_sizes)
+
+    def test_probe_max_successful_returns_largest_ok_candidate(self) -> None:
+        worker = _FakeWorker()
+        worker.init()
+        picked = probe_batch_size(
+            worker,
+            ["s"] * 128,
+            candidates=(16, 32, 64, 128),
+            fallback_batch_size=8,
+            strategy=ProbeStrategy.MAX_SUCCESSFUL,
+        )
+        self.assertEqual(picked, 128)
+
+    def test_probe_min_latency_prefers_better_per_sentence(self) -> None:
+        worker = _FakeWorker()
+        worker.init()
+        # Two perf_counter calls per candidate: start, end. 64 wins on latency/sentence.
+        perf = [
+            0.0,
+            0.032,
+            0.0,
+            0.12,
+        ]
+        with patch("ingest_pipeline.time.perf_counter", side_effect=perf):
+            picked = probe_batch_size(
+                worker,
+                ["s"] * 128,
+                candidates=(64, 128),
+                fallback_batch_size=8,
+                strategy=ProbeStrategy.MIN_LATENCY_PER_SENT,
+            )
+        self.assertEqual(picked, 64)
+
+    def test_probe_max_successful_returns_128_when_min_latency_would_pick_64(self) -> None:
+        worker = _FakeWorker()
+        worker.init()
+        perf = [
+            0.0,
+            0.032,
+            0.0,
+            0.12,
+        ]
+        with patch("ingest_pipeline.time.perf_counter", side_effect=perf * 2):
+            min_pick = probe_batch_size(
+                worker,
+                ["s"] * 128,
+                candidates=(64, 128),
+                fallback_batch_size=8,
+                strategy=ProbeStrategy.MIN_LATENCY_PER_SENT,
+            )
+            max_pick = probe_batch_size(
+                worker,
+                ["s"] * 128,
+                candidates=(64, 128),
+                fallback_batch_size=8,
+                strategy=ProbeStrategy.MAX_SUCCESSFUL,
+            )
+        self.assertEqual(min_pick, 64)
+        self.assertEqual(max_pick, 128)
+
+    def test_probe_epsilon_prefers_largest_within_band(self) -> None:
+        worker = _FakeWorker()
+        worker.init()
+        # 64: 0.032/64 = 0.0005/sent; 128: 0.06656/128 = 0.00052/sent (within 5% of 0.0005)
+        perf = [0.0, 0.032, 0.0, 0.06656]
+        with patch("ingest_pipeline.time.perf_counter", side_effect=perf):
+            picked = probe_batch_size(
+                worker,
+                ["s"] * 128,
+                candidates=(64, 128),
+                fallback_batch_size=8,
+                strategy=ProbeStrategy.EPSILON,
+                probe_epsilon=0.05,
+            )
+        self.assertEqual(picked, 128)
+
+    def test_resolved_probe_candidates_defaults(self) -> None:
+        self.assertEqual(_resolved_probe_candidates(None, None), (16, 32, 64, 128))
+
+    def test_resolved_probe_candidates_max_probe_batch(self) -> None:
+        self.assertEqual(_resolved_probe_candidates(None, 64), (16, 32, 64))
+        self.assertEqual(
+            _resolved_probe_candidates(None, 512),
+            (16, 32, 64, 128, 256, 512),
+        )
+
+    def test_resolved_probe_candidates_explicit_and_cap(self) -> None:
+        self.assertEqual(
+            _resolved_probe_candidates((128, 256, 512), 256),
+            (128, 256),
+        )
+
+    def test_run_pipeline_rejects_empty_probe_candidate_list(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            root.mkdir()
+            out = Path(td) / "out.bin"
+            with self.assertRaises(ValueError) as ctx:
+                run_pipeline(root, out, probe_batch_sizes=())
+            self.assertIn("empty", str(ctx.exception).lower())
 
     def test_per_document_probe_applied_to_each_file(self) -> None:
         with TemporaryDirectory() as td:

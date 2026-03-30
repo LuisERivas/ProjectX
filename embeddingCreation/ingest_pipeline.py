@@ -13,6 +13,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -32,9 +33,83 @@ from packed_id import (
 from paragraph_splitter import split_into_paragraphs
 
 LOGGER = logging.getLogger("ingest_pipeline")
+# Full ladder for use with max_probe_batch; default cap 128 preserves prior default probe set.
+FULL_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128, 256, 512)
 PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128)
 MAX_PENDING_WRITES: int = 2
 CHAR_BUDGET_PER_SENTENCE: int = 256
+DEFAULT_PROBE_EPSILON: float = 0.05
+CUDA_WARN_FREE_BYTES: int = 1 * 1024 * 1024 * 1024
+
+
+class ProbeStrategy(str, Enum):
+    """How to pick a winner after successful probe encodes."""
+
+    MIN_LATENCY_PER_SENT = "min_latency_per_sent"
+    MAX_SUCCESSFUL = "max_successful"
+    EPSILON = "epsilon"
+
+
+def _resolved_probe_candidates(
+    probe_batch_sizes: tuple[int, ...] | None,
+    max_probe_batch: int | None,
+) -> tuple[int, ...]:
+    """Ordered distinct positive candidates; default ladder capped at 128 unless max_probe_batch set."""
+    if max_probe_batch is not None and max_probe_batch < 1:
+        raise ValueError(f"max_probe_batch must be >= 1 when set, got {max_probe_batch}")
+    if probe_batch_sizes is not None:
+        out = tuple(sorted({c for c in probe_batch_sizes if c > 0}))
+        if max_probe_batch is not None:
+            out = tuple(c for c in out if c <= max_probe_batch)
+        return out
+    cap = max_probe_batch if max_probe_batch is not None else 128
+    return tuple(c for c in FULL_PROBE_CANDIDATE_BATCH_SIZES if c <= cap)
+
+
+def _pick_probe_winner(
+    attempted: list[tuple[int, float]],
+    *,
+    strategy: ProbeStrategy,
+    probe_epsilon: float,
+) -> int | None:
+    if not attempted:
+        return None
+    if strategy is ProbeStrategy.MAX_SUCCESSFUL:
+        return max(c for c, _ in attempted)
+    if strategy is ProbeStrategy.MIN_LATENCY_PER_SENT:
+        best_lat = min(lat for _, lat in attempted)
+        for c, lat in attempted:
+            if lat == best_lat:
+                return c
+        return None
+    if strategy is ProbeStrategy.EPSILON:
+        if probe_epsilon < 0:
+            raise ValueError(f"probe_epsilon must be >= 0, got {probe_epsilon}")
+        best_lat = min(lat for _, lat in attempted)
+        threshold = (1.0 + probe_epsilon) * best_lat
+        eligible = [c for c, lat in attempted if lat <= threshold]
+        return max(eligible)
+    raise ValueError(f"unknown probe strategy: {strategy!r}")
+
+
+def _maybe_warn_cuda_memory_before_probe(candidate: int) -> None:
+    if candidate <= 8:
+        return
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        if free_bytes < CUDA_WARN_FREE_BYTES:
+            LOGGER.warning(
+                "probe: low free CUDA memory before batch_size=%d: free=%.2f GB total=%.2f GB",
+                candidate,
+                free_bytes / (1024**3),
+                total_bytes / (1024**3),
+            )
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True)
@@ -151,14 +226,15 @@ def probe_batch_size(
     *,
     candidates: tuple[int, ...] = PROBE_CANDIDATE_BATCH_SIZES,
     fallback_batch_size: int = DEFAULT_BATCH_SIZE,
+    strategy: ProbeStrategy = ProbeStrategy.MIN_LATENCY_PER_SENT,
+    probe_epsilon: float = DEFAULT_PROBE_EPSILON,
+    log_cuda_memory_warn: bool = False,
 ) -> int:
     if fallback_batch_size < 1:
         raise ValueError(f"fallback_batch_size must be >= 1, got {fallback_batch_size}")
     if not sample_sentences:
         return fallback_batch_size
 
-    best_candidate: int | None = None
-    best_latency_per_sentence = float("inf")
     attempted: list[tuple[int, float]] = []
     candidate_list = sorted({c for c in candidates if c > 0})
     if not candidate_list:
@@ -167,6 +243,8 @@ def probe_batch_size(
     for candidate in candidate_list:
         if candidate > len(sample_sentences):
             continue
+        if log_cuda_memory_warn:
+            _maybe_warn_cuda_memory_before_probe(candidate)
         try:
             t0 = time.perf_counter()
             _ = worker.encode_batch(sample_sentences[:candidate])
@@ -180,9 +258,10 @@ def probe_batch_size(
             break
         latency_per_sentence = elapsed / candidate
         attempted.append((candidate, latency_per_sentence))
-        if latency_per_sentence < best_latency_per_sentence:
-            best_latency_per_sentence = latency_per_sentence
-            best_candidate = candidate
+
+    best_candidate = _pick_probe_winner(
+        attempted, strategy=strategy, probe_epsilon=probe_epsilon
+    )
 
     if best_candidate is None:
         LOGGER.info(
@@ -192,7 +271,8 @@ def probe_batch_size(
         return fallback_batch_size
 
     LOGGER.info(
-        "probe complete: tested=%s winner=%d",
+        "probe complete: strategy=%s tested=%s winner=%d",
+        strategy.value,
         ", ".join(f"{bs}:{lat:.6f}s_per_sent" for bs, lat in attempted),
         best_candidate,
     )
@@ -239,10 +319,25 @@ def run_pipeline(
     encoding: str = "utf-8",
     skip_hidden: bool = True,
     max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+    probe_batch_sizes: tuple[int, ...] | None = None,
+    max_probe_batch: int | None = None,
+    probe_strategy: ProbeStrategy | str = ProbeStrategy.MIN_LATENCY_PER_SENT,
+    probe_epsilon: float = DEFAULT_PROBE_EPSILON,
+    probe_log_cuda_memory: bool = False,
 ) -> PipelineResult:
     t0 = time.perf_counter()
     in_dir = Path(input_directory)
     out_path = Path(output_path)
+    strategy = (
+        probe_strategy
+        if isinstance(probe_strategy, ProbeStrategy)
+        else ProbeStrategy(probe_strategy)
+    )
+    resolved_probe = _resolved_probe_candidates(probe_batch_sizes, max_probe_batch)
+    if not resolved_probe:
+        raise ValueError(
+            "probe candidate list is empty; adjust probe_batch_sizes or max_probe_batch"
+        )
     startup_error = _validate_startup(in_dir, out_path, batch_size=batch_size)
     if startup_error is not None:
         LOGGER.error(startup_error)
@@ -313,24 +408,37 @@ def run_pipeline(
                         continue
                     file_metas_sorted = sorted(file_metas, key=lambda m: m.char_len)
                     file_sentences = [m.text for m in file_metas_sorted]
-                    selected_batch_size = (
-                        min(
-                            probe_batch_size(
-                                worker,
-                                file_sentences[: max(PROBE_CANDIDATE_BATCH_SIZES)],
-                                candidates=PROBE_CANDIDATE_BATCH_SIZES,
-                                fallback_batch_size=batch_size,
-                            ),
-                            probe_batch_size(
-                                worker,
-                                file_sentences[-max(PROBE_CANDIDATE_BATCH_SIZES) :],
-                                candidates=PROBE_CANDIDATE_BATCH_SIZES,
-                                fallback_batch_size=batch_size,
-                            ),
+                    probe_window = max(resolved_probe)
+                    min_sentences_to_probe = min(resolved_probe)
+                    if len(file_sentences) >= min_sentences_to_probe:
+                        head_ceiling = probe_batch_size(
+                            worker,
+                            file_sentences[:probe_window],
+                            candidates=resolved_probe,
+                            fallback_batch_size=batch_size,
+                            strategy=strategy,
+                            probe_epsilon=probe_epsilon,
+                            log_cuda_memory_warn=probe_log_cuda_memory,
                         )
-                        if len(file_sentences) >= min(PROBE_CANDIDATE_BATCH_SIZES)
-                        else batch_size
-                    )
+                        tail_ceiling = probe_batch_size(
+                            worker,
+                            file_sentences[-probe_window:],
+                            candidates=resolved_probe,
+                            fallback_batch_size=batch_size,
+                            strategy=strategy,
+                            probe_epsilon=probe_epsilon,
+                            log_cuda_memory_warn=probe_log_cuda_memory,
+                        )
+                        selected_batch_size = min(head_ceiling, tail_ceiling)
+                        LOGGER.info(
+                            "file probe ceilings: file=%s head=%d tail=%d final=%d",
+                            path.name,
+                            head_ceiling,
+                            tail_ceiling,
+                            selected_batch_size,
+                        )
+                    else:
+                        selected_batch_size = batch_size
                     char_budget = selected_batch_size * CHAR_BUDGET_PER_SENTENCE
                     LOGGER.info(
                         "file batch controls: file=%s sentences=%d batch_size=%d char_budget=%d",
