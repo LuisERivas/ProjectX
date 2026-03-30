@@ -17,6 +17,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
+import numpy as np
+
 from batch_builder import DEFAULT_BATCH_SIZE, batch_sentences, batch_sentences_dynamic_cap
 from binary_reader import VerificationReport, verify_file
 from binary_writer import BinaryWriterError, EmbeddingWriter
@@ -49,6 +51,7 @@ PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (64, 128)
 DEFAULT_CHAR_LEN_BUCKET_EDGES: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024)
 DEFAULT_MAX_BUCKETS: int = 6
 DEFAULT_GVF_THRESHOLD: float = 0.85
+JENKS_SAMPLE_SIZE: int = 2000
 MAX_PENDING_WRITES: int = 2
 CHAR_BUDGET_PER_SENTENCE: int = 256
 DEFAULT_PROBE_EPSILON: float = 0.05
@@ -151,7 +154,7 @@ def _char_len_band_label(char_len: int, edges: tuple[int, ...]) -> str:
 
 
 def _jenks_breaks(values: list[int], k: int) -> list[int]:
-    """Compute Jenks natural breaks for sorted 1D integer data.
+    """Compute Jenks natural breaks for sorted 1D integer data (numpy-accelerated).
 
     Returns k-1 break points (upper edge of each class except the last).
     values must be sorted non-decreasing and len(values) >= k >= 2.
@@ -160,36 +163,39 @@ def _jenks_breaks(values: list[int], k: int) -> list[int]:
     if k < 2 or n < k:
         return []
 
-    lower_class_limits = [[0.0] * (k + 1) for _ in range(n + 1)]
-    variance_combos = [[float("inf")] * (k + 1) for _ in range(n + 1)]
-    for j in range(1, k + 1):
-        lower_class_limits[1][j] = 1.0
-        variance_combos[1][j] = 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    lower_class_limits = np.zeros((n + 1, k + 1), dtype=np.float64)
+    variance_combos = np.full((n + 1, k + 1), np.inf, dtype=np.float64)
+    lower_class_limits[1, 1:k + 1] = 1.0
+    variance_combos[1, 1:k + 1] = 0.0
 
     for i in range(2, n + 1):
         sum_ = 0.0
         sum_sq = 0.0
         for m in range(1, i + 1):
             lower_m = i - m + 1
-            val = float(values[lower_m - 1])
+            val = arr[lower_m - 1]
             sum_ += val
             sum_sq += val * val
             variance = sum_sq - (sum_ * sum_) / m
             if lower_m > 1:
-                for j in range(2, k + 1):
-                    combo = variance + variance_combos[lower_m - 1][j - 1]
-                    if combo < variance_combos[i][j]:
-                        lower_class_limits[i][j] = float(lower_m)
-                        variance_combos[i][j] = combo
-        lower_class_limits[i][1] = 1.0
-        variance_combos[i][1] = variance
+                prev = variance_combos[lower_m - 1, 1:k]
+                combo = variance + prev
+                cur = variance_combos[i, 2:k + 1]
+                mask = combo < cur
+                if np.any(mask):
+                    js = np.where(mask)[0]
+                    variance_combos[i, js + 2] = combo[js]
+                    lower_class_limits[i, js + 2] = float(lower_m)
+        lower_class_limits[i, 1] = 1.0
+        variance_combos[i, 1] = variance
 
     kclass = [0] * (k + 1)
     kclass[k] = n
     kclass[0] = 0
     pivot = k
     while pivot >= 2:
-        idx = int(lower_class_limits[kclass[pivot]][pivot]) - 1
+        idx = int(lower_class_limits[kclass[pivot], pivot]) - 1
         kclass[pivot - 1] = idx
         pivot -= 1
 
@@ -197,7 +203,7 @@ def _jenks_breaks(values: list[int], k: int) -> list[int]:
     for c in range(1, k):
         edge_idx = kclass[c]
         if 0 <= edge_idx < n:
-            breaks.append(values[edge_idx])
+            breaks.append(int(arr[edge_idx]))
     return breaks
 
 
@@ -205,20 +211,29 @@ def _goodness_of_variance_fit(values: list[int], breaks: list[int]) -> float:
     """GVF: 1 - (within-class variance / total variance). 1.0 = perfect."""
     if not values:
         return 1.0
-    mean = sum(values) / len(values)
-    sdam = sum((v - mean) ** 2 for v in values)
+    arr = np.asarray(values, dtype=np.float64)
+    sdam = float(np.sum((arr - arr.mean()) ** 2))
     if sdam == 0.0:
         return 1.0
-    edges = breaks + [values[-1] + 1]
+    edges = np.array(breaks + [int(arr[-1]) + 1], dtype=np.float64)
     sdcm = 0.0
     lo = 0
     for hi_edge in edges:
-        cluster = [v for v in values[lo:] if v < hi_edge]
-        lo += len(cluster)
-        if cluster:
-            cm = sum(cluster) / len(cluster)
-            sdcm += sum((v - cm) ** 2 for v in cluster)
+        hi_idx = int(np.searchsorted(arr[lo:], hi_edge, side="left")) + lo
+        if hi_idx > lo:
+            cluster = arr[lo:hi_idx]
+            sdcm += float(np.sum((cluster - cluster.mean()) ** 2))
+        lo = hi_idx
     return 1.0 - sdcm / sdam
+
+
+def _sample_sorted(values: list[int], n_sample: int) -> list[int]:
+    """Uniformly sample from a sorted list, preserving sort order."""
+    n = len(values)
+    if n <= n_sample:
+        return values
+    indices = np.linspace(0, n - 1, n_sample, dtype=np.intp)
+    return [values[i] for i in indices]
 
 
 def _jenks_auto_bucket_edges(
@@ -229,9 +244,11 @@ def _jenks_auto_bucket_edges(
 ) -> tuple[int, ...]:
     """Find natural bucket edges for sorted char_len array using Jenks + GVF.
 
+    For large inputs (> JENKS_SAMPLE_SIZE), operates on a uniform sample to
+    keep runtime bounded, then evaluates GVF against the full dataset.
     Returns a tuple of break-point values (strictly increasing) to be used
     as bucket edges with _split_sorted_metas_by_char_len_edges.
-    If data is uniform (or n < 2), returns empty tuple → single bucket.
+    If data is uniform (or n < 2), returns empty tuple -> single bucket.
     """
     if max_k < 2:
         raise ValueError(f"max_k must be >= 2, got {max_k}")
@@ -241,9 +258,18 @@ def _jenks_auto_bucket_edges(
     if n < 2 or char_lens[0] == char_lens[-1]:
         return ()
 
+    sample = _sample_sorted(char_lens, JENKS_SAMPLE_SIZE)
+    sampled = len(sample) < n
+    if sampled:
+        LOGGER.debug(
+            "jenks: sampled %d of %d char_lens for clustering",
+            len(sample),
+            n,
+        )
+
     best_breaks: list[int] = []
-    for k in range(2, min(max_k, n) + 1):
-        breaks = _jenks_breaks(char_lens, k)
+    for k in range(2, min(max_k, len(sample)) + 1):
+        breaks = _jenks_breaks(sample, k)
         if not breaks:
             break
         gvf = _goodness_of_variance_fit(char_lens, breaks)

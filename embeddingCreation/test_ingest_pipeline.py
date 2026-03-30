@@ -27,12 +27,14 @@ from ingest_pipeline import (
     DEFAULT_CHAR_LEN_BUCKET_EDGES,
     DEFAULT_GVF_THRESHOLD,
     DEFAULT_MAX_BUCKETS,
+    JENKS_SAMPLE_SIZE,
     ProbeStrategy,
     _binary_probe_max_safe,
     _goodness_of_variance_fit,
     _jenks_auto_bucket_edges,
     _jenks_breaks,
     _resolved_probe_candidates,
+    _sample_sorted,
     _split_sorted_metas_by_char_len_edges,
     _validate_char_len_bucket_edges,
     probe_batch_size,
@@ -811,6 +813,25 @@ class TestIngestPipeline(unittest.TestCase):
         self.assertTrue(len(edges) >= 1)
         self.assertTrue(all(e > 0 for e in edges))
         self.assertTrue(edges[0] <= 200)
+
+    def test_sample_sorted_passthrough_small(self) -> None:
+        data = [1, 2, 3, 4, 5]
+        self.assertEqual(_sample_sorted(data, 10), data)
+
+    def test_sample_sorted_reduces_large(self) -> None:
+        data = list(range(10000))
+        sampled = _sample_sorted(data, 500)
+        self.assertEqual(len(sampled), 500)
+        self.assertEqual(sampled, sorted(sampled))
+        self.assertEqual(sampled[0], 0)
+        self.assertEqual(sampled[-1], 9999)
+
+    def test_jenks_auto_large_input_uses_sampling(self) -> None:
+        """Jenks on > JENKS_SAMPLE_SIZE values should complete quickly via sampling."""
+        data = sorted([5] * 5000 + [200] * 5000)
+        edges = _jenks_auto_bucket_edges(data, max_k=4, gvf_threshold=0.8)
+        self.assertTrue(len(edges) >= 1)
+        self.assertTrue(all(e > 0 for e in edges))
 
     def test_jenks_auto_validates_max_k(self) -> None:
         with self.assertRaises(ValueError):
