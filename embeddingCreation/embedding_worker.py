@@ -74,6 +74,8 @@ class EmbeddingWorker:
         self._state = WorkerState.UNINITIALIZED
         self._model: Any | None = None
         self._metrics = _WorkerMetrics()
+        self._compiled_parent_module: Any | None = None
+        self._compiled_original_auto_model: Any | None = None
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -109,11 +111,44 @@ class EmbeddingWorker:
                     "torch.compile available, but no transformer auto_model was found; skipping compile"
                 )
                 return False
+            self._compiled_parent_module = first_mod
+            self._compiled_original_auto_model = auto_model
             first_mod.auto_model = compile_fn(auto_model)
             return True
         except Exception as exc:
             LOGGER.warning("torch.compile failed; continuing in eager mode: %s", exc)
+            self._compiled_parent_module = None
+            self._compiled_original_auto_model = None
             return False
+
+    def _disable_compiled_mode(self) -> bool:
+        """Restore eager module if compiled mode is active."""
+        if (
+            self._compiled_parent_module is None
+            or self._compiled_original_auto_model is None
+        ):
+            return False
+        try:
+            self._compiled_parent_module.auto_model = self._compiled_original_auto_model
+            self._metrics.compiled = False
+            LOGGER.warning("disabled torch.compile and restored eager model path")
+            return True
+        except Exception as exc:
+            LOGGER.warning("failed to restore eager model after compile failure: %s", exc)
+            return False
+
+    @staticmethod
+    def _looks_like_compile_backend_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        markers = (
+            "inductorerror",
+            "torch._inductor",
+            "torch._dynamo",
+            "triton",
+            "cluster_dims",
+            "compile_fx",
+        )
+        return any(m in text for m in markers)
 
     def init(self) -> None:
         """Load the model once and transition to READY."""
@@ -166,11 +201,26 @@ class EmbeddingWorker:
         self._metrics.compiled = self._maybe_compile_model(torch)
 
         # Verify expected embedding dimension once at startup.
-        probe = self._model.encode(
-            "dimension check",
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        try:
+            probe = self._model.encode(
+                "dimension check",
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+        except Exception as exc:
+            if self._metrics.compiled and self._looks_like_compile_backend_error(exc):
+                LOGGER.warning(
+                    "compile path failed during init probe; retrying in eager mode: %s",
+                    exc,
+                )
+                self._disable_compiled_mode()
+                probe = self._model.encode(
+                    "dimension check",
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+            else:
+                raise ModelLoadError(f"model warmup encode failed: {exc}") from exc
         arr = np.asarray(probe, dtype=np.float32)
         if arr.ndim == 2:
             arr = arr[0]
@@ -187,7 +237,7 @@ class EmbeddingWorker:
             extra={
                 "model_id": MODEL_ID,
                 "device": self._metrics.device,
-                "dtype": self._metrics.dtype,
+                    "dtype": self._metrics.dtype,
                     "compiled": self._metrics.compiled,
                 "load_time_s": round(self._metrics.init_time_s, 4),
                 "load_count": self._metrics.load_count,
@@ -211,19 +261,33 @@ class EmbeddingWorker:
 
         t0 = time.perf_counter()
         try:
+            def _encode_once() -> Any:
+                try:
+                    return self._model.encode(
+                        sentences,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                        convert_to_tensor=True,
+                    )
+                except TypeError:
+                    return self._model.encode(
+                        sentences,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                    )
+
             try:
-                out = self._model.encode(
-                    sentences,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                    convert_to_tensor=True,
-                )
-            except TypeError:
-                out = self._model.encode(
-                    sentences,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
+                out = _encode_once()
+            except Exception as exc:
+                if self._metrics.compiled and self._looks_like_compile_backend_error(exc):
+                    LOGGER.warning(
+                        "compile path failed during encode; retrying eager path for batch: %s",
+                        exc,
+                    )
+                    self._disable_compiled_mode()
+                    out = _encode_once()
+                else:
+                    raise
 
             try:
                 skip_norm_checks = self._metrics.total_batches >= FULL_VALIDATION_BATCHES
