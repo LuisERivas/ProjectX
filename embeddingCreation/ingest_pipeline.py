@@ -34,7 +34,6 @@ from packed_id import (
 from paragraph_splitter import split_into_paragraphs
 
 LOGGER = logging.getLogger("ingest_pipeline")
-# Full ladder for max_probe_batch / char_len bucketing (cap 16384 when bucketing on).
 FULL_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (
     64,
     128,
@@ -48,6 +47,8 @@ FULL_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (
 )
 PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (64, 128)
 DEFAULT_CHAR_LEN_BUCKET_EDGES: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024)
+DEFAULT_MAX_BUCKETS: int = 6
+DEFAULT_GVF_THRESHOLD: float = 0.85
 MAX_PENDING_WRITES: int = 2
 CHAR_BUDGET_PER_SENTENCE: int = 256
 DEFAULT_PROBE_EPSILON: float = 0.05
@@ -147,6 +148,111 @@ def _char_len_band_label(char_len: int, edges: tuple[int, ...]) -> str:
         if edges[j] <= char_len < edges[j + 1]:
             return f"[{edges[j]},{edges[j + 1]})"
     return f"[char_len={char_len}]"
+
+
+def _jenks_breaks(values: list[int], k: int) -> list[int]:
+    """Compute Jenks natural breaks for sorted 1D integer data.
+
+    Returns k-1 break points (upper edge of each class except the last).
+    values must be sorted non-decreasing and len(values) >= k >= 2.
+    """
+    n = len(values)
+    if k < 2 or n < k:
+        return []
+
+    lower_class_limits = [[0.0] * (k + 1) for _ in range(n + 1)]
+    variance_combos = [[float("inf")] * (k + 1) for _ in range(n + 1)]
+    for j in range(1, k + 1):
+        lower_class_limits[1][j] = 1.0
+        variance_combos[1][j] = 0.0
+
+    for i in range(2, n + 1):
+        sum_ = 0.0
+        sum_sq = 0.0
+        for m in range(1, i + 1):
+            lower_m = i - m + 1
+            val = float(values[lower_m - 1])
+            sum_ += val
+            sum_sq += val * val
+            variance = sum_sq - (sum_ * sum_) / m
+            if lower_m > 1:
+                for j in range(2, k + 1):
+                    combo = variance + variance_combos[lower_m - 1][j - 1]
+                    if combo < variance_combos[i][j]:
+                        lower_class_limits[i][j] = float(lower_m)
+                        variance_combos[i][j] = combo
+        lower_class_limits[i][1] = 1.0
+        variance_combos[i][1] = variance
+
+    kclass = [0] * (k + 1)
+    kclass[k] = n
+    kclass[0] = 0
+    pivot = k
+    while pivot >= 2:
+        idx = int(lower_class_limits[kclass[pivot]][pivot]) - 1
+        kclass[pivot - 1] = idx
+        pivot -= 1
+
+    breaks: list[int] = []
+    for c in range(1, k):
+        edge_idx = kclass[c]
+        if 0 <= edge_idx < n:
+            breaks.append(values[edge_idx])
+    return breaks
+
+
+def _goodness_of_variance_fit(values: list[int], breaks: list[int]) -> float:
+    """GVF: 1 - (within-class variance / total variance). 1.0 = perfect."""
+    if not values:
+        return 1.0
+    mean = sum(values) / len(values)
+    sdam = sum((v - mean) ** 2 for v in values)
+    if sdam == 0.0:
+        return 1.0
+    edges = breaks + [values[-1] + 1]
+    sdcm = 0.0
+    lo = 0
+    for hi_edge in edges:
+        cluster = [v for v in values[lo:] if v < hi_edge]
+        lo += len(cluster)
+        if cluster:
+            cm = sum(cluster) / len(cluster)
+            sdcm += sum((v - cm) ** 2 for v in cluster)
+    return 1.0 - sdcm / sdam
+
+
+def _jenks_auto_bucket_edges(
+    char_lens: list[int],
+    *,
+    max_k: int = DEFAULT_MAX_BUCKETS,
+    gvf_threshold: float = DEFAULT_GVF_THRESHOLD,
+) -> tuple[int, ...]:
+    """Find natural bucket edges for sorted char_len array using Jenks + GVF.
+
+    Returns a tuple of break-point values (strictly increasing) to be used
+    as bucket edges with _split_sorted_metas_by_char_len_edges.
+    If data is uniform (or n < 2), returns empty tuple → single bucket.
+    """
+    if max_k < 2:
+        raise ValueError(f"max_k must be >= 2, got {max_k}")
+    if not (0.0 <= gvf_threshold <= 1.0):
+        raise ValueError(f"gvf_threshold must be in [0, 1], got {gvf_threshold}")
+    n = len(char_lens)
+    if n < 2 or char_lens[0] == char_lens[-1]:
+        return ()
+
+    best_breaks: list[int] = []
+    for k in range(2, min(max_k, n) + 1):
+        breaks = _jenks_breaks(char_lens, k)
+        if not breaks:
+            break
+        gvf = _goodness_of_variance_fit(char_lens, breaks)
+        best_breaks = breaks
+        LOGGER.debug("jenks k=%d gvf=%.4f breaks=%s", k, gvf, breaks)
+        if gvf >= gvf_threshold:
+            break
+    unique_breaks = sorted(set(best_breaks))
+    return tuple(b for b in unique_breaks if b > 0)
 
 
 def _pick_probe_winner(
@@ -303,6 +409,51 @@ def _file_sentence_stream(
         yield shard_doc_num, path, metas
 
 
+def _binary_probe_max_safe(
+    worker: EmbeddingWorker,
+    sample_sentences: list[str],
+    candidate_list: list[int],
+    *,
+    log_cuda_memory_warn: bool = False,
+) -> tuple[int | None, list[tuple[int, float]]]:
+    """Binary search for the largest candidate that succeeds without OOM.
+
+    Returns (max_safe_candidate, attempted_list_with_timings).
+    """
+    n_sample = len(sample_sentences)
+    eligible = [c for c in candidate_list if c <= n_sample]
+    if not eligible:
+        return None, []
+
+    attempted: list[tuple[int, float]] = []
+    lo, hi = 0, len(eligible) - 1
+    best_safe_idx: int | None = None
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = eligible[mid]
+        if log_cuda_memory_warn:
+            _maybe_warn_cuda_memory_before_probe(candidate)
+        try:
+            t0 = time.perf_counter()
+            _ = worker.encode_batch(sample_sentences[:candidate])
+            elapsed = time.perf_counter() - t0
+            attempted.append((candidate, elapsed / candidate))
+            best_safe_idx = mid
+            lo = mid + 1
+        except EmbeddingError as exc:
+            LOGGER.warning(
+                "binary probe failed at size=%d: %s",
+                candidate,
+                exc,
+            )
+            hi = mid - 1
+
+    if best_safe_idx is None:
+        return None, attempted
+    return eligible[best_safe_idx], attempted
+
+
 def probe_batch_size(
     worker: EmbeddingWorker,
     sample_sentences: list[str],
@@ -318,29 +469,31 @@ def probe_batch_size(
     if not sample_sentences:
         return fallback_batch_size
 
-    attempted: list[tuple[int, float]] = []
     candidate_list = sorted({c for c in candidates if c > 0})
     if not candidate_list:
         return fallback_batch_size
 
-    for candidate in candidate_list:
-        if candidate > len(sample_sentences):
-            continue
-        if log_cuda_memory_warn:
-            _maybe_warn_cuda_memory_before_probe(candidate)
-        try:
-            t0 = time.perf_counter()
-            _ = worker.encode_batch(sample_sentences[:candidate])
-            elapsed = time.perf_counter() - t0
-        except EmbeddingError as exc:
-            LOGGER.warning(
-                "probe batch failed at size=%d, skipping larger candidates: %s",
-                candidate,
-                exc,
+    max_safe, attempted = _binary_probe_max_safe(
+        worker,
+        sample_sentences,
+        candidate_list,
+        log_cuda_memory_warn=log_cuda_memory_warn,
+    )
+
+    if strategy is ProbeStrategy.MAX_SUCCESSFUL:
+        if max_safe is None:
+            LOGGER.info(
+                "probe had no valid candidates, using fallback_batch_size=%d",
+                fallback_batch_size,
             )
-            break
-        latency_per_sentence = elapsed / candidate
-        attempted.append((candidate, latency_per_sentence))
+            return fallback_batch_size
+        LOGGER.info(
+            "probe complete: strategy=%s tested=%s winner=%d",
+            strategy.value,
+            ", ".join(f"{bs}:{lat:.6f}s_per_sent" for bs, lat in attempted),
+            max_safe,
+        )
+        return max_safe
 
     best_candidate = _pick_probe_winner(
         attempted, strategy=strategy, probe_epsilon=probe_epsilon
@@ -409,6 +562,8 @@ def run_pipeline(
     probe_log_cuda_memory: bool = False,
     char_len_bucketing: bool = False,
     char_len_bucket_edges: tuple[int, ...] | None = None,
+    max_buckets: int = DEFAULT_MAX_BUCKETS,
+    gvf_threshold: float = DEFAULT_GVF_THRESHOLD,
 ) -> PipelineResult:
     t0 = time.perf_counter()
     in_dir = Path(input_directory)
@@ -418,15 +573,14 @@ def run_pipeline(
         if isinstance(probe_strategy, ProbeStrategy)
         else ProbeStrategy(probe_strategy)
     )
-    if char_len_bucketing:
-        edges_eff = (
-            char_len_bucket_edges
-            if char_len_bucket_edges is not None
-            else DEFAULT_CHAR_LEN_BUCKET_EDGES
-        )
+    use_jenks = char_len_bucketing and char_len_bucket_edges is None
+    if char_len_bucketing and char_len_bucket_edges is not None:
+        edges_eff: tuple[int, ...] | None = char_len_bucket_edges
         _validate_char_len_bucket_edges(edges_eff)
+    elif not char_len_bucketing:
+        edges_eff = None
     else:
-        edges_eff = DEFAULT_CHAR_LEN_BUCKET_EDGES
+        edges_eff = None
     resolved_probe = _resolved_probe_candidates(
         probe_batch_sizes,
         max_probe_batch,
@@ -582,11 +736,39 @@ def run_pipeline(
                         continue
                     file_metas_sorted = sorted(file_metas, key=lambda m: m.char_len)
                     if char_len_bucketing:
-                        buckets = _split_sorted_metas_by_char_len_edges(
-                            file_metas_sorted, edges_eff
-                        )
+                        if use_jenks:
+                            file_char_lens = [m.char_len for m in file_metas_sorted]
+                            jenks_edges = _jenks_auto_bucket_edges(
+                                file_char_lens,
+                                max_k=max_buckets,
+                                gvf_threshold=gvf_threshold,
+                            )
+                            if jenks_edges:
+                                _validate_char_len_bucket_edges(jenks_edges)
+                                active_edges = jenks_edges
+                            else:
+                                active_edges = None
+                            LOGGER.info(
+                                "file=%s jenks edges=%s (from %d char_lens)",
+                                path.name,
+                                active_edges,
+                                len(file_char_lens),
+                            )
+                        else:
+                            active_edges = edges_eff
+                        if active_edges:
+                            buckets = _split_sorted_metas_by_char_len_edges(
+                                file_metas_sorted, active_edges
+                            )
+                        else:
+                            buckets = [file_metas_sorted]
                         for bi, bucket_metas in enumerate(buckets):
-                            band = _char_len_band_label(bucket_metas[0].char_len, edges_eff)
+                            if active_edges:
+                                band = _char_len_band_label(
+                                    bucket_metas[0].char_len, active_edges
+                                )
+                            else:
+                                band = "[all]"
                             _process_metas_slice(
                                 bucket_metas,
                                 log_name=(

@@ -16,6 +16,8 @@ import sys
 from batch_builder import DEFAULT_BATCH_SIZE
 from ingest_pipeline import (
     DEFAULT_CHAR_LEN_BUCKET_EDGES,
+    DEFAULT_GVF_THRESHOLD,
+    DEFAULT_MAX_BUCKETS,
     DEFAULT_PROBE_EPSILON,
     ProbeStrategy,
     run_pipeline,
@@ -119,7 +121,29 @@ def parse_args() -> argparse.Namespace:
         metavar="LIST",
         help=(
             'char_len bucket upper bounds, comma-separated (strictly increasing), e.g. '
-            '"16,32,64,128,256,512,1024"; requires --char-len-buckets; default is built-in edges'
+            '"16,32,64,128,256,512,1024"; requires --char-len-buckets; when omitted, '
+            'Jenks natural breaks clustering is used to find edges automatically'
+        ),
+    )
+    parser.add_argument(
+        "--max-buckets",
+        type=int,
+        default=DEFAULT_MAX_BUCKETS,
+        metavar="K",
+        help=(
+            f"maximum number of Jenks char_len buckets per file (default: {DEFAULT_MAX_BUCKETS}); "
+            "only used when --char-len-buckets is set without --bucket-edges"
+        ),
+    )
+    parser.add_argument(
+        "--gvf-threshold",
+        type=float,
+        default=DEFAULT_GVF_THRESHOLD,
+        metavar="X",
+        help=(
+            "Jenks goodness-of-variance-fit target: stop increasing k when GVF reaches this "
+            f"level (default: {DEFAULT_GVF_THRESHOLD}); only used with --char-len-buckets "
+            "without --bucket-edges"
         ),
     )
     return parser.parse_args()
@@ -142,6 +166,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if args.max_buckets < 2:
+        print("run_ingest: --max-buckets must be >= 2", file=sys.stderr)
+        return 2
+    if not (0.0 <= args.gvf_threshold <= 1.0):
+        print("run_ingest: --gvf-threshold must be in [0, 1]", file=sys.stderr)
+        return 2
     logging.basicConfig(level=logging.INFO)
 
     result = run_pipeline(
@@ -155,6 +185,8 @@ def main() -> int:
         probe_log_cuda_memory=args.probe_log_cuda_memory,
         char_len_bucketing=args.char_len_buckets,
         char_len_bucket_edges=args.bucket_edges,
+        max_buckets=args.max_buckets,
+        gvf_threshold=args.gvf_threshold,
     )
 
     print("pipeline_result:")
@@ -164,6 +196,8 @@ def main() -> int:
     print(f"- max_probe_batch: {args.max_probe_batch}")
     print(f"- char_len_bucketing: {args.char_len_buckets}")
     print(f"- bucket_edges: {args.bucket_edges}")
+    print(f"- max_buckets: {args.max_buckets}")
+    print(f"- gvf_threshold: {args.gvf_threshold}")
     print(f"- input_directory: {result.input_directory}")
     print(f"- output_path: {result.output_path}")
     print(f"- files_discovered: {result.files_discovered}")

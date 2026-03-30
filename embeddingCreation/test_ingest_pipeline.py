@@ -25,7 +25,13 @@ from functools import wraps
 
 from ingest_pipeline import (
     DEFAULT_CHAR_LEN_BUCKET_EDGES,
+    DEFAULT_GVF_THRESHOLD,
+    DEFAULT_MAX_BUCKETS,
     ProbeStrategy,
+    _binary_probe_max_safe,
+    _goodness_of_variance_fit,
+    _jenks_auto_bucket_edges,
+    _jenks_breaks,
     _resolved_probe_candidates,
     _split_sorted_metas_by_char_len_edges,
     _validate_char_len_bucket_edges,
@@ -510,7 +516,6 @@ class TestIngestPipeline(unittest.TestCase):
             fallback_batch_size=8,
         )
         self.assertIn(picked, (64, 128))
-        self.assertIn(256, _FakeWorker.seen_batch_sizes)
         self.assertNotIn(512, _FakeWorker.seen_batch_sizes)
 
     def test_probe_max_successful_returns_largest_ok_candidate(self) -> None:
@@ -528,12 +533,10 @@ class TestIngestPipeline(unittest.TestCase):
     def test_probe_min_latency_prefers_better_per_sentence(self) -> None:
         worker = _FakeWorker()
         worker.init()
-        # Two perf_counter calls per candidate: start, end. 256 wins on latency/sentence.
+        # Binary search on [256, 512]: lo=0 hi=1 → mid=0 (256 first), then mid=1 (512).
         perf = [
-            0.0,
-            0.032,
-            0.0,
-            0.12,
+            0.0, 0.032,   # 256: 0.032/256 = 0.000125/sent — better
+            0.0, 0.12,    # 512: 0.12/512  = 0.000234/sent
         ]
         with patch("ingest_pipeline.time.perf_counter", side_effect=perf):
             picked = probe_batch_size(
@@ -548,11 +551,10 @@ class TestIngestPipeline(unittest.TestCase):
     def test_probe_max_successful_returns_512_when_min_latency_would_pick_256(self) -> None:
         worker = _FakeWorker()
         worker.init()
+        # Binary search order: 256, then 512 (both succeed).
         perf = [
-            0.0,
-            0.032,
-            0.0,
-            0.12,
+            0.0, 0.032,   # 256
+            0.0, 0.12,    # 512
         ]
         with patch("ingest_pipeline.time.perf_counter", side_effect=perf * 2):
             min_pick = probe_batch_size(
@@ -575,7 +577,8 @@ class TestIngestPipeline(unittest.TestCase):
     def test_probe_epsilon_prefers_largest_within_band(self) -> None:
         worker = _FakeWorker()
         worker.init()
-        # 256: 0.032/256 = 0.000125/sent; 512: 0.066/512 within 5% of best
+        # Binary search order: 256 first, 512 second.
+        # 256: 0.032/256 = 0.000125/sent; 512: 0.066/512 ≈ 0.000129/sent — within 5%
         perf = [0.0, 0.032, 0.0, 0.066]
         with patch("ingest_pipeline.time.perf_counter", side_effect=perf):
             picked = probe_batch_size(
@@ -696,7 +699,9 @@ class TestIngestPipeline(unittest.TestCase):
             (16, 32, 64, 128, 256, 512, 1024),
         )
 
-    def test_char_len_bucketing_two_buckets_four_probe_calls(self) -> None:
+    def test_char_len_bucketing_explicit_edges_four_probe_calls(self) -> None:
+        """With explicit bucket-edges, Jenks is skipped and fixed edges used."""
+
         def _two_band_splitter(text: str, *, locale: str) -> list[str]:
             del text, locale
             shorts = [f"{i:03d}aaaaaaaaaa." for i in range(64)]
@@ -725,6 +730,7 @@ class TestIngestPipeline(unittest.TestCase):
                     out,
                     batch_size=4,
                     char_len_bucketing=True,
+                    char_len_bucket_edges=(16,),
                     max_probe_batch=64,
                 )
         self.assertTrue(res.success)
@@ -761,6 +767,177 @@ class TestIngestPipeline(unittest.TestCase):
             first_batch = _FakeWorker.seen_batches[0]
             lengths = [len(s) for s in first_batch]
             self.assertEqual(lengths, sorted(lengths))
+
+    # -- Jenks natural breaks ---------------------------------------------------
+
+    def test_jenks_breaks_two_clusters(self) -> None:
+        data = [1, 1, 2, 2, 100, 100, 101, 101]
+        breaks = _jenks_breaks(data, 2)
+        self.assertEqual(len(breaks), 1)
+        self.assertTrue(breaks[0] <= 100)
+
+    def test_jenks_breaks_k_equals_n(self) -> None:
+        data = [10, 20, 30]
+        breaks = _jenks_breaks(data, 3)
+        self.assertEqual(len(breaks), 2)
+
+    def test_jenks_breaks_too_few_points(self) -> None:
+        self.assertEqual(_jenks_breaks([1], 2), [])
+        self.assertEqual(_jenks_breaks([], 2), [])
+
+    def test_jenks_breaks_uniform_data(self) -> None:
+        data = [5, 5, 5, 5]
+        breaks = _jenks_breaks(data, 2)
+        self.assertIsInstance(breaks, list)
+
+    def test_gvf_perfect_clustering(self) -> None:
+        data = [1, 1, 1, 100, 100, 100]
+        breaks = _jenks_breaks(data, 2)
+        gvf = _goodness_of_variance_fit(data, breaks)
+        self.assertGreaterEqual(gvf, 0.95)
+
+    def test_gvf_uniform_is_one(self) -> None:
+        self.assertEqual(_goodness_of_variance_fit([5, 5, 5], [3]), 1.0)
+
+    def test_gvf_empty_is_one(self) -> None:
+        self.assertEqual(_goodness_of_variance_fit([], []), 1.0)
+
+    def test_jenks_auto_bucket_edges_uniform_returns_empty(self) -> None:
+        self.assertEqual(_jenks_auto_bucket_edges([10, 10, 10, 10]), ())
+
+    def test_jenks_auto_bucket_edges_two_groups(self) -> None:
+        data = sorted([5] * 20 + [200] * 20)
+        edges = _jenks_auto_bucket_edges(data, max_k=4, gvf_threshold=0.8)
+        self.assertTrue(len(edges) >= 1)
+        self.assertTrue(all(e > 0 for e in edges))
+        self.assertTrue(edges[0] <= 200)
+
+    def test_jenks_auto_validates_max_k(self) -> None:
+        with self.assertRaises(ValueError):
+            _jenks_auto_bucket_edges([1, 2, 3], max_k=1)
+
+    def test_jenks_auto_validates_gvf_range(self) -> None:
+        with self.assertRaises(ValueError):
+            _jenks_auto_bucket_edges([1, 2, 3], gvf_threshold=1.5)
+
+    # -- Binary probe -----------------------------------------------------------
+
+    def test_binary_probe_finds_max_safe(self) -> None:
+        worker = _FakeWorker()
+        worker.init()
+        _FakeWorker.fail_on_batch_size_at_or_above = 512
+        max_safe, attempted = _binary_probe_max_safe(
+            worker,
+            ["s"] * 1024,
+            [64, 128, 256, 512, 1024],
+        )
+        self.assertIn(max_safe, (128, 256))
+        self.assertNotIn(1024, [c for c, _ in attempted])
+
+    def test_binary_probe_all_succeed(self) -> None:
+        worker = _FakeWorker()
+        worker.init()
+        max_safe, _ = _binary_probe_max_safe(
+            worker,
+            ["s"] * 1024,
+            [64, 128, 256, 512],
+        )
+        self.assertEqual(max_safe, 512)
+
+    def test_binary_probe_all_fail(self) -> None:
+        worker = _FakeWorker()
+        worker.init()
+        _FakeWorker.fail_on_batch_size_at_or_above = 1
+        max_safe, attempted = _binary_probe_max_safe(
+            worker,
+            ["s"] * 1024,
+            [64, 128, 256],
+        )
+        self.assertIsNone(max_safe)
+
+    def test_binary_probe_fewer_samples_than_candidates(self) -> None:
+        worker = _FakeWorker()
+        worker.init()
+        max_safe, _ = _binary_probe_max_safe(
+            worker,
+            ["s"] * 100,
+            [64, 128, 256, 512],
+        )
+        self.assertIn(max_safe, (64, 128, None))
+
+    # -- Jenks bucketing integration --------------------------------------------
+
+    def test_jenks_bucketing_integration(self) -> None:
+        """char_len_bucketing=True without explicit edges triggers Jenks."""
+
+        def _varied_splitter(text: str, *, locale: str) -> list[str]:
+            del text, locale
+            shorts = [f"s{i:02d}." for i in range(64)]
+            longs = ["x" * 120 + f"{i:03d}." for i in range(64)]
+            return shorts + longs
+
+        real_pb = ingest_pipeline_mod.probe_batch_size
+
+        @wraps(real_pb)
+        def spy(*a: object, **k: object) -> int:
+            spy.probe_count += 1
+            return real_pb(*a, **k)
+
+        spy.probe_count = 0
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            root.mkdir()
+            (root / "doc.txt").write_text("placeholder", encoding="utf-8")
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline._split_text", _varied_splitter
+            ), patch("ingest_pipeline.probe_batch_size", spy):
+                res = run_pipeline(
+                    root,
+                    out,
+                    batch_size=4,
+                    char_len_bucketing=True,
+                    max_probe_batch=64,
+                )
+        self.assertTrue(res.success)
+        self.assertEqual(res.records_written, 128)
+        self.assertGreaterEqual(spy.probe_count, 2)
+
+    def test_jenks_bucketing_uniform_falls_back_to_single_bucket(self) -> None:
+        """When all sentences have same char_len, Jenks returns no edges → single bucket."""
+
+        def _uniform_splitter(text: str, *, locale: str) -> list[str]:
+            del text, locale
+            return [f"word{i:03d}." for i in range(64)]
+
+        real_pb = ingest_pipeline_mod.probe_batch_size
+
+        @wraps(real_pb)
+        def spy(*a: object, **k: object) -> int:
+            spy.probe_count += 1
+            return real_pb(*a, **k)
+
+        spy.probe_count = 0
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            root.mkdir()
+            (root / "doc.txt").write_text("placeholder", encoding="utf-8")
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline._split_text", _uniform_splitter
+            ), patch("ingest_pipeline.probe_batch_size", spy):
+                res = run_pipeline(
+                    root,
+                    out,
+                    batch_size=4,
+                    char_len_bucketing=True,
+                    max_probe_batch=64,
+                )
+        self.assertTrue(res.success)
+        self.assertEqual(res.records_written, 64)
+        self.assertEqual(spy.probe_count, 2)
 
 
 if __name__ == "__main__":
