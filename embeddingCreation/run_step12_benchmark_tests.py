@@ -68,34 +68,13 @@ def main() -> int:
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     benchmark_report = reports_dir / f"step12_benchmark_{ts}.json"
-    soak_report = reports_dir / f"step12_benchmark_soak_{ts}.json"
-
-    print("step12_runner: starting primary benchmark sweep")
-    report1 = run_benchmark(
+    print("step12_runner: starting benchmark sweep (+ soak) in one pass")
+    report = run_benchmark(
         argparse.Namespace(
             batch_sizes=args.batch_sizes,
             corpus_size=args.corpus_size,
             corpus_dir=args.corpus_dir,
             output_report=str(benchmark_report),
-            warmup_batches=args.warmup_batches,
-            soak=False,
-            soak_sentences=args.soak_sentences,
-            keep_outputs=args.keep_outputs,
-        )
-    )
-
-    recommendation = report1.get("recommendation", {})
-    rec_bs = recommendation.get("batch_size")
-    rec_reason = recommendation.get("reason")
-    print(f"step12_runner: primary recommendation batch_size={rec_bs} reason={rec_reason}")
-
-    print("step12_runner: starting soak benchmark")
-    report2 = run_benchmark(
-        argparse.Namespace(
-            batch_sizes=args.batch_sizes,
-            corpus_size=args.corpus_size,
-            corpus_dir=args.corpus_dir,
-            output_report=str(soak_report),
             warmup_batches=args.warmup_batches,
             soak=True,
             soak_sentences=args.soak_sentences,
@@ -103,10 +82,15 @@ def main() -> int:
         )
     )
 
-    soak = report2.get("soak") or {}
+    recommendation = report.get("recommendation", {})
+    rec_bs = recommendation.get("batch_size")
+    rec_reason = recommendation.get("reason")
+    print(f"step12_runner: recommendation batch_size={rec_bs} reason={rec_reason}")
+
+    soak = report.get("soak") or {}
+    print(f"step12_runner: soak verification_ok={soak.get('verification_ok')}")
     print(f"step12_runner: soak leak_warning={soak.get('leak_warning')}")
     print(f"step12_runner: benchmark_report={benchmark_report.resolve()}")
-    print(f"step12_runner: soak_report={soak_report.resolve()}")
     print("step12_runner: done")
     return 0
 
