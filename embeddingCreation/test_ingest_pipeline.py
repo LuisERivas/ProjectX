@@ -20,7 +20,7 @@ import numpy as np
 from binary_writer import BinaryWriterError
 from binary_reader import read_all
 from embedding_worker import EmbeddingError, ModelLoadError
-from ingest_pipeline import run_pipeline
+from ingest_pipeline import probe_batch_size, run_pipeline
 
 try:
     import icu  # type: ignore
@@ -41,6 +41,8 @@ class _FakeWorker:
     shutdown_calls = 0
     encode_calls = 0
     fail_on_encode = False
+    fail_on_batch_size_at_or_above: int | None = None
+    seen_batch_sizes: list[int] = []
     last_instance: "_FakeWorker | None" = None
 
     def __init__(self) -> None:
@@ -54,6 +56,8 @@ class _FakeWorker:
         cls.shutdown_calls = 0
         cls.encode_calls = 0
         cls.fail_on_encode = False
+        cls.fail_on_batch_size_at_or_above = None
+        cls.seen_batch_sizes = []
         cls.last_instance = None
 
     @property
@@ -67,8 +71,14 @@ class _FakeWorker:
 
     def encode_batch(self, sentences: list[str]) -> np.ndarray:
         _FakeWorker.encode_calls += 1
+        _FakeWorker.seen_batch_sizes.append(len(sentences))
         if _FakeWorker.fail_on_encode:
             raise EmbeddingError("forced encode failure")
+        if (
+            _FakeWorker.fail_on_batch_size_at_or_above is not None
+            and len(sentences) >= _FakeWorker.fail_on_batch_size_at_or_above
+        ):
+            raise EmbeddingError("forced probe OOM")
         arr = np.zeros((len(sentences), 2048), dtype=np.float16)
         for i in range(len(sentences)):
             arr[i, i % 2048] = np.float16(1.0)
@@ -474,6 +484,36 @@ class TestIngestPipeline(unittest.TestCase):
                 res = run_pipeline(root, out, batch_size=4, locale="en_US")
             self.assertTrue(res.records_written >= 3)
             self.assertTrue(res.success)
+
+    def test_probe_batch_size_skips_larger_candidates_after_failure(self) -> None:
+        worker = _FakeWorker()
+        worker.init()
+        _FakeWorker.fail_on_batch_size_at_or_above = 64
+        picked = probe_batch_size(
+            worker,
+            ["s"] * 128,
+            candidates=(16, 32, 64, 128),
+            fallback_batch_size=8,
+        )
+        self.assertIn(picked, (16, 32))
+        self.assertIn(64, _FakeWorker.seen_batch_sizes)
+        self.assertNotIn(128, _FakeWorker.seen_batch_sizes)
+
+    def test_per_document_probe_applied_to_each_file(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            doc1 = " ".join(f"D1_{i}." for i in range(20))
+            doc2 = " ".join(f"D2_{i}." for i in range(20))
+            self._write_texts(root, {"a.txt": doc1, "b.txt": doc2})
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline._split_text", _simple_splitter
+            ), patch("ingest_pipeline.probe_batch_size", return_value=16) as probe_mock:
+                res = run_pipeline(root, out, batch_size=4)
+            self.assertTrue(res.success)
+            self.assertEqual(res.records_written, 40)
+            self.assertEqual(res.total_batches, 4)
+            self.assertEqual(probe_mock.call_count, 2)
 
 
 if __name__ == "__main__":

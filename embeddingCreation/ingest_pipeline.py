@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from batch_builder import DEFAULT_BATCH_SIZE, batch_sentences
 from binary_reader import VerificationReport, verify_file
@@ -22,6 +23,8 @@ from embedding_worker import EmbeddingError, EmbeddingWorker, ModelLoadError
 from file_reader import DEFAULT_MAX_FILE_SIZE, discover_files, read_text_files
 
 LOGGER = logging.getLogger("ingest_pipeline")
+PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (16, 32, 64, 128)
+MAX_PENDING_WRITES: int = 2
 
 
 @dataclass(frozen=True)
@@ -73,7 +76,7 @@ def _validate_startup(in_dir: Path, out_path: Path, *, batch_size: int) -> str |
     return None
 
 
-def _sentence_stream(
+def _file_sentence_stream(
     input_directory: str | Path,
     *,
     extensions: frozenset[str],
@@ -81,10 +84,9 @@ def _sentence_stream(
     encoding: str,
     skip_hidden: bool,
     max_file_size: int,
-    locale: str,
     counters: dict[str, int],
     splitter: Callable[[str], list[str]],
-):
+) -> Iterable[tuple[Path, list[str]]]:
     for path, text in read_text_files(
         input_directory,
         extensions=extensions,
@@ -102,8 +104,61 @@ def _sentence_stream(
             continue
         counters["total_sentences"] += len(sentences)
         LOGGER.info("split file: path=%s sentences=%d", path.name, len(sentences))
-        for sentence in sentences:
-            yield sentence
+        yield path, sentences
+
+
+def probe_batch_size(
+    worker: EmbeddingWorker,
+    sample_sentences: list[str],
+    *,
+    candidates: tuple[int, ...] = PROBE_CANDIDATE_BATCH_SIZES,
+    fallback_batch_size: int = DEFAULT_BATCH_SIZE,
+) -> int:
+    if fallback_batch_size < 1:
+        raise ValueError(f"fallback_batch_size must be >= 1, got {fallback_batch_size}")
+    if not sample_sentences:
+        return fallback_batch_size
+
+    best_candidate: int | None = None
+    best_latency_per_sentence = float("inf")
+    attempted: list[tuple[int, float]] = []
+    candidate_list = sorted({c for c in candidates if c > 0})
+    if not candidate_list:
+        return fallback_batch_size
+
+    for candidate in candidate_list:
+        if candidate > len(sample_sentences):
+            continue
+        try:
+            t0 = time.perf_counter()
+            _ = worker.encode_batch(sample_sentences[:candidate])
+            elapsed = time.perf_counter() - t0
+        except EmbeddingError as exc:
+            LOGGER.warning(
+                "probe batch failed at size=%d, skipping larger candidates: %s",
+                candidate,
+                exc,
+            )
+            break
+        latency_per_sentence = elapsed / candidate
+        attempted.append((candidate, latency_per_sentence))
+        if latency_per_sentence < best_latency_per_sentence:
+            best_latency_per_sentence = latency_per_sentence
+            best_candidate = candidate
+
+    if best_candidate is None:
+        LOGGER.info(
+            "probe had no valid candidates, using fallback_batch_size=%d",
+            fallback_batch_size,
+        )
+        return fallback_batch_size
+
+    LOGGER.info(
+        "probe complete: tested=%s winner=%d",
+        ", ".join(f"{bs}:{lat:.6f}s_per_sent" for bs, lat in attempted),
+        best_candidate,
+    )
+    return best_candidate
 
 
 def _failure_result(
@@ -200,37 +255,65 @@ def run_pipeline(
     worker = EmbeddingWorker()
 
     splitter = lambda text: _split_text(text, locale=locale)
-    sentence_iter = _sentence_stream(
-        in_dir,
-        extensions=extensions,
-        recursive=recursive,
-        encoding=encoding,
-        skip_hidden=skip_hidden,
-        max_file_size=max_file_size,
-        locale=locale,
-        counters=counters,
-        splitter=splitter,
-    )
-    sentences = list(sentence_iter)
 
     try:
         worker.init()
         with EmbeddingWriter(out_path) as writer:
             with ThreadPoolExecutor(max_workers=1) as pool:
-                pending_write: Future[None] | None = None
-                for batch in batch_sentences(sentences, batch_size=batch_size, start_id=0):
-                    total_batches += 1
-                    embeddings = worker.encode_batch(batch.sentences)
-                    if pending_write is not None:
-                        pending_write.result()
-                    pending_write = pool.submit(writer.write_batch, batch.ids, embeddings)
-                    LOGGER.info(
-                        "batch queued: index=%d size=%d",
-                        total_batches,
-                        len(batch.sentences),
+                pending_writes: deque[Future[None]] = deque()
+                next_id = 0
+
+                for path, file_sentences in _file_sentence_stream(
+                    in_dir,
+                    extensions=extensions,
+                    recursive=recursive,
+                    encoding=encoding,
+                    skip_hidden=skip_hidden,
+                    max_file_size=max_file_size,
+                    counters=counters,
+                    splitter=splitter,
+                ):
+                    if not file_sentences:
+                        continue
+                    probe_sample = file_sentences[: max(PROBE_CANDIDATE_BATCH_SIZES)]
+                    selected_batch_size = (
+                        probe_batch_size(
+                            worker,
+                            probe_sample,
+                            candidates=PROBE_CANDIDATE_BATCH_SIZES,
+                            fallback_batch_size=batch_size,
+                        )
+                        if len(file_sentences) >= min(PROBE_CANDIDATE_BATCH_SIZES)
+                        else batch_size
                     )
-                if pending_write is not None:
-                    pending_write.result()
+                    LOGGER.info(
+                        "file batch size selected: file=%s sentences=%d batch_size=%d",
+                        path.name,
+                        len(file_sentences),
+                        selected_batch_size,
+                    )
+
+                    for batch in batch_sentences(
+                        file_sentences,
+                        batch_size=selected_batch_size,
+                        start_id=next_id,
+                    ):
+                        total_batches += 1
+                        embeddings = worker.encode_batch(batch.sentences)
+                        pending_writes.append(
+                            pool.submit(writer.write_batch, batch.ids, embeddings)
+                        )
+                        if len(pending_writes) >= MAX_PENDING_WRITES:
+                            pending_writes.popleft().result()
+                        LOGGER.info(
+                            "batch queued: index=%d size=%d",
+                            total_batches,
+                            len(batch.sentences),
+                        )
+                    next_id += len(file_sentences)
+
+                while pending_writes:
+                    pending_writes.popleft().result()
             records_written = writer.records_written
     except ModelLoadError as exc:
         success = False

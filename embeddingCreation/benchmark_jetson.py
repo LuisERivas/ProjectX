@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import mkdtemp
@@ -28,6 +30,7 @@ from file_reader import read_text_files
 
 LOGGER = logging.getLogger("benchmark_jetson")
 EXPECTED_DIM = 2048
+MAX_PENDING_WRITES = 2
 
 
 @dataclass(frozen=True)
@@ -191,14 +194,13 @@ def run_batch_size_benchmark(
     if batch_size <= 0:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
-    all_batches = list(batch_sentences(sentences, batch_size=batch_size, start_id=0))
-    warmup_count = min(max(0, warmup_batches), len(all_batches))
-    warmup_batches_list = all_batches[:warmup_count]
+    total_candidate_batches = (len(sentences) + batch_size - 1) // batch_size
+    warmup_count = min(max(0, warmup_batches), total_candidate_batches)
 
     LOGGER.info(
         "starting batch-size run: batch_size=%d total_batches=%d warmup_batches=%d",
         batch_size,
-        len(all_batches),
+        total_candidate_batches,
         warmup_count,
     )
 
@@ -215,8 +217,11 @@ def run_batch_size_benchmark(
         except Exception:
             pass
 
-    for wb in warmup_batches_list:
-        _ = worker.encode_batch(wb.sentences)
+    if warmup_count > 0:
+        for idx, wb in enumerate(batch_sentences(sentences, batch_size=batch_size, start_id=0), 1):
+            _ = worker.encode_batch(wb.sentences)
+            if idx >= warmup_count:
+                break
 
     output_path = output_dir / f"benchmark_bs{batch_size}.bin"
     if output_path.exists():
@@ -235,13 +240,19 @@ def run_batch_size_benchmark(
     per_batch_latencies: list[float] = []
     try:
         with EmbeddingWriter(output_path) as writer:
-            for batch in all_batches:
-                peak_rss = max(peak_rss, _read_rss_bytes())
-                t0 = time.perf_counter()
-                embeddings = worker.encode_batch(batch.sentences)
-                per_batch_latencies.append(time.perf_counter() - t0)
-                writer.write_batch(batch.ids, embeddings)
-                peak_rss = max(peak_rss, _read_rss_bytes())
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending_writes: deque[Future[None]] = deque()
+                for batch in batch_sentences(sentences, batch_size=batch_size, start_id=0):
+                    peak_rss = max(peak_rss, _read_rss_bytes())
+                    t0 = time.perf_counter()
+                    embeddings = worker.encode_batch(batch.sentences)
+                    per_batch_latencies.append(time.perf_counter() - t0)
+                    pending_writes.append(pool.submit(writer.write_batch, batch.ids, embeddings))
+                    if len(pending_writes) >= MAX_PENDING_WRITES:
+                        pending_writes.popleft().result()
+                    peak_rss = max(peak_rss, _read_rss_bytes())
+                while pending_writes:
+                    pending_writes.popleft().result()
             records_written = writer.records_written
     except (EmbeddingError, RuntimeError) as exc:
         if _is_oom_error(exc):
