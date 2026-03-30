@@ -128,6 +128,17 @@ class TestEmbeddingValidator(unittest.TestCase):
         out = validate_embeddings(arr, expected_count=1)
         self.assertEqual(out.shape, (1, EXPECTED_DIM))
 
+    def test_skip_norm_checks_happy_path(self) -> None:
+        arr = _unit_batch(2) * 3.0
+        out = validate_embeddings(arr, expected_count=2, skip_norm_checks=True)
+        self.assertEqual(out.shape, (2, EXPECTED_DIM))
+        self.assertEqual(out.dtype, np.float16)
+
+    def test_skip_norm_checks_still_enforces_shape(self) -> None:
+        bad = np.zeros((2, 1024), dtype=np.float32)
+        with self.assertRaises(EmbeddingValidationError):
+            validate_embeddings(bad, expected_count=2, skip_norm_checks=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

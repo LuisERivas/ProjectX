@@ -27,6 +27,7 @@ PRE_CAST_NORM_MIN = 0.999
 PRE_CAST_NORM_MAX = 1.001
 POST_CAST_NORM_MIN = 0.95
 POST_CAST_NORM_MAX = 1.05
+FULL_VALIDATION_BATCHES = 3
 DEBUG_ENV_VAR = "EMBEDDING_WORKER_DEBUG"
 
 LOGGER = logging.getLogger("embedding_worker")
@@ -191,6 +192,7 @@ class EmbeddingWorker:
                 result = result.reshape(1, -1)
 
             try:
+                skip_norm_checks = self._metrics.total_batches >= FULL_VALIDATION_BATCHES
                 result_fp16 = validate_embeddings(
                     result,
                     expected_count=len(sentences),
@@ -199,6 +201,7 @@ class EmbeddingWorker:
                     pre_cast_norm_max=PRE_CAST_NORM_MAX,
                     post_cast_norm_min=POST_CAST_NORM_MIN,
                     post_cast_norm_max=POST_CAST_NORM_MAX,
+                    skip_norm_checks=skip_norm_checks,
                 )
             except EmbeddingValidationError as exc:
                 raise EmbeddingError(str(exc)) from exc

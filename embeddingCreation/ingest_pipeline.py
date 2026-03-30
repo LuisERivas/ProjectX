@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from batch_builder import batch_sentences
+from batch_builder import DEFAULT_BATCH_SIZE, batch_sentences
 from binary_reader import VerificationReport, verify_file
 from binary_writer import BinaryWriterError, EmbeddingWriter
 from embedding_worker import EmbeddingError, EmbeddingWorker, ModelLoadError
@@ -138,7 +139,7 @@ def run_pipeline(
     input_directory: str | Path,
     output_path: str | Path,
     *,
-    batch_size: int = 8,
+    batch_size: int = DEFAULT_BATCH_SIZE,
     locale: str = "en_US",
     extensions: frozenset[str] = frozenset({".txt"}),
     recursive: bool = False,
@@ -210,20 +211,26 @@ def run_pipeline(
         counters=counters,
         splitter=splitter,
     )
+    sentences = list(sentence_iter)
 
     try:
         worker.init()
         with EmbeddingWriter(out_path) as writer:
-            for batch in batch_sentences(sentence_iter, batch_size=batch_size, start_id=0):
-                total_batches += 1
-                embeddings = worker.encode_batch(batch.sentences)
-                writer.write_batch(batch.ids, embeddings)
-                LOGGER.info(
-                    "batch processed: index=%d size=%d records_written=%d",
-                    total_batches,
-                    len(batch.sentences),
-                    writer.records_written,
-                )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending_write: Future[None] | None = None
+                for batch in batch_sentences(sentences, batch_size=batch_size, start_id=0):
+                    total_batches += 1
+                    embeddings = worker.encode_batch(batch.sentences)
+                    if pending_write is not None:
+                        pending_write.result()
+                    pending_write = pool.submit(writer.write_batch, batch.ids, embeddings)
+                    LOGGER.info(
+                        "batch queued: index=%d size=%d",
+                        total_batches,
+                        len(batch.sentences),
+                    )
+                if pending_write is not None:
+                    pending_write.result()
             records_written = writer.records_written
     except ModelLoadError as exc:
         success = False

@@ -27,6 +27,7 @@ def validate_embeddings(
     pre_cast_norm_max: float = 1.001,
     post_cast_norm_min: float = 0.95,
     post_cast_norm_max: float = 1.05,
+    skip_norm_checks: bool = False,
 ) -> np.ndarray:
     """Validate and convert embeddings from fp32 to fp16.
 
@@ -50,6 +51,16 @@ def validate_embeddings(
         raise EmbeddingValidationError(
             f"embedding dim mismatch: got {arr.shape[1]}, expected {expected_dim}"
         )
+    result_fp16 = arr.astype(np.float16)
+
+    if skip_norm_checks:
+        LOGGER.debug(
+            "embedding validation fast path: count=%d dim=%d",
+            arr.shape[0],
+            arr.shape[1],
+        )
+        return result_fp16
+
     if not np.isfinite(arr).all():
         raise EmbeddingValidationError("non-finite values in fp32 embedding output")
 

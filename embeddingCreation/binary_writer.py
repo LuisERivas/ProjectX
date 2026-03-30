@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import os
-import struct
 from pathlib import Path
 
 import numpy as np
@@ -72,22 +71,29 @@ class EmbeddingWriter:
                 f"id count ({len(ids)}) != embedding count ({arr.shape[0]})"
             )
 
-        le_arr = arr.astype("<f2", copy=False)
         try:
-            for k, uid in enumerate(ids):
-                if not isinstance(uid, int):
-                    raise BinaryWriterError(f"id at index {k} is not int: {type(uid).__name__}")
-                if uid < 0 or uid > UINT32_MAX:
-                    raise BinaryWriterError(f"id {uid} outside uint32 range")
+            id_arr = np.asarray(ids, dtype=np.int64)
+        except Exception as exc:
+            raise BinaryWriterError("ids must be int-convertible values") from exc
+        if id_arr.ndim != 1 or id_arr.shape[0] != len(ids):
+            raise BinaryWriterError("ids must be a flat list of integers")
+        if np.any(id_arr < 0) or np.any(id_arr > UINT32_MAX):
+            bad = int(id_arr[(id_arr < 0) | (id_arr > UINT32_MAX)][0])
+            raise BinaryWriterError(f"id {bad} outside uint32 range")
 
-                row_bytes = le_arr[k].tobytes(order="C")
-                if len(row_bytes) != EMBEDDING_BYTES:
-                    raise BinaryWriterError(
-                        f"embedding row byte size mismatch: got {len(row_bytes)}, expected {EMBEDDING_BYTES}"
-                    )
+        le_arr = arr.astype("<f2", copy=False)
+        record_dtype = np.dtype([("id", "<u4"), ("emb", ("<f2", EXPECTED_DIM))])
+        block = np.empty(len(ids), dtype=record_dtype)
+        block["id"] = id_arr.astype("<u4", copy=False)
+        block["emb"] = le_arr
+        payload = block.tobytes()
+        if len(payload) != len(ids) * RECORD_SIZE:
+            raise BinaryWriterError(
+                f"record block byte size mismatch: got {len(payload)}, expected {len(ids) * RECORD_SIZE}"
+            )
 
-                self._fp.write(struct.pack("<I", uid))
-                self._fp.write(row_bytes)
+        try:
+            self._fp.write(payload)
         except OSError as exc:
             raise BinaryWriterError(f"write failure for temp file: {self._tmp_path}") from exc
 

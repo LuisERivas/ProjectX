@@ -152,7 +152,7 @@ def _run_acceptance(corpus_dir: Path, output_path: Path) -> _AssertionState:
     ingest_logger.setLevel(logging.INFO)
 
     try:
-        result = run_pipeline(corpus_dir, output_path, batch_size=8, locale="en_US")
+        result = run_pipeline(corpus_dir, output_path, locale="en_US")
     finally:
         worker_logger.removeHandler(worker_log_handler)
         ingest_logger.removeHandler(ingest_log_handler)

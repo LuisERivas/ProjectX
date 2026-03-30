@@ -165,11 +165,11 @@ class TestIngestPipeline(unittest.TestCase):
             self.assertEqual(ids, sorted(ids))
             self.assertEqual(len(ids), len(set(ids)))
 
-    def test_batch_size_1_4_16(self) -> None:
+    def test_batch_size_1_4_16_64(self) -> None:
         with TemporaryDirectory() as td:
             root = Path(td) / "in"
             self._write_texts(root, {"a.txt": "A. B. C. D. E."})
-            for bs in (1, 4, 16):
+            for bs in (1, 4, 16, 64):
                 out = Path(td) / f"out_{bs}.bin"
                 with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
                     "ingest_pipeline._split_text", _simple_splitter
@@ -355,6 +355,36 @@ class TestIngestPipeline(unittest.TestCase):
                 "ingest_pipeline.EmbeddingWriter", _FailWriter
             ), patch("ingest_pipeline._split_text", _simple_splitter):
                 res = run_pipeline(root, out)
+            self.assertFalse(res.success)
+            self.assertTrue(any(e.startswith("[WRITE]") for e in res.errors))
+
+    def test_async_write_failure_returns_result(self) -> None:
+        class _FailWriter:
+            def __init__(self, output_path: Path) -> None:
+                self.output_path = Path(output_path)
+                self.records_written = 0
+
+            def __enter__(self) -> "_FailWriter":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                tmp = self.output_path.with_name(f"{self.output_path.name}.tmp")
+                if tmp.exists():
+                    tmp.unlink()
+                return False
+
+            def write_batch(self, ids: list[int], embeddings: np.ndarray) -> None:
+                del ids, embeddings
+                raise BinaryWriterError("async forced write failure")
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            self._write_texts(root, {"a.txt": "A. B. C."})
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline.EmbeddingWriter", _FailWriter
+            ), patch("ingest_pipeline._split_text", _simple_splitter):
+                res = run_pipeline(root, out, batch_size=2)
             self.assertFalse(res.success)
             self.assertTrue(any(e.startswith("[WRITE]") for e in res.errors))
 
