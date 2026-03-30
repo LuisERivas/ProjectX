@@ -701,7 +701,7 @@ class TestIngestPipeline(unittest.TestCase):
             (16, 32, 64, 128, 256, 512, 1024),
         )
 
-    def test_char_len_bucketing_explicit_edges_four_probe_calls(self) -> None:
+    def test_char_len_bucketing_explicit_edges_two_probe_calls(self) -> None:
         """With explicit bucket-edges, Jenks is skipped and fixed edges used."""
 
         def _two_band_splitter(text: str, *, locale: str) -> list[str]:
@@ -737,7 +737,7 @@ class TestIngestPipeline(unittest.TestCase):
                 )
         self.assertTrue(res.success)
         self.assertEqual(res.records_written, 128)
-        self.assertEqual(spy.probe_count, 4)
+        self.assertEqual(spy.probe_count, 2)
 
     def test_per_document_probe_applied_to_each_file(self) -> None:
         with TemporaryDirectory() as td:
@@ -923,7 +923,7 @@ class TestIngestPipeline(unittest.TestCase):
                 )
         self.assertTrue(res.success)
         self.assertEqual(res.records_written, 128)
-        self.assertGreaterEqual(spy.probe_count, 2)
+        self.assertGreaterEqual(spy.probe_count, 1)
 
     def test_jenks_bucketing_uniform_falls_back_to_single_bucket(self) -> None:
         """When all sentences have same char_len, Jenks returns no edges → single bucket."""
@@ -958,6 +958,44 @@ class TestIngestPipeline(unittest.TestCase):
                 )
         self.assertTrue(res.success)
         self.assertEqual(res.records_written, 64)
+        self.assertEqual(spy.probe_count, 1)
+
+    def test_probe_cache_reuses_bucket_ceiling_across_files(self) -> None:
+        def _two_band_splitter(text: str, *, locale: str) -> list[str]:
+            del text, locale
+            shorts = [f"{i:03d}short." for i in range(64)]
+            longs = [f"{i:03d}" + ("x" * 120) + "." for i in range(64)]
+            return shorts + longs
+
+        real_pb = ingest_pipeline_mod.probe_batch_size
+
+        @wraps(real_pb)
+        def spy(*a: object, **k: object) -> int:
+            spy.probe_count += 1
+            return real_pb(*a, **k)
+
+        spy.probe_count = 0
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            root.mkdir()
+            (root / "a.txt").write_text("placeholder-a", encoding="utf-8")
+            (root / "b.txt").write_text("placeholder-b", encoding="utf-8")
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline._split_text", _two_band_splitter
+            ), patch("ingest_pipeline.probe_batch_size", spy):
+                res = run_pipeline(
+                    root,
+                    out,
+                    batch_size=4,
+                    char_len_bucketing=True,
+                    char_len_bucket_edges=(16,),
+                    max_probe_batch=64,
+                )
+        self.assertTrue(res.success)
+        self.assertEqual(res.records_written, 256)
+        # Two bucket signatures are probed once, then reused for second file.
         self.assertEqual(spy.probe_count, 2)
 
 

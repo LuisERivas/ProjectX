@@ -9,6 +9,8 @@ Conforms to embedding_format_spec.txt Section 3 contract.
 
 from __future__ import annotations
 
+import threading
+
 import icu
 
 SUPPRESSIONS: frozenset[str] = frozenset({
@@ -22,6 +24,25 @@ SUPPRESSIONS: frozenset[str] = frozenset({
     "No.", "Fig.", "Ref.",
     "a.m.", "p.m.",
 })
+_THREAD_LOCAL = threading.local()
+
+
+def _get_sentence_break_iterator(*, locale: str) -> icu.BreakIterator:
+    cache = getattr(_THREAD_LOCAL, "break_iterators", None)
+    if cache is None:
+        cache = {}
+        _THREAD_LOCAL.break_iterators = cache
+    it = cache.get(locale)
+    if it is None:
+        it = icu.BreakIterator.createSentenceInstance(icu.Locale(locale))
+        cache[locale] = it
+    return it
+
+
+def _reset_break_iterator_cache_for_tests() -> None:
+    """Testing helper to clear per-thread BreakIterator cache."""
+    if hasattr(_THREAD_LOCAL, "break_iterators"):
+        _THREAD_LOCAL.break_iterators = {}
 
 
 def _ends_with_suppression(sentence: str) -> bool:
@@ -63,7 +84,7 @@ def split_sentences(
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    bi = icu.BreakIterator.createSentenceInstance(icu.Locale(locale))
+    bi = _get_sentence_break_iterator(locale=locale)
     bi.setText(text)
 
     boundaries: list[int] = list(bi)

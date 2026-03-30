@@ -9,6 +9,8 @@ file_reader -> sentence_splitter -> batch_builder -> embedding_worker -> binary_
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -56,6 +58,7 @@ MAX_PENDING_WRITES: int = 2
 CHAR_BUDGET_PER_SENTENCE: int = 256
 DEFAULT_PROBE_EPSILON: float = 0.05
 CUDA_WARN_FREE_BYTES: int = 1 * 1024 * 1024 * 1024
+SPLIT_QUEUE_MAX_ITEMS: int = 2
 
 
 class ProbeStrategy(str, Enum):
@@ -674,42 +677,74 @@ def run_pipeline(
                 pending_writes: deque[Future[None]] = deque()
                 probe_window = max(resolved_probe)
                 min_sentences_to_probe = min(resolved_probe)
+                probe_cache: dict[tuple[int, int, tuple[int, ...], str, float], int] = {}
 
                 def _process_metas_slice(
                     metas_slice: list[SentenceMeta],
                     *,
                     log_name: str,
                     sentence_count: int,
+                    bucket_mode: bool,
                 ) -> None:
                     nonlocal total_batches
                     sentences = [m.text for m in metas_slice]
                     if len(sentences) >= min_sentences_to_probe:
-                        head_ceiling = probe_batch_size(
-                            worker,
-                            sentences[:probe_window],
-                            candidates=resolved_probe,
-                            fallback_batch_size=batch_size,
-                            strategy=strategy,
-                            probe_epsilon=probe_epsilon,
-                            log_cuda_memory_warn=probe_log_cuda_memory,
-                        )
-                        tail_ceiling = probe_batch_size(
-                            worker,
-                            sentences[-probe_window:],
-                            candidates=resolved_probe,
-                            fallback_batch_size=batch_size,
-                            strategy=strategy,
-                            probe_epsilon=probe_epsilon,
-                            log_cuda_memory_warn=probe_log_cuda_memory,
-                        )
-                        selected = min(head_ceiling, tail_ceiling)
-                        LOGGER.info(
-                            "%s probe ceilings: head=%d tail=%d final=%d",
-                            log_name,
-                            head_ceiling,
-                            tail_ceiling,
-                            selected,
-                        )
+                        if bucket_mode:
+                            lo = (metas_slice[0].char_len // 8) * 8
+                            hi = (metas_slice[-1].char_len // 8) * 8
+                            cache_key = (lo, hi, resolved_probe, strategy.value, probe_epsilon)
+                            cached = probe_cache.get(cache_key)
+                            if cached is not None:
+                                selected = cached
+                                LOGGER.info(
+                                    "%s probe cache hit: key=%s selected=%d",
+                                    log_name,
+                                    cache_key,
+                                    selected,
+                                )
+                            else:
+                                selected = probe_batch_size(
+                                    worker,
+                                    sentences[:probe_window],
+                                    candidates=resolved_probe,
+                                    fallback_batch_size=batch_size,
+                                    strategy=strategy,
+                                    probe_epsilon=probe_epsilon,
+                                    log_cuda_memory_warn=probe_log_cuda_memory,
+                                )
+                                probe_cache[cache_key] = selected
+                                LOGGER.info(
+                                    "%s probe ceiling (single-window bucket mode): final=%d",
+                                    log_name,
+                                    selected,
+                                )
+                        else:
+                            head_ceiling = probe_batch_size(
+                                worker,
+                                sentences[:probe_window],
+                                candidates=resolved_probe,
+                                fallback_batch_size=batch_size,
+                                strategy=strategy,
+                                probe_epsilon=probe_epsilon,
+                                log_cuda_memory_warn=probe_log_cuda_memory,
+                            )
+                            tail_ceiling = probe_batch_size(
+                                worker,
+                                sentences[-probe_window:],
+                                candidates=resolved_probe,
+                                fallback_batch_size=batch_size,
+                                strategy=strategy,
+                                probe_epsilon=probe_epsilon,
+                                log_cuda_memory_warn=probe_log_cuda_memory,
+                            )
+                            selected = min(head_ceiling, tail_ceiling)
+                            LOGGER.info(
+                                "%s probe ceilings: head=%d tail=%d final=%d",
+                                log_name,
+                                head_ceiling,
+                                tail_ceiling,
+                                selected,
+                            )
                     else:
                         selected = batch_size
                     char_budget_local = selected * CHAR_BUDGET_PER_SENTENCE
@@ -748,16 +783,40 @@ def run_pipeline(
                             len(batch.sentences),
                         )
 
-                for _, path, file_metas in _file_sentence_stream(
-                    in_dir,
-                    extensions=extensions,
-                    recursive=recursive,
-                    encoding=encoding,
-                    skip_hidden=skip_hidden,
-                    max_file_size=max_file_size,
-                    counters=counters,
-                    splitter=splitter,
-                ):
+                split_queue: queue.Queue[
+                    tuple[int, Path, list[SentenceMeta]] | object
+                ] = queue.Queue(maxsize=SPLIT_QUEUE_MAX_ITEMS)
+                split_errors: list[Exception] = []
+                sentinel = object()
+
+                def _produce_file_metas() -> None:
+                    try:
+                        for item in _file_sentence_stream(
+                            in_dir,
+                            extensions=extensions,
+                            recursive=recursive,
+                            encoding=encoding,
+                            skip_hidden=skip_hidden,
+                            max_file_size=max_file_size,
+                            counters=counters,
+                            splitter=splitter,
+                        ):
+                            split_queue.put(item)
+                    except Exception as exc:
+                        split_errors.append(exc)
+                    finally:
+                        split_queue.put(sentinel)
+
+                producer = threading.Thread(
+                    target=_produce_file_metas, name="split-producer", daemon=True
+                )
+                producer.start()
+
+                while True:
+                    item = split_queue.get()
+                    if item is sentinel:
+                        break
+                    _, path, file_metas = item
                     if not file_metas:
                         continue
                     file_metas_sorted = sorted(file_metas, key=lambda m: m.char_len)
@@ -801,13 +860,18 @@ def run_pipeline(
                                     f"file={path.name} bucket_index={bi} band={band}"
                                 ),
                                 sentence_count=len(bucket_metas),
+                                bucket_mode=True,
                             )
                     else:
                         _process_metas_slice(
                             file_metas_sorted,
                             log_name=f"file={path.name}",
                             sentence_count=len(file_metas_sorted),
+                            bucket_mode=False,
                         )
+                producer.join()
+                if split_errors:
+                    raise split_errors[0]
                 while pending_writes:
                     pending_writes.popleft().result()
             records_written = writer.records_written

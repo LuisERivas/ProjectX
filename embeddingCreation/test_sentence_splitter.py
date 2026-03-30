@@ -9,10 +9,26 @@ Usage:
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from sentence_splitter import split_sentences
+try:
+    import sentence_splitter as sentence_splitter_mod
+    from sentence_splitter import _reset_break_iterator_cache_for_tests, split_sentences
+
+    HAVE_ICU = True
+except Exception:
+    sentence_splitter_mod = None
+    HAVE_ICU = False
+
+    def split_sentences(text: str, *, locale: str = "en_US") -> list[str]:
+        del text, locale
+        raise RuntimeError("PyICU not installed")
+
+    def _reset_break_iterator_cache_for_tests() -> None:
+        return None
 
 
+@unittest.skipUnless(HAVE_ICU, "PyICU required for sentence splitter tests")
 class TestSplitSentences(unittest.TestCase):
 
     def test_normal_english_prose(self) -> None:
@@ -104,6 +120,26 @@ class TestSplitSentences(unittest.TestCase):
         text = "Hello. World."
         result = split_sentences(text, locale="root")
         self.assertEqual(len(result), 2)
+
+    def test_break_iterator_reuse_same_locale(self) -> None:
+        _reset_break_iterator_cache_for_tests()
+        with patch(
+            "sentence_splitter.icu.BreakIterator.createSentenceInstance",
+            wraps=sentence_splitter_mod.icu.BreakIterator.createSentenceInstance,
+        ) as spy:
+            split_sentences("One. Two.", locale="en_US")
+            split_sentences("Three. Four.", locale="en_US")
+            self.assertEqual(spy.call_count, 1)
+
+    def test_break_iterator_new_instance_for_different_locale(self) -> None:
+        _reset_break_iterator_cache_for_tests()
+        with patch(
+            "sentence_splitter.icu.BreakIterator.createSentenceInstance",
+            wraps=sentence_splitter_mod.icu.BreakIterator.createSentenceInstance,
+        ) as spy:
+            split_sentences("One. Two.", locale="en_US")
+            split_sentences("Un. Deux.", locale="fr_FR")
+            self.assertEqual(spy.call_count, 2)
 
 
 if __name__ == "__main__":

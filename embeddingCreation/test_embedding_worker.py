@@ -107,8 +107,18 @@ class TestEmbeddingWorker(unittest.TestCase):
             self.assertEqual(w.stats["state"], WorkerState.READY.value)
             self.assertEqual(w.stats["load_count"], 1)
             self.assertIn("cuda", w.stats["device"] or "")
+            self.assertFalse(w.stats["compiled"])
             with self.assertRaises(WorkerStateError):
                 w.init()
+
+    def test_compile_flag_set_when_compile_succeeds(self) -> None:
+        torch_mod, st_mod = _build_fake_modules()
+        with patch.dict(sys.modules, {"torch": torch_mod, "sentence_transformers": st_mod}), patch.object(
+            EmbeddingWorker, "_maybe_compile_model", return_value=True
+        ):
+            w = EmbeddingWorker()
+            w.init()
+            self.assertTrue(w.stats["compiled"])
 
     def test_bfloat16_fallback_to_float16(self) -> None:
         torch_mod, st_mod = _build_fake_modules(bfloat16_fails=True)

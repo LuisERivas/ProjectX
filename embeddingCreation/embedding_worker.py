@@ -64,6 +64,7 @@ class _WorkerMetrics:
     init_time_s: float | None = None
     dtype: str | None = None
     device: str | None = None
+    compiled: bool = False
 
 
 class EmbeddingWorker:
@@ -82,11 +83,37 @@ class EmbeddingWorker:
             "device": self._metrics.device,
             "dtype": self._metrics.dtype,
             "init_time_s": self._metrics.init_time_s,
+            "compiled": self._metrics.compiled,
             "total_batches": self._metrics.total_batches,
             "total_sentences": self._metrics.total_sentences,
             "total_encode_time_s": self._metrics.total_encode_time_s,
             "load_count": self._metrics.load_count,
         }
+
+    def _maybe_compile_model(self, torch_mod: Any) -> bool:
+        """Try to compile the underlying transformer module with fallback."""
+        if self._model is None:
+            return False
+        compile_fn = getattr(torch_mod, "compile", None)
+        if compile_fn is None:
+            return False
+        try:
+            first_mod = (
+                self._model._first_module() if hasattr(self._model, "_first_module") else None
+            )
+            auto_model = (
+                getattr(first_mod, "auto_model", None) if first_mod is not None else None
+            )
+            if auto_model is None:
+                LOGGER.warning(
+                    "torch.compile available, but no transformer auto_model was found; skipping compile"
+                )
+                return False
+            first_mod.auto_model = compile_fn(auto_model)
+            return True
+        except Exception as exc:
+            LOGGER.warning("torch.compile failed; continuing in eager mode: %s", exc)
+            return False
 
     def init(self) -> None:
         """Load the model once and transition to READY."""
@@ -136,6 +163,7 @@ class EmbeddingWorker:
                 f"model loaded on unexpected device '{device}'; CUDA is required"
             )
         self._metrics.device = device
+        self._metrics.compiled = self._maybe_compile_model(torch)
 
         # Verify expected embedding dimension once at startup.
         probe = self._model.encode(
@@ -160,6 +188,7 @@ class EmbeddingWorker:
                 "model_id": MODEL_ID,
                 "device": self._metrics.device,
                 "dtype": self._metrics.dtype,
+                    "compiled": self._metrics.compiled,
                 "load_time_s": round(self._metrics.init_time_s, 4),
                 "load_count": self._metrics.load_count,
             },
@@ -182,19 +211,24 @@ class EmbeddingWorker:
 
         t0 = time.perf_counter()
         try:
-            out = self._model.encode(
-                sentences,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
-            result = np.asarray(out).astype(np.float32, copy=False)
-            if result.ndim == 1:
-                result = result.reshape(1, -1)
+            try:
+                out = self._model.encode(
+                    sentences,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    convert_to_tensor=True,
+                )
+            except TypeError:
+                out = self._model.encode(
+                    sentences,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
 
             try:
                 skip_norm_checks = self._metrics.total_batches >= FULL_VALIDATION_BATCHES
-                result_fp16 = validate_embeddings(
-                    result,
+                validated = validate_embeddings(
+                    out,
                     expected_count=len(sentences),
                     expected_dim=EXPECTED_DIM,
                     pre_cast_norm_min=PRE_CAST_NORM_MIN,
@@ -205,6 +239,8 @@ class EmbeddingWorker:
                 )
             except EmbeddingValidationError as exc:
                 raise EmbeddingError(str(exc)) from exc
+
+            result_fp16 = np.asarray(validated, dtype=np.float16)
 
             elapsed = time.perf_counter() - t0
             self._metrics.total_batches += 1
