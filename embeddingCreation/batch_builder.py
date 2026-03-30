@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Generator, Iterable
+from typing import Generator, Iterable, Sequence
 
 from packed_id import SentenceMeta
 
@@ -115,3 +115,63 @@ def batch_sentences(
             char_budget,
             partial_flush,
         )
+
+
+def batch_sentences_dynamic_cap(
+    sentence_metas: Sequence[SentenceMeta],
+    *,
+    batch_size_ceiling: int = DEFAULT_BATCH_SIZE,
+    char_budget: int,
+) -> Generator[SentenceBatch, None, None]:
+    """Build dynamic-size batches using a per-batch char_len budget.
+
+    Assumes input is sorted by non-decreasing char_len. The emitted batch size k is the
+    largest value in [1, min(batch_size_ceiling, remaining)] satisfying:
+      max_char_len_in_batch * k <= char_budget
+    If no k satisfies the inequality, a single-sentence batch is emitted.
+    """
+    if batch_size_ceiling < 1:
+        raise ValueError(f"batch_size_ceiling must be >= 1, got {batch_size_ceiling}")
+    if char_budget < 1:
+        raise ValueError(f"char_budget must be >= 1, got {char_budget}")
+
+    n = len(sentence_metas)
+    for meta in sentence_metas:
+        if not isinstance(meta, SentenceMeta):
+            raise ValueError("all items must be SentenceMeta")
+
+    yielded_batches = 0
+    total_sentences = 0
+    i = 0
+    while i < n:
+        hi = min(batch_size_ceiling, n - i)
+        best_k = 1
+        for k in range(1, hi + 1):
+            max_char_len = sentence_metas[i + k - 1].char_len
+            if max_char_len * k <= char_budget:
+                best_k = k
+            else:
+                break
+
+        batch_metas = list(sentence_metas[i : i + best_k])
+        batch_texts = [m.text for m in batch_metas]
+        yielded_batches += 1
+        total_sentences += len(batch_texts)
+        LOGGER.info(
+            "yielding dynamic-cap batch: size=%d max_char_len=%d char_work=%d budget=%d ceiling=%d",
+            best_k,
+            batch_metas[-1].char_len,
+            batch_metas[-1].char_len * best_k,
+            char_budget,
+            batch_size_ceiling,
+        )
+        yield SentenceBatch(metas=batch_metas, sentences=batch_texts)
+        i += best_k
+
+    LOGGER.info(
+        "dynamic-cap batch summary: batches=%d total_sentences=%d ceiling=%d budget=%d",
+        yielded_batches,
+        total_sentences,
+        batch_size_ceiling,
+        char_budget,
+    )

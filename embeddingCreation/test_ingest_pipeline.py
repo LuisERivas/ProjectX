@@ -406,7 +406,7 @@ class TestIngestPipeline(unittest.TestCase):
             out = Path(td) / "out.bin"
             self._write_texts(root, {"a.txt": "A. B."})
             with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
-                "ingest_pipeline.batch_sentences",
+                "ingest_pipeline.batch_sentences_dynamic_cap",
                 side_effect=OverflowError("sentence ID 4294967296 exceeds uint32 max"),
             ), patch("ingest_pipeline._split_text", _simple_splitter):
                 res = run_pipeline(root, out)

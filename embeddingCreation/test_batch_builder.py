@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from batch_builder import SentenceBatch, batch_sentences
+from batch_builder import SentenceBatch, batch_sentences, batch_sentences_dynamic_cap
 from packed_id import SentenceMeta
 
 
@@ -163,6 +163,56 @@ class TestBatchBuilder(unittest.TestCase):
     def test_non_meta_item_raises(self) -> None:
         with self.assertRaises(ValueError):
             list(batch_sentences([self._meta("ok", 0), "bad"]))  # type: ignore[list-item]
+
+    def test_dynamic_cap_budget_and_ceiling_respected(self) -> None:
+        metas = [self._meta("a" * n, i) for i, n in enumerate([2, 4, 6, 8, 10])]
+        batches = list(
+            batch_sentences_dynamic_cap(
+                metas,
+                batch_size_ceiling=4,
+                char_budget=16,
+            )
+        )
+        self.assertEqual([len(b.sentences) for b in batches], [2, 2, 1])
+        for batch in batches:
+            self.assertLessEqual(len(batch.sentences), 4)
+            max_char = max(m.char_len for m in batch.metas)
+            if len(batch.sentences) > 1:
+                self.assertLessEqual(max_char * len(batch.sentences), 16)
+
+    def test_dynamic_cap_preserves_coverage_and_order(self) -> None:
+        metas = [self._meta(f"s{i}", i) for i in range(11)]
+        batches = list(
+            batch_sentences_dynamic_cap(
+                metas,
+                batch_size_ceiling=3,
+                char_budget=100,
+            )
+        )
+        flattened = [s for b in batches for s in b.sentences]
+        self.assertEqual(flattened, [f"s{i}" for i in range(11)])
+
+    def test_dynamic_cap_singleton_when_one_exceeds_budget(self) -> None:
+        metas = [self._meta("x" * 50, 0), self._meta("y", 1), self._meta("zz", 2)]
+        batches = list(
+            batch_sentences_dynamic_cap(
+                metas,
+                batch_size_ceiling=4,
+                char_budget=10,
+            )
+        )
+        self.assertEqual([b.sentences for b in batches], [["x" * 50], ["y", "zz"]])
+
+    def test_dynamic_cap_validates_args(self) -> None:
+        metas = [self._meta("ok", 0)]
+        with self.assertRaises(ValueError):
+            list(batch_sentences_dynamic_cap(metas, batch_size_ceiling=0, char_budget=10))
+        with self.assertRaises(ValueError):
+            list(batch_sentences_dynamic_cap(metas, batch_size_ceiling=2, char_budget=0))
+        with self.assertRaises(ValueError):
+            list(  # type: ignore[list-item]
+                batch_sentences_dynamic_cap([self._meta("ok", 0), "bad"], batch_size_ceiling=2, char_budget=10)
+            )
 
 
 if __name__ == "__main__":

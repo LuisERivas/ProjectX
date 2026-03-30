@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-from batch_builder import DEFAULT_BATCH_SIZE, batch_sentences
+from batch_builder import DEFAULT_BATCH_SIZE, batch_sentences, batch_sentences_dynamic_cap
 from binary_reader import VerificationReport, verify_file
 from binary_writer import BinaryWriterError, EmbeddingWriter
 from embedding_worker import EmbeddingError, EmbeddingWorker, ModelLoadError
@@ -340,9 +340,9 @@ def run_pipeline(
                         char_budget,
                     )
 
-                    for batch in batch_sentences(
+                    for batch in batch_sentences_dynamic_cap(
                         file_metas_sorted,
-                        batch_size=selected_batch_size,
+                        batch_size_ceiling=selected_batch_size,
                         char_budget=char_budget,
                     ):
                         total_batches += 1
