@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass
 from typing import Generator, Iterable
 
-DEFAULT_BATCH_SIZE: int = 8
+DEFAULT_BATCH_SIZE: int = 16
 UINT32_MAX: int = (2**32) - 1
 
 LOGGER = logging.getLogger("batch_builder")
