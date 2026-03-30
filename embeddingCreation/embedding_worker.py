@@ -243,6 +243,10 @@ class EmbeddingWorker:
                 "load_count": self._metrics.load_count,
             },
         )
+        LOGGER.info(
+            "embedding worker execution mode: %s",
+            "compiled" if self._metrics.compiled else "eager",
+        )
 
     def encode_batch(self, sentences: list[str]) -> np.ndarray:
         """Encode a sentence batch and return (N, 2048) float16 vectors."""
@@ -304,7 +308,16 @@ class EmbeddingWorker:
             except EmbeddingValidationError as exc:
                 raise EmbeddingError(str(exc)) from exc
 
-            result_fp16 = np.asarray(validated, dtype=np.float16)
+            try:
+                import torch
+            except Exception:
+                torch = None
+            if torch is not None and hasattr(torch, "is_tensor") and torch.is_tensor(validated):
+                result_fp16 = (
+                    validated.detach().to(dtype=torch.float16).cpu().numpy()
+                )
+            else:
+                result_fp16 = np.asarray(validated, dtype=np.float16)
 
             elapsed = time.perf_counter() - t0
             self._metrics.total_batches += 1
