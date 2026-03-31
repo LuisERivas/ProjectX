@@ -38,6 +38,15 @@ from packed_id import (
 from paragraph_splitter import split_into_paragraphs
 
 LOGGER = logging.getLogger("ingest_pipeline")
+
+
+def _latency_record(
+    events: list[tuple[str, float]] | None, label: str, duration_s: float
+) -> None:
+    if events is not None and duration_s >= 0.0:
+        events.append((label, duration_s))
+
+
 FULL_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (
     64,
     128,
@@ -398,6 +407,7 @@ def _file_sentence_stream(
     max_file_size: int,
     counters: dict[str, int],
     splitter: Callable[[str], list[str]],
+    latency_events: list[tuple[str, float]] | None = None,
 ) -> Iterable[tuple[int, Path, list[SentenceMeta]]]:
     for shard_doc_num, (path, text) in enumerate(
         read_text_files(
@@ -410,6 +420,7 @@ def _file_sentence_stream(
         )
     ):
         counters["files_read"] += 1
+        t_split = time.perf_counter()
         try:
             paragraphs = split_into_paragraphs(text)
             metas: list[SentenceMeta] = []
@@ -435,9 +446,21 @@ def _file_sentence_stream(
                         )
                     )
         except Exception as exc:
+            if latency_events is not None:
+                _latency_record(
+                    latency_events,
+                    f"split_file_failed:{path.name}",
+                    time.perf_counter() - t_split,
+                )
             counters["files_skipped"] += 1
             LOGGER.warning("[SPLITTER] skipping file %s: %s", path.name, exc)
             continue
+        if latency_events is not None:
+            _latency_record(
+                latency_events,
+                f"split_file:{path.name}",
+                time.perf_counter() - t_split,
+            )
         counters["total_sentences"] += len(metas)
         LOGGER.info("split file: path=%s sentences=%d", path.name, len(metas))
         if shard_doc_num > SHARD_DOC_MAX:
@@ -604,6 +627,7 @@ def run_pipeline(
     char_len_bucket_edges: tuple[int, ...] | None = None,
     max_buckets: int = DEFAULT_MAX_BUCKETS,
     gvf_threshold: float = DEFAULT_GVF_THRESHOLD,
+    latency_events: list[tuple[str, float]] | None = None,
 ) -> PipelineResult:
     t0 = time.perf_counter()
     in_dir = Path(input_directory)
@@ -631,7 +655,14 @@ def run_pipeline(
         raise ValueError(
             "probe candidate list is empty; adjust probe_batch_sizes or max_probe_batch"
         )
+    t_startup = time.perf_counter()
     startup_error = _validate_startup(in_dir, out_path, batch_size=batch_size)
+    if latency_events is not None:
+        _latency_record(
+            latency_events,
+            "startup_validation",
+            time.perf_counter() - t_startup,
+        )
     if startup_error is not None:
         LOGGER.error(startup_error)
         return _failure_result(
@@ -649,6 +680,7 @@ def run_pipeline(
 
     errors: list[str] = []
     try:
+        t_discover = time.perf_counter()
         files = discover_files(
             in_dir,
             extensions=extensions,
@@ -656,6 +688,12 @@ def run_pipeline(
             skip_hidden=skip_hidden,
             max_file_size_bytes=max_file_size,
         )
+        if latency_events is not None:
+            _latency_record(
+                latency_events,
+                "discover_files",
+                time.perf_counter() - t_discover,
+            )
     except Exception as exc:
         msg = f"[STARTUP] failed to discover files: {exc}"
         LOGGER.error(msg)
@@ -683,39 +721,73 @@ def run_pipeline(
     splitter = lambda text: _split_text(text, locale=locale)
 
     try:
-        worker.init()
-        with EmbeddingWriter(out_path) as writer:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                pending_writes: deque[Future[None]] = deque()
-                probe_window = max(resolved_probe)
-                min_sentences_to_probe = min(resolved_probe)
-                probe_cache: dict[tuple[int, int, tuple[int, ...], str, float], int] = {}
+        t_init = time.perf_counter()
+        try:
+            worker.init()
+        finally:
+            if latency_events is not None:
+                _latency_record(
+                    latency_events,
+                    "model_init",
+                    time.perf_counter() - t_init,
+                )
+        t_wctx = time.perf_counter()
+        try:
+            with EmbeddingWriter(out_path) as writer:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending_writes: deque[Future[None]] = deque()
+                    probe_window = max(resolved_probe)
+                    min_sentences_to_probe = min(resolved_probe)
+                    probe_cache: dict[tuple[int, int, tuple[int, ...], str, float], int] = {}
 
-                def _process_metas_slice(
-                    metas_slice: list[SentenceMeta],
-                    *,
-                    log_name: str,
-                    sentence_count: int,
-                    bucket_mode: bool,
-                ) -> None:
-                    nonlocal total_batches
-                    sentences = [m.text for m in metas_slice]
-                    if len(sentences) >= min_sentences_to_probe:
-                        if bucket_mode:
-                            lo = (metas_slice[0].char_len // 8) * 8
-                            hi = (metas_slice[-1].char_len // 8) * 8
-                            cache_key = (lo, hi, resolved_probe, strategy.value, probe_epsilon)
-                            cached = probe_cache.get(cache_key)
-                            if cached is not None:
-                                selected = cached
-                                LOGGER.info(
-                                    "%s probe cache hit: key=%s selected=%d",
-                                    log_name,
-                                    cache_key,
-                                    selected,
+                    def _process_metas_slice(
+                        metas_slice: list[SentenceMeta],
+                        *,
+                        log_name: str,
+                        sentence_count: int,
+                        bucket_mode: bool,
+                    ) -> None:
+                        nonlocal total_batches
+                        sentences = [m.text for m in metas_slice]
+                        t_probe = time.perf_counter()
+                        if len(sentences) >= min_sentences_to_probe:
+                            if bucket_mode:
+                                lo = (metas_slice[0].char_len // 8) * 8
+                                hi = (metas_slice[-1].char_len // 8) * 8
+                                cache_key = (
+                                    lo,
+                                    hi,
+                                    resolved_probe,
+                                    strategy.value,
+                                    probe_epsilon,
                                 )
+                                cached = probe_cache.get(cache_key)
+                                if cached is not None:
+                                    selected = cached
+                                    LOGGER.info(
+                                        "%s probe cache hit: key=%s selected=%d",
+                                        log_name,
+                                        cache_key,
+                                        selected,
+                                    )
+                                else:
+                                    selected = probe_batch_size(
+                                        worker,
+                                        sentences[:probe_window],
+                                        candidates=resolved_probe,
+                                        fallback_batch_size=batch_size,
+                                        strategy=strategy,
+                                        probe_epsilon=probe_epsilon,
+                                        log_cuda_memory_warn=probe_log_cuda_memory,
+                                    )
+                                    probe_cache[cache_key] = selected
+                                    LOGGER.info(
+                                        "%s probe ceiling (single-window bucket mode): final=%d",
+                                        log_name,
+                                        selected,
+                                    )
                             else:
-                                selected = probe_batch_size(
+                                head_ceiling = probe_batch_size(
                                     worker,
                                     sentences[:probe_window],
                                     candidates=resolved_probe,
@@ -724,177 +796,213 @@ def run_pipeline(
                                     probe_epsilon=probe_epsilon,
                                     log_cuda_memory_warn=probe_log_cuda_memory,
                                 )
-                                probe_cache[cache_key] = selected
-                                LOGGER.info(
-                                    "%s probe ceiling (single-window bucket mode): final=%d",
-                                    log_name,
-                                    selected,
-                                )
+                                if probe_dual_window:
+                                    tail_ceiling = probe_batch_size(
+                                        worker,
+                                        sentences[-probe_window:],
+                                        candidates=resolved_probe,
+                                        fallback_batch_size=batch_size,
+                                        strategy=strategy,
+                                        probe_epsilon=probe_epsilon,
+                                        log_cuda_memory_warn=probe_log_cuda_memory,
+                                    )
+                                    selected = min(head_ceiling, tail_ceiling)
+                                    LOGGER.info(
+                                        "%s probe ceilings: mode=head_tail head=%d tail=%d final=%d",
+                                        log_name,
+                                        head_ceiling,
+                                        tail_ceiling,
+                                        selected,
+                                    )
+                                else:
+                                    selected = head_ceiling
+                                    LOGGER.info(
+                                        "%s probe ceilings: mode=single_window final=%d",
+                                        log_name,
+                                        selected,
+                                    )
                         else:
-                            head_ceiling = probe_batch_size(
-                                worker,
-                                sentences[:probe_window],
-                                candidates=resolved_probe,
-                                fallback_batch_size=batch_size,
-                                strategy=strategy,
-                                probe_epsilon=probe_epsilon,
-                                log_cuda_memory_warn=probe_log_cuda_memory,
+                            selected = batch_size
+                        if latency_events is not None:
+                            _latency_record(
+                                latency_events,
+                                f"probe:{log_name}",
+                                time.perf_counter() - t_probe,
                             )
-                            if probe_dual_window:
-                                tail_ceiling = probe_batch_size(
-                                    worker,
-                                    sentences[-probe_window:],
-                                    candidates=resolved_probe,
-                                    fallback_batch_size=batch_size,
-                                    strategy=strategy,
-                                    probe_epsilon=probe_epsilon,
-                                    log_cuda_memory_warn=probe_log_cuda_memory,
-                                )
-                                selected = min(head_ceiling, tail_ceiling)
-                                LOGGER.info(
-                                    "%s probe ceilings: mode=head_tail head=%d tail=%d final=%d",
-                                    log_name,
-                                    head_ceiling,
-                                    tail_ceiling,
-                                    selected,
-                                )
-                            else:
-                                selected = head_ceiling
-                                LOGGER.info(
-                                    "%s probe ceilings: mode=single_window final=%d",
-                                    log_name,
-                                    selected,
-                                )
-                    else:
-                        selected = batch_size
-                    char_budget_local = selected * CHAR_BUDGET_PER_SENTENCE
-                    LOGGER.info(
-                        "%s batch controls: sentences=%d batch_size=%d char_budget=%d",
-                        log_name,
-                        sentence_count,
-                        selected,
-                        char_budget_local,
-                    )
-                    for batch in batch_sentences_dynamic_cap(
-                        metas_slice,
-                        batch_size_ceiling=selected,
-                        char_budget=char_budget_local,
-                    ):
-                        total_batches += 1
-                        embeddings = worker.encode_batch(batch.sentences)
-                        ids = [
-                            pack_id(
-                                m.para_line,
-                                m.char_len,
-                                m.doc_para_num,
-                                m.shard_num,
-                                m.shard_doc_num,
-                            )
-                            for m in batch.metas
-                        ]
-                        pending_writes.append(
-                            pool.submit(writer.write_batch, ids, embeddings)
-                        )
-                        if len(pending_writes) >= MAX_PENDING_WRITES:
-                            pending_writes.popleft().result()
+                        char_budget_local = selected * CHAR_BUDGET_PER_SENTENCE
                         LOGGER.info(
-                            "batch queued: index=%d size=%d",
-                            total_batches,
-                            len(batch.sentences),
+                            "%s batch controls: sentences=%d batch_size=%d char_budget=%d",
+                            log_name,
+                            sentence_count,
+                            selected,
+                            char_budget_local,
                         )
 
-                split_queue: queue.Queue[
-                    tuple[int, Path, list[SentenceMeta]] | object
-                ] = queue.Queue(maxsize=SPLIT_QUEUE_MAX_ITEMS)
-                split_errors: list[Exception] = []
-                sentinel = object()
+                        def _submit_timed_write(
+                            ids_: list[int],
+                            emb: np.ndarray,
+                            batch_idx: int,
+                            batch_n: int,
+                        ) -> None:
+                            tw0 = time.perf_counter()
+                            writer.write_batch(ids_, emb)
+                            if latency_events is not None:
+                                _latency_record(
+                                    latency_events,
+                                    f"write_batch:{batch_idx}:{batch_n}",
+                                    time.perf_counter() - tw0,
+                                )
 
-                def _produce_file_metas() -> None:
-                    try:
-                        for item in _file_sentence_stream(
-                            in_dir,
-                            extensions=extensions,
-                            recursive=recursive,
-                            encoding=encoding,
-                            skip_hidden=skip_hidden,
-                            max_file_size=max_file_size,
-                            counters=counters,
-                            splitter=splitter,
+                        for batch in batch_sentences_dynamic_cap(
+                            metas_slice,
+                            batch_size_ceiling=selected,
+                            char_budget=char_budget_local,
                         ):
-                            split_queue.put(item)
-                    except Exception as exc:
-                        split_errors.append(exc)
-                    finally:
-                        split_queue.put(sentinel)
-
-                producer = threading.Thread(
-                    target=_produce_file_metas, name="split-producer", daemon=True
-                )
-                producer.start()
-
-                while True:
-                    item = split_queue.get()
-                    if item is sentinel:
-                        break
-                    _, path, file_metas = item
-                    if not file_metas:
-                        continue
-                    file_metas_sorted = sorted(file_metas, key=lambda m: m.char_len)
-                    if char_len_bucketing:
-                        if use_jenks:
-                            file_char_lens = [m.char_len for m in file_metas_sorted]
-                            jenks_edges = _jenks_auto_bucket_edges(
-                                file_char_lens,
-                                max_k=max_buckets,
-                                gvf_threshold=gvf_threshold,
+                            total_batches += 1
+                            t_enc = time.perf_counter()
+                            embeddings = worker.encode_batch(batch.sentences)
+                            if latency_events is not None:
+                                _latency_record(
+                                    latency_events,
+                                    f"encode_batch:{total_batches}:{len(batch.sentences)}",
+                                    time.perf_counter() - t_enc,
+                                )
+                            ids = [
+                                pack_id(
+                                    m.para_line,
+                                    m.char_len,
+                                    m.doc_para_num,
+                                    m.shard_num,
+                                    m.shard_doc_num,
+                                )
+                                for m in batch.metas
+                            ]
+                            bn = len(batch.sentences)
+                            bi = total_batches
+                            pending_writes.append(
+                                pool.submit(
+                                    _submit_timed_write, ids, embeddings, bi, bn
+                                )
                             )
-                            if jenks_edges:
-                                _validate_char_len_bucket_edges(jenks_edges)
-                                active_edges = jenks_edges
-                            else:
-                                active_edges = None
+                            if len(pending_writes) >= MAX_PENDING_WRITES:
+                                pending_writes.popleft().result()
                             LOGGER.info(
-                                "file=%s jenks edges=%s (from %d char_lens)",
-                                path.name,
-                                active_edges,
-                                len(file_char_lens),
+                                "batch queued: index=%d size=%d",
+                                total_batches,
+                                len(batch.sentences),
                             )
-                        else:
-                            active_edges = edges_eff
-                        if active_edges:
-                            buckets = _split_sorted_metas_by_char_len_edges(
-                                file_metas_sorted, active_edges
-                            )
-                        else:
-                            buckets = [file_metas_sorted]
-                        for bi, bucket_metas in enumerate(buckets):
+
+                    split_queue: queue.Queue[
+                        tuple[int, Path, list[SentenceMeta]] | object
+                    ] = queue.Queue(maxsize=SPLIT_QUEUE_MAX_ITEMS)
+                    split_errors: list[Exception] = []
+                    sentinel = object()
+
+                    def _produce_file_metas() -> None:
+                        try:
+                            for item in _file_sentence_stream(
+                                in_dir,
+                                extensions=extensions,
+                                recursive=recursive,
+                                encoding=encoding,
+                                skip_hidden=skip_hidden,
+                                max_file_size=max_file_size,
+                                counters=counters,
+                                splitter=splitter,
+                                latency_events=latency_events,
+                            ):
+                                split_queue.put(item)
+                        except Exception as exc:
+                            split_errors.append(exc)
+                        finally:
+                            split_queue.put(sentinel)
+
+                    producer = threading.Thread(
+                        target=_produce_file_metas,
+                        name="split-producer",
+                        daemon=True,
+                    )
+                    producer.start()
+
+                    while True:
+                        item = split_queue.get()
+                        if item is sentinel:
+                            break
+                        _, path, file_metas = item
+                        if not file_metas:
+                            continue
+                        file_metas_sorted = sorted(file_metas, key=lambda m: m.char_len)
+                        if char_len_bucketing:
+                            if use_jenks:
+                                t_jenks = time.perf_counter()
+                                file_char_lens = [
+                                    m.char_len for m in file_metas_sorted
+                                ]
+                                jenks_edges = _jenks_auto_bucket_edges(
+                                    file_char_lens,
+                                    max_k=max_buckets,
+                                    gvf_threshold=gvf_threshold,
+                                )
+                                if jenks_edges:
+                                    _validate_char_len_bucket_edges(jenks_edges)
+                                    active_edges = jenks_edges
+                                else:
+                                    active_edges = None
+                                LOGGER.info(
+                                    "file=%s jenks edges=%s (from %d char_lens)",
+                                    path.name,
+                                    active_edges,
+                                    len(file_char_lens),
+                                )
+                                if latency_events is not None:
+                                    _latency_record(
+                                        latency_events,
+                                        f"jenks:{path.name}",
+                                        time.perf_counter() - t_jenks,
+                                    )
+                            else:
+                                active_edges = edges_eff
                             if active_edges:
-                                band = _char_len_band_label(
-                                    bucket_metas[0].char_len, active_edges
+                                buckets = _split_sorted_metas_by_char_len_edges(
+                                    file_metas_sorted, active_edges
                                 )
                             else:
-                                band = "[all]"
+                                buckets = [file_metas_sorted]
+                            for bi, bucket_metas in enumerate(buckets):
+                                if active_edges:
+                                    band = _char_len_band_label(
+                                        bucket_metas[0].char_len, active_edges
+                                    )
+                                else:
+                                    band = "[all]"
+                                _process_metas_slice(
+                                    bucket_metas,
+                                    log_name=(
+                                        f"file={path.name} bucket_index={bi} band={band}"
+                                    ),
+                                    sentence_count=len(bucket_metas),
+                                    bucket_mode=True,
+                                )
+                        else:
                             _process_metas_slice(
-                                bucket_metas,
-                                log_name=(
-                                    f"file={path.name} bucket_index={bi} band={band}"
-                                ),
-                                sentence_count=len(bucket_metas),
-                                bucket_mode=True,
+                                file_metas_sorted,
+                                log_name=f"file={path.name}",
+                                sentence_count=len(file_metas_sorted),
+                                bucket_mode=False,
                             )
-                    else:
-                        _process_metas_slice(
-                            file_metas_sorted,
-                            log_name=f"file={path.name}",
-                            sentence_count=len(file_metas_sorted),
-                            bucket_mode=False,
-                        )
-                producer.join()
-                if split_errors:
-                    raise split_errors[0]
-                while pending_writes:
-                    pending_writes.popleft().result()
-            records_written = writer.records_written
+                    producer.join()
+                    if split_errors:
+                        raise split_errors[0]
+                    while pending_writes:
+                        pending_writes.popleft().result()
+                records_written = writer.records_written
+        finally:
+            if latency_events is not None:
+                _latency_record(
+                    latency_events,
+                    "writer_encode_context",
+                    time.perf_counter() - t_wctx,
+                )
     except ModelLoadError as exc:
         success = False
         msg = f"[MODEL_LOAD] {exc}"
@@ -921,13 +1029,21 @@ def run_pipeline(
         errors.append(msg)
         LOGGER.error(msg)
     finally:
+        t_sd = time.perf_counter()
         try:
             worker.shutdown()
         except Exception as exc:  # pragma: no cover - defensive path
             LOGGER.error("worker shutdown failed: %s", exc)
+        if latency_events is not None:
+            _latency_record(
+                latency_events,
+                "worker_shutdown",
+                time.perf_counter() - t_sd,
+            )
 
     verification: VerificationReport | None = None
     if success:
+        t_verify = time.perf_counter()
         try:
             verification = verify_file(out_path)
             if not verification.ok:
@@ -939,6 +1055,12 @@ def run_pipeline(
             msg = f"post-run verification error: {exc}"
             errors.append(msg)
             LOGGER.error(msg)
+        if latency_events is not None:
+            _latency_record(
+                latency_events,
+                "verify_file",
+                time.perf_counter() - t_verify,
+            )
 
     files_skipped = counters["files_skipped"] + max(0, files_discovered - counters["files_read"])
 
