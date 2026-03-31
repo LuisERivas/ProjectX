@@ -17,7 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 import numpy as np
 
@@ -49,7 +49,9 @@ FULL_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (
     8192,
     16384,
 )
+SHORT_PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (64, 128, 256, 512, 1024)
 PROBE_CANDIDATE_BATCH_SIZES: tuple[int, ...] = (64, 128)
+DEFAULT_NON_BUCKET_PROBE_CAP: int = 4096
 DEFAULT_CHAR_LEN_BUCKET_EDGES: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024)
 DEFAULT_MAX_BUCKETS: int = 6
 DEFAULT_GVF_THRESHOLD: float = 0.85
@@ -74,6 +76,7 @@ def _resolved_probe_candidates(
     max_probe_batch: int | None,
     *,
     char_len_bucketing: bool = False,
+    probe_ladder: Literal["full", "short"] = "full",
 ) -> tuple[int, ...]:
     """Ordered distinct positive candidates.
 
@@ -90,8 +93,14 @@ def _resolved_probe_candidates(
     if max_probe_batch is not None:
         cap = max_probe_batch
     else:
-        cap = 16384 if char_len_bucketing else 128
-    return tuple(c for c in FULL_PROBE_CANDIDATE_BATCH_SIZES if c <= cap)
+        cap = 16384 if char_len_bucketing else DEFAULT_NON_BUCKET_PROBE_CAP
+    if probe_ladder == "short":
+        source = SHORT_PROBE_CANDIDATE_BATCH_SIZES
+    elif probe_ladder == "full":
+        source = FULL_PROBE_CANDIDATE_BATCH_SIZES
+    else:
+        raise ValueError(f"probe_ladder must be 'full' or 'short', got {probe_ladder!r}")
+    return tuple(c for c in source if c <= cap)
 
 
 def _validate_char_len_bucket_edges(edges: tuple[int, ...]) -> None:
@@ -586,6 +595,8 @@ def run_pipeline(
     max_file_size: int = DEFAULT_MAX_FILE_SIZE,
     probe_batch_sizes: tuple[int, ...] | None = None,
     max_probe_batch: int | None = None,
+    probe_ladder: Literal["full", "short"] = "full",
+    probe_dual_window: bool = True,
     probe_strategy: ProbeStrategy | str = ProbeStrategy.MIN_LATENCY_PER_SENT,
     probe_epsilon: float = DEFAULT_PROBE_EPSILON,
     probe_log_cuda_memory: bool = False,
@@ -614,6 +625,7 @@ def run_pipeline(
         probe_batch_sizes,
         max_probe_batch,
         char_len_bucketing=char_len_bucketing,
+        probe_ladder=probe_ladder,
     )
     if not resolved_probe:
         raise ValueError(
@@ -728,23 +740,31 @@ def run_pipeline(
                                 probe_epsilon=probe_epsilon,
                                 log_cuda_memory_warn=probe_log_cuda_memory,
                             )
-                            tail_ceiling = probe_batch_size(
-                                worker,
-                                sentences[-probe_window:],
-                                candidates=resolved_probe,
-                                fallback_batch_size=batch_size,
-                                strategy=strategy,
-                                probe_epsilon=probe_epsilon,
-                                log_cuda_memory_warn=probe_log_cuda_memory,
-                            )
-                            selected = min(head_ceiling, tail_ceiling)
-                            LOGGER.info(
-                                "%s probe ceilings: head=%d tail=%d final=%d",
-                                log_name,
-                                head_ceiling,
-                                tail_ceiling,
-                                selected,
-                            )
+                            if probe_dual_window:
+                                tail_ceiling = probe_batch_size(
+                                    worker,
+                                    sentences[-probe_window:],
+                                    candidates=resolved_probe,
+                                    fallback_batch_size=batch_size,
+                                    strategy=strategy,
+                                    probe_epsilon=probe_epsilon,
+                                    log_cuda_memory_warn=probe_log_cuda_memory,
+                                )
+                                selected = min(head_ceiling, tail_ceiling)
+                                LOGGER.info(
+                                    "%s probe ceilings: mode=head_tail head=%d tail=%d final=%d",
+                                    log_name,
+                                    head_ceiling,
+                                    tail_ceiling,
+                                    selected,
+                                )
+                            else:
+                                selected = head_ceiling
+                                LOGGER.info(
+                                    "%s probe ceilings: mode=single_window final=%d",
+                                    log_name,
+                                    selected,
+                                )
                     else:
                         selected = batch_size
                     char_budget_local = selected * CHAR_BUDGET_PER_SENTENCE

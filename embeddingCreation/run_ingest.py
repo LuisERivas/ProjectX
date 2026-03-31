@@ -18,6 +18,7 @@ from ingest_pipeline import (
     DEFAULT_CHAR_LEN_BUCKET_EDGES,
     DEFAULT_GVF_THRESHOLD,
     DEFAULT_MAX_BUCKETS,
+    DEFAULT_NON_BUCKET_PROBE_CAP,
     DEFAULT_PROBE_EPSILON,
     ProbeStrategy,
     run_pipeline,
@@ -61,14 +62,34 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--probe-ladder",
+        type=str,
+        choices=("full", "short"),
+        default="full",
+        help=(
+            "probe candidate ladder to use when --probe-batch-sizes is not provided: "
+            "full uses 64..16384 powers-of-two; short uses 64..1024. Ignored when "
+            "--probe-batch-sizes is provided"
+        ),
+    )
+    parser.add_argument(
+        "--probe-single-window",
+        action="store_true",
+        help=(
+            "use only a head-window probe in non-bucketing mode (faster startup, less conservative); "
+            "default probes head and tail and takes min"
+        ),
+    )
+    parser.add_argument(
         "--probe-strategy",
         type=str,
         choices=[s.value for s in ProbeStrategy],
         default=ProbeStrategy.MIN_LATENCY_PER_SENT.value,
         help=(
-            "how to pick the batch ceiling after probe encodes: min_latency_per_sent (default), "
-            "max_successful (largest batch that succeeded), or epsilon (largest batch within "
-            "(1+eps) of best latency per sentence)"
+            "how to pick the batch ceiling after probe encodes: min_latency_per_sent (default) "
+            "targets best probe-time latency per sentence; max_successful picks the largest passing "
+            "batch (often best throughput); epsilon picks the largest batch within (1+eps) of best "
+            "latency per sentence"
         ),
     )
     parser.add_argument(
@@ -89,7 +110,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "cap probe ladder: when set without --probe-batch-sizes, try batch sizes up to N "
             "from the built-in ladder (64..16384 powers-of-two steps). When set with --probe-batch-sizes, "
-            "drops candidates above N"
+            "drops candidates above N. When omitted, non-bucketing mode defaults to "
+            f"{DEFAULT_NON_BUCKET_PROBE_CAP} and bucketing mode defaults to 16384"
         ),
     )
     parser.add_argument(
@@ -108,10 +130,12 @@ def parse_args() -> argparse.Namespace:
         "--char-len-buckets",
         action="store_true",
         help=(
-            "split each file into char_len bands (default edges "
-            f"{','.join(str(e) for e in DEFAULT_CHAR_LEN_BUCKET_EDGES)}), probe and batch each "
-            "band separately; default probe ladder cap becomes 16384 (many probe encodes; use "
-            "--max-probe-batch or --probe-batch-sizes to limit)"
+            "split each file into char_len bands, probe and batch each band separately. When "
+            "--bucket-edges is omitted, Jenks natural breaks choose per-file edges; when "
+            "--bucket-edges is provided, fixed edges are used. Probe ceilings are cached by "
+            "approximate band signature so similar bands across files can skip repeat probes. "
+            "Default probe ladder cap becomes 16384 (use --max-probe-batch or "
+            "--probe-batch-sizes to limit)"
         ),
     )
     parser.add_argument(
@@ -121,8 +145,9 @@ def parse_args() -> argparse.Namespace:
         metavar="LIST",
         help=(
             'char_len bucket upper bounds, comma-separated (strictly increasing), e.g. '
-            '"16,32,64,128,256,512,1024"; requires --char-len-buckets; when omitted, '
-            'Jenks natural breaks clustering is used to find edges automatically'
+            f'"{",".join(str(e) for e in DEFAULT_CHAR_LEN_BUCKET_EDGES)}"; requires '
+            "--char-len-buckets. When set, skips per-file Jenks/GVF edge discovery and uses "
+            "these fixed edges"
         ),
     )
     parser.add_argument(
@@ -180,6 +205,8 @@ def main() -> int:
         batch_size=args.batch_size,
         probe_batch_sizes=args.probe_batch_sizes,
         max_probe_batch=args.max_probe_batch,
+        probe_ladder=args.probe_ladder,
+        probe_dual_window=not args.probe_single_window,
         probe_strategy=args.probe_strategy,
         probe_epsilon=args.probe_epsilon,
         probe_log_cuda_memory=args.probe_log_cuda_memory,
@@ -194,6 +221,8 @@ def main() -> int:
     print(f"- probe_strategy: {args.probe_strategy}")
     print(f"- probe_batch_sizes: {args.probe_batch_sizes}")
     print(f"- max_probe_batch: {args.max_probe_batch}")
+    print(f"- probe_ladder: {args.probe_ladder}")
+    print(f"- probe_single_window: {args.probe_single_window}")
     print(f"- char_len_bucketing: {args.char_len_buckets}")
     print(f"- bucket_edges: {args.bucket_edges}")
     print(f"- max_buckets: {args.max_buckets}")

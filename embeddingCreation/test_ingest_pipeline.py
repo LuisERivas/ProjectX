@@ -594,7 +594,22 @@ class TestIngestPipeline(unittest.TestCase):
         self.assertEqual(picked, 512)
 
     def test_resolved_probe_candidates_defaults(self) -> None:
-        self.assertEqual(_resolved_probe_candidates(None, None), (64, 128))
+        self.assertEqual(
+            _resolved_probe_candidates(None, None),
+            (64, 128, 256, 512, 1024, 2048, 4096),
+        )
+
+    def test_resolved_probe_candidates_short_ladder_defaults(self) -> None:
+        self.assertEqual(
+            _resolved_probe_candidates(None, None, probe_ladder="short"),
+            (64, 128, 256, 512, 1024),
+        )
+
+    def test_resolved_probe_candidates_short_ladder_with_max_probe_batch(self) -> None:
+        self.assertEqual(
+            _resolved_probe_candidates(None, 256, probe_ladder="short"),
+            (64, 128, 256),
+        )
 
     def test_resolved_probe_candidates_max_probe_batch(self) -> None:
         self.assertEqual(_resolved_probe_candidates(None, 64), (64,))
@@ -640,6 +655,10 @@ class TestIngestPipeline(unittest.TestCase):
     def test_resolved_probe_candidates_explicit_and_cap(self) -> None:
         self.assertEqual(
             _resolved_probe_candidates((128, 256, 512), 256),
+            (128, 256),
+        )
+        self.assertEqual(
+            _resolved_probe_candidates((128, 256, 512), 256, probe_ladder="short"),
             (128, 256),
         )
 
@@ -886,6 +905,39 @@ class TestIngestPipeline(unittest.TestCase):
         )
         self.assertIn(max_safe, (64, 128, None))
 
+    def test_non_bucket_single_window_probes_once(self) -> None:
+        def _splitter(text: str, *, locale: str) -> list[str]:
+            del text, locale
+            return [f"sent{i:03d}." for i in range(128)]
+
+        real_pb = ingest_pipeline_mod.probe_batch_size
+
+        @wraps(real_pb)
+        def spy(*a: object, **k: object) -> int:
+            spy.probe_count += 1
+            return real_pb(*a, **k)
+
+        spy.probe_count = 0
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "in"
+            out = Path(td) / "out.bin"
+            root.mkdir()
+            (root / "doc.txt").write_text("placeholder", encoding="utf-8")
+            with patch("ingest_pipeline.EmbeddingWorker", _FakeWorker), patch(
+                "ingest_pipeline._split_text", _splitter
+            ), patch("ingest_pipeline.probe_batch_size", spy):
+                res = run_pipeline(
+                    root,
+                    out,
+                    batch_size=4,
+                    max_probe_batch=64,
+                    probe_dual_window=False,
+                )
+        self.assertTrue(res.success)
+        self.assertEqual(res.records_written, 128)
+        self.assertEqual(spy.probe_count, 1)
+
     # -- Jenks bucketing integration --------------------------------------------
 
     def test_jenks_bucketing_integration(self) -> None:
@@ -961,6 +1013,8 @@ class TestIngestPipeline(unittest.TestCase):
         self.assertEqual(spy.probe_count, 1)
 
     def test_probe_cache_reuses_bucket_ceiling_across_files(self) -> None:
+        """With fixed edges, identical bands in later files should hit probe cache."""
+
         def _two_band_splitter(text: str, *, locale: str) -> list[str]:
             del text, locale
             shorts = [f"{i:03d}short." for i in range(64)]
